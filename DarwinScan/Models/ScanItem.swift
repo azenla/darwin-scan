@@ -15,7 +15,8 @@ enum ItemCategory: String, Codable, CaseIterable, Identifiable, Sendable {
     case dyldCache         // dyld_shared_cache_* files
     case kext              // .kext bundles
     case script            // shell/python/perl scripts (interpreter shebang)
-    case configuration     // notable plists & config files
+    case plist             // .plist files (other than launch services)
+    case configuration     // notable non-plist config files
     case other
 
     var id: String { rawValue }
@@ -27,12 +28,13 @@ enum ItemCategory: String, Codable, CaseIterable, Identifiable, Sendable {
         case .launchService: return "Launch Services"
         case .framework:     return "Frameworks & Libraries"
         case .mlModel:       return "ML Models"
-        case .icon:          return "Icons"
+        case .icon:          return "Images"
         case .manPage:       return "Man Pages"
         case .localization:  return "Localizations"
         case .dyldCache:     return "DYLD Shared Cache"
         case .kext:          return "Kernel Extensions"
         case .script:        return "Scripts"
+        case .plist:         return "Plists"
         case .configuration: return "Configuration"
         case .other:         return "Other"
         }
@@ -45,12 +47,13 @@ enum ItemCategory: String, Codable, CaseIterable, Identifiable, Sendable {
         case .launchService: return "gearshape.2"
         case .framework:     return "shippingbox"
         case .mlModel:       return "brain"
-        case .icon:          return "photo.on.rectangle.angled"
+        case .icon:          return "photo.stack"
         case .manPage:       return "doc.text.magnifyingglass"
         case .localization:  return "character.bubble"
         case .dyldCache:     return "cylinder.split.1x2"
         case .kext:          return "cpu"
         case .script:        return "scroll"
+        case .plist:         return "list.bullet.indent"
         case .configuration: return "slider.horizontal.3"
         case .other:         return "questionmark.folder"
         }
@@ -86,6 +89,7 @@ struct ScanItem: Codable, Identifiable, Hashable, Sendable {
     var localization: LocalizationInfo?
     var dyldCache: DyldCacheInfo?
     var script: ScriptInfo?
+    var plist: PlistInfo?
 
     /// Free-form tags surfaced as colored chips in the UI. Examples: "cli", "daemon",
     /// "cross-platform", "scripting-runtime". Cheap way to add new facets without
@@ -289,4 +293,39 @@ struct ScriptInfo: Codable, Hashable, Sendable {
     var interpreter: String?       // /bin/bash, /usr/bin/env perl, ...
     var language: String?          // bash / python / perl / ruby / ...
     var lineCount: Int?
+}
+
+struct PlistInfo: Codable, Hashable, Sendable {
+    /// Best-effort classification by filename / location, used to drive the
+    /// "Kind" tag in the UI without re-parsing.
+    enum Kind: String, Codable, Sendable {
+        case info               // Info.plist (bundle metadata)
+        case version            // Version.plist (in frameworks)
+        case launchService      // a launchd plist *outside* /System/Library/LaunchDaemons|Agents
+        case preference         // Preferences/*.plist
+        case entitlements       // *.entitlements
+        case mappedTypes        // UTI / declared-types plist
+        case other
+    }
+    enum Format: String, Codable, Sendable {
+        case xml
+        case binary
+        case json               // some "plists" on macOS are JSON
+        case unknown
+    }
+    enum TopLevel: String, Codable, Sendable {
+        case dictionary
+        case array
+        case other
+    }
+    var kind: Kind
+    var format: Format
+    var topLevel: TopLevel
+    var keyCount: Int?              // top-level key count for dicts
+    var elementCount: Int?          // top-level count for arrays
+    /// XML/JSON-encoded snippet of the top of the plist for display. Empty for
+    /// huge plists; we cap to a sensible read size at scan time.
+    var previewText: String?
+    /// True when the plist's top-level dictionary has a key like "CFBundleIdentifier".
+    var looksLikeInfoPlist: Bool
 }

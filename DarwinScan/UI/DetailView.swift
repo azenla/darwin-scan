@@ -63,6 +63,9 @@ private struct DetailContent: View {
                 if let script = item.script {
                     ScriptSection(info: script)
                 }
+                if let plist = item.plist {
+                    PlistSection(info: plist)
+                }
 
                 // Graph: outgoing relationships, contents (if a bundle),
                 // and incoming references — all index-backed so they don't
@@ -707,6 +710,66 @@ private struct ScriptSection: View {
                     }
                 }
             }
+        }
+    }
+}
+
+private struct PlistSection: View {
+    let info: PlistInfo
+    var body: some View {
+        Section(title: "Plist", systemImage: "list.bullet.indent") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    ColoredChip(text: info.kind.rawValue, color: plistKindColor(info.kind))
+                    ColoredChip(text: info.format.rawValue, color: formatColor(info.format))
+                    ColoredChip(text: info.topLevel.rawValue, color: .gray)
+                    if info.looksLikeInfoPlist {
+                        ColoredChip(text: "bundle metadata", color: .green)
+                    }
+                    Spacer()
+                }
+                if let n = info.keyCount {
+                    InfoRow(label: "Keys", value: "\(n)")
+                }
+                if let n = info.elementCount {
+                    InfoRow(label: "Elements", value: "\(n)")
+                }
+                if let preview = info.previewText, !preview.isEmpty {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Preview")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        ScrollView {
+                            Text(preview)
+                                .font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 320)
+                    }
+                }
+            }
+        }
+    }
+
+    private func plistKindColor(_ k: PlistInfo.Kind) -> Color {
+        switch k {
+        case .info:           return .green
+        case .version:        return .mint
+        case .launchService:  return .orange
+        case .preference:     return .blue
+        case .entitlements:   return .red
+        case .mappedTypes:    return .purple
+        case .other:          return .gray
+        }
+    }
+    private func formatColor(_ f: PlistInfo.Format) -> Color {
+        switch f {
+        case .xml:     return .blue
+        case .binary:  return .teal
+        case .json:    return .yellow
+        case .unknown: return .gray
         }
     }
 }

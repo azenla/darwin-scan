@@ -7,6 +7,105 @@ nonisolated enum PlistInspector {
         return try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
     }
 
+    /// Classify a `.plist` file without parsing its full contents. We peek
+    /// the first ~64 KB which is enough to detect format, top-level kind,
+    /// CFBundle keys, and capture a preview snippet for the detail view.
+    static func decodePlistInfo(at url: URL) -> (PlistInfo, previewBlob: Data?)? {
+        let head: Data
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            guard let chunk = try handle.read(upToCount: 64 * 1024) else { return nil }
+            head = chunk
+        } catch {
+            return nil
+        }
+        if head.isEmpty { return nil }
+
+        // Format sniffing.
+        let format: PlistInfo.Format
+        if head.starts(with: Array("bplist".utf8)) {
+            format = .binary
+        } else if head.starts(with: Array("<?xml".utf8))
+            || head.starts(with: Array("<plist".utf8))
+            || head.starts(with: Array("<!DOCTYPE".utf8)) {
+            format = .xml
+        } else if head.first == 0x7B /* { */ || head.first == 0x5B /* [ */ {
+            format = .json
+        } else {
+            format = .unknown
+        }
+
+        // Try a proper parse for accurate structure info. PropertyListSerialization
+        // handles xml + binary. JSON we'll just sniff structurally below.
+        var topLevel: PlistInfo.TopLevel = .other
+        var keyCount: Int? = nil
+        var elementCount: Int? = nil
+        var looksLikeInfoPlist: Bool = false
+        var dictKeys: [String] = []
+
+        if format == .xml || format == .binary,
+           let parsed = try? PropertyListSerialization.propertyList(from: head, options: [], format: nil) {
+            if let dict = parsed as? [String: Any] {
+                topLevel = .dictionary
+                keyCount = dict.count
+                dictKeys = Array(dict.keys)
+                looksLikeInfoPlist =
+                    dict.keys.contains("CFBundleIdentifier") ||
+                    dict.keys.contains("CFBundleExecutable") ||
+                    dict.keys.contains("CFBundleName")
+            } else if let array = parsed as? [Any] {
+                topLevel = .array
+                elementCount = array.count
+            }
+        } else if format == .json,
+                  let text = String(data: head, encoding: .utf8) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("{") { topLevel = .dictionary }
+            else if trimmed.hasPrefix("[") { topLevel = .array }
+        }
+
+        let kind = classifyKind(url: url, dictKeys: dictKeys, looksLikeInfoPlist: looksLikeInfoPlist)
+
+        // Preview snippet for the detail view. For binary plists we re-render
+        // as XML so the user sees something legible; for XML/JSON we just
+        // show the head.
+        var previewText: String? = nil
+        if format == .binary {
+            if let plistObj = try? PropertyListSerialization.propertyList(from: head, options: [], format: nil),
+               let xml = try? PropertyListSerialization.data(fromPropertyList: plistObj, format: .xml, options: 0),
+               let xmlText = String(data: xml, encoding: .utf8) {
+                previewText = String(xmlText.prefix(8 * 1024))
+            }
+        } else if let text = String(data: head, encoding: .utf8) {
+            previewText = String(text.prefix(8 * 1024))
+        }
+
+        let info = PlistInfo(
+            kind: kind,
+            format: format,
+            topLevel: topLevel,
+            keyCount: keyCount,
+            elementCount: elementCount,
+            previewText: previewText,
+            looksLikeInfoPlist: looksLikeInfoPlist
+        )
+        return (info, nil)
+    }
+
+    /// Heuristic classification — uses filename + parent directory to decide
+    /// what kind of plist this is, falling back to "other".
+    private static func classifyKind(url: URL, dictKeys: [String], looksLikeInfoPlist: Bool) -> PlistInfo.Kind {
+        let name = url.lastPathComponent
+        let parent = url.deletingLastPathComponent().lastPathComponent
+        if name == "Info.plist" || looksLikeInfoPlist { return .info }
+        if name == "version.plist" || name == "Version.plist" { return .version }
+        if url.pathExtension.lowercased() == "entitlements" { return .entitlements }
+        if name.hasPrefix("com.apple.") && parent == "Preferences" { return .preference }
+        if dictKeys.contains("Label") && dictKeys.contains("ProgramArguments") { return .launchService }
+        return .other
+    }
+
     /// Decode a launchd plist into a `LaunchServiceInfo`. Returns nil if
     /// the plist isn't recognizable as a launchd descriptor (no `Label`).
     static func decodeLaunchService(at url: URL) -> LaunchServiceInfo? {

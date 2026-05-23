@@ -216,15 +216,23 @@ nonisolated struct ScanPipeline: Sendable {
     /// item plus the set of blob refs we wrote to disk for it.
     func inspect(url: URL) -> InspectResult? {
         guard let (item, blobs) = classify(url: url) else { return nil }
-        // Write blobs to disk on this worker thread before crossing back to
-        // MainActor — keeps peak memory low and keeps the main thread out of
-        // the byte-pushing path entirely.
+        // Write the in-memory blobs to disk on this worker thread before
+        // crossing back to MainActor — keeps peak memory low and keeps the
+        // main thread out of the byte-pushing path entirely.
         for (ref, data) in blobs {
             blobWriter.write(data, ref: ref)
         }
         var enriched = item
         populateContextAndRelationships(item: &enriched, originalURL: url)
-        return InspectResult(item: enriched, blobRefs: Array(blobs.keys))
+        // Collect every ref this item references, whether it came in via
+        // the in-memory `blobs` dict (icons, app icons) OR was streamed
+        // directly to disk by an inspector (strings). The BlobStore needs
+        // to know about all of them so saved bundles include the files.
+        var refs = Array(blobs.keys)
+        if let r = enriched.executable?.stringsBlobRef { refs.append(r) }
+        if let r = enriched.application?.iconRef { refs.append(r) }
+        if let r = enriched.icon?.previewBlobRef { refs.append(r) }
+        return InspectResult(item: enriched, blobRefs: refs)
     }
 
     // MARK: Classification
@@ -293,6 +301,24 @@ nonisolated struct ScanPipeline: Sendable {
                 sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
                 insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
                 launchService: info,
+                tags: tags
+            ), [:])
+        }
+
+        // Plists that aren't launch services. We catch these BEFORE the
+        // Mach-O fallback because plists never have Mach-O magic, but the
+        // explicit detection lets us extract structure (format, top-level
+        // shape, key count) for the detail view.
+        if ext == "plist", let (info, _) = PlistInspector.decodePlistInfo(at: url) {
+            var tags: [String] = ["plist", info.format.rawValue]
+            if info.kind != .other { tags.append(info.kind.rawValue) }
+            if info.looksLikeInfoPlist { tags.append("Info.plist") }
+            return (ScanItem(
+                id: UUID(), path: path, name: filename, category: .plist,
+                size: size, modifiedAt: mtime,
+                sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
+                insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
+                plist: info,
                 tags: tags
             ), [:])
         }
@@ -456,7 +482,10 @@ nonisolated struct ScanPipeline: Sendable {
 
     private func makeMachOItem(at url: URL, size: Int64, mtime: Date?, info: ExecutableInfo) -> (ScanItem, [String: Data])? {
         var enriched = info
-        var blobs: [String: Data] = [:]
+        // The strings dump is streamed directly to disk inside the BlobStore
+        // cache dir via `StringsExtractor.streamStrings`, so we have no other
+        // in-memory blobs to register from this Mach-O path.
+        let blobs: [String: Data] = [:]
         let path = url.path
         let filename = url.lastPathComponent
         let inside = isInsideBundle(path)
@@ -490,9 +519,16 @@ nonisolated struct ScanPipeline: Sendable {
         enriched.roles = roles
 
         if options.extractStrings && info.kind == .executable && size <= options.maxInspectFileSize {
-            if let dump = StringsExtractor.extract(from: url, minLength: options.stringsMinLength) {
-                let ref = "strings-" + Hash.sha256Hex(dump)
-                blobs[ref] = dump
+            // Streams /usr/bin/strings output directly to disk; no blob bytes
+            // are ever held in worker memory. The function hashes the file
+            // after writing and returns the content-addressed ref — caller
+            // doesn't add anything to `blobs`, which is reserved for the
+            // in-memory writer path.
+            if let ref = StringsExtractor.streamStrings(
+                from: url,
+                minLength: options.stringsMinLength,
+                into: blobWriter.directory
+            ) {
                 enriched.stringsBlobRef = ref
             }
         }
