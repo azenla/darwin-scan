@@ -1,17 +1,14 @@
-//
-//  DarwinScanApp.swift
-//  DarwinScan
-//
-//  Created by Alex Zenla on 5/22/26.
-//
-
 import SwiftUI
 
 @main
 struct DarwinScanApp: App {
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        DocumentGroup(newDocument: { ScanDocument() }) { config in
+            ContentView(document: config.document)
+        }
+        .commands {
+            // File > Save naturally handled by DocumentGroup; nothing extra
+            // for now. Keep the menu surface minimal until features land.
         }
     }
 }
