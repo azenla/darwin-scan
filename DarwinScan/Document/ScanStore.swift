@@ -1,28 +1,45 @@
 import Foundation
 import Observation
 
-/// In-memory database for one open document. The store is the source of truth
-/// while the document is open; serialization (FileWrapper layout) is handled
-/// by `ScanDocument`/`ScanPackage`. Bulk content (icons, strings dumps) lives
-/// on disk via `BlobStore` — only metadata sits in memory.
+/// In-memory store for one open document. SQLite (`data.db`) is the persistent
+/// source of truth for full `ScanItem` payloads; this class keeps a slim
+/// `ItemHeader` for every item in memory plus a handful of derived indexes so
+/// search, lists, and sidebar counts don't pay per-row disk reads.
 ///
-/// ## Performance design
+/// ## Tiering
 ///
-/// Three indexes are maintained incrementally on every `upsert` so detail and
-/// sidebar views never have to scan the full item collection:
+/// - **Always in RAM** — one `ItemHeader` per item (~200-300 B). The header
+///   carries every field the list, sidebar, and search engine consult, so a
+///   global filter over hundreds of thousands of items never has to round-trip
+///   through SQLite.
+/// - **On demand** — full `ScanItem` (with relationships, full executable
+///   info, etc.). Fetched via `fullItem(id:)` when the detail view opens.
+///   A typical session touches a few dozen items here, not the whole store.
 ///
-/// - `categoryCounts: [ItemCategory: Int]` — drives sidebar count badges.
-///   Without this, the sidebar would re-iterate all items on every render.
-/// - `pathReferencedBy: [String: [UUID]]` — inverse adjacency. For each
-///   `targetPath` mentioned in any item's `relationships`, the list of items
-///   pointing at it. Powers DetailView's "Referenced By" section in O(1)
-///   instead of O(N × E) per render.
-/// - `itemsByOwningBundle: [String: [UUID]]` — bundle contents. Lets the
-///   detail view show what lives inside a `.app` / `.framework` / `.kext`
-///   without filtering the whole store.
+/// This is the "SQLite primary, in-memory working set" architecture flagged in
+/// CLAUDE.md. For a /System scan it's ~5-10× less RAM than holding full
+/// `ScanItem` values for every row.
 ///
-/// All three are reset along with `items` and `itemsByPath` in `reset()`. They
-/// are NOT persisted to disk — they're rebuilt on document load via `load()`.
+/// ## Indexes
+///
+/// Three derived indexes are maintained incrementally on every upsert:
+///
+/// - `categoryCounts: [ItemCategory: Int]` — sidebar count badges in O(1).
+/// - `pathReferencedBy: [String: [UUID]]` — inverse adjacency: for each
+///   `targetPath` mentioned in any item's relationships, the list of items
+///   pointing at it. Powers "Referenced By" in O(1).
+/// - `itemsByOwningBundle: [String: [UUID]]` — bundle contents.
+///
+/// All three are reset along with `items`/`itemsByPath`/`itemHeaders` in
+/// `reset()` and rebuilt on document load. They are NOT persisted.
+///
+/// ## Path-collision upserts
+///
+/// When a rescan touches a path that already has an item, the in-memory
+/// `ItemHeader` doesn't carry the previous outgoing relationships (those are
+/// only in SQLite). We query `Database.outgoingTargets(sourceID:)` right before
+/// the upsert to know which paths to scrub from `pathReferencedBy`. For
+/// initial scans nothing collides, so this query never fires.
 @Observable
 final class ScanStore {
     var systemInfo: SystemInfo? {
@@ -38,7 +55,11 @@ final class ScanStore {
         didSet { persistMeta("last_scan_completed", value: lastScanCompleted) }
     }
 
-    private(set) var items: [UUID: ScanItem] = [:]
+    /// In-memory map of all items, slim form. Full payloads come from SQLite
+    /// via `fullItem(id:)`. The name stays `items` so the rest of the app
+    /// keeps reading `store.items[id]` / `store.items.count` unchanged — the
+    /// type just narrowed from `ScanItem` to `ItemHeader`.
+    private(set) var items: [UUID: ItemHeader] = [:]
     private(set) var itemsByPath: [String: UUID] = [:]
 
     // Derived indexes — invariants enforced by upsert/remove.
@@ -105,15 +126,20 @@ final class ScanStore {
         if let existingID = itemsByPath[item.path], let existing = items[existingID] {
             // Update path: tear down derived edges of the old item, then add
             // back for the new one. The UUID stays — keeps UI selection stable.
-            removeIndexes(for: existing)
+            // Outgoing targets aren't in the in-memory header, so query SQLite
+            // for the previous edges before we overwrite them.
+            let oldTargets = (try? database?.outgoingTargets(sourceID: existingID)) ?? []
+            removeIndexes(forID: existingID, header: existing, outgoingTargets: oldTargets)
             let updated = item.withId(existingID)
-            items[existingID] = updated
-            addIndexes(for: updated)
+            let header = ItemHeader(from: updated)
+            items[existingID] = header
+            addIndexes(forID: existingID, header: header, relationships: updated.relationships)
             written = updated
         } else {
-            items[item.id] = item
+            let header = ItemHeader(from: item)
+            items[item.id] = header
             itemsByPath[item.path] = item.id
-            addIndexes(for: item)
+            addIndexes(forID: item.id, header: header, relationships: item.relationships)
             written = item
         }
         if let database {
@@ -137,15 +163,18 @@ final class ScanStore {
         for item in produced {
             let stored: ScanItem
             if let existingID = itemsByPath[item.path], let existing = items[existingID] {
-                removeIndexes(for: existing)
+                let oldTargets = (try? database?.outgoingTargets(sourceID: existingID)) ?? []
+                removeIndexes(forID: existingID, header: existing, outgoingTargets: oldTargets)
                 let updated = item.withId(existingID)
-                items[existingID] = updated
-                addIndexes(for: updated)
+                let header = ItemHeader(from: updated)
+                items[existingID] = header
+                addIndexes(forID: existingID, header: header, relationships: updated.relationships)
                 stored = updated
             } else {
-                items[item.id] = item
+                let header = ItemHeader(from: item)
+                items[item.id] = header
                 itemsByPath[item.path] = item.id
-                addIndexes(for: item)
+                addIndexes(forID: item.id, header: header, relationships: item.relationships)
                 stored = item
             }
             persisted.append(stored)
@@ -157,26 +186,32 @@ final class ScanStore {
         }
     }
 
-    private func addIndexes(for item: ScanItem) {
-        categoryCounts[item.category, default: 0] += 1
-        for rel in item.relationships {
-            pathReferencedBy[rel.targetPath, default: []].append(item.id)
+    /// Index update for a newly-added item. Takes the relationships separately
+    /// because the in-memory `ItemHeader` deliberately doesn't carry them — the
+    /// caller has the full `ScanItem` at upsert time and passes them through.
+    private func addIndexes(forID id: UUID, header: ItemHeader, relationships: [Relationship]) {
+        categoryCounts[header.category, default: 0] += 1
+        for rel in relationships {
+            pathReferencedBy[rel.targetPath, default: []].append(id)
         }
-        if let owning = item.owningBundlePath {
-            itemsByOwningBundle[owning, default: []].append(item.id)
+        if let owning = header.owningBundlePath {
+            itemsByOwningBundle[owning, default: []].append(id)
         }
     }
 
-    private func removeIndexes(for item: ScanItem) {
-        categoryCounts[item.category, default: 0] -= 1
-        for rel in item.relationships {
-            pathReferencedBy[rel.targetPath]?.removeAll { $0 == item.id }
-            if pathReferencedBy[rel.targetPath]?.isEmpty == true {
-                pathReferencedBy.removeValue(forKey: rel.targetPath)
+    /// Index teardown for an item being replaced. `outgoingTargets` comes
+    /// from SQLite via `Database.outgoingTargets(sourceID:)` since the
+    /// in-memory header doesn't carry them.
+    private func removeIndexes(forID id: UUID, header: ItemHeader, outgoingTargets: [String]) {
+        categoryCounts[header.category, default: 0] -= 1
+        for target in outgoingTargets {
+            pathReferencedBy[target]?.removeAll { $0 == id }
+            if pathReferencedBy[target]?.isEmpty == true {
+                pathReferencedBy.removeValue(forKey: target)
             }
         }
-        if let owning = item.owningBundlePath {
-            itemsByOwningBundle[owning]?.removeAll { $0 == item.id }
+        if let owning = header.owningBundlePath {
+            itemsByOwningBundle[owning]?.removeAll { $0 == id }
             if itemsByOwningBundle[owning]?.isEmpty == true {
                 itemsByOwningBundle.removeValue(forKey: owning)
             }
@@ -191,45 +226,68 @@ final class ScanStore {
 
     // MARK: - Queries
 
-    func items(in category: ItemCategory) -> [ScanItem] {
+    func items(in category: ItemCategory) -> [ItemHeader] {
         items.values.filter { $0.category == category }
     }
 
-    func item(atPath path: String) -> ScanItem? {
+    func item(atPath path: String) -> ItemHeader? {
         guard let id = itemsByPath[path] else { return nil }
         return items[id]
     }
 
-    /// Items that reference this path via outgoing relationships.
+    /// Fetch the full `ScanItem` payload for `id` from SQLite. Synchronous
+    /// (Database holds an internal lock; reads are ~ms) — call from
+    /// `MainActor` only. Returns `nil` if no database is attached or the
+    /// row was deleted between header insert and this call.
+    ///
+    /// Detail views use this in a `.task(id:)` so the load happens as the
+    /// selection changes, not on every body re-render.
+    func fullItem(id: UUID) -> ScanItem? {
+        guard let database else { return nil }
+        return try? database.item(id: id)
+    }
+
+    /// Headers that reference this path via outgoing relationships.
     /// O(1) lookup + O(K) materialization where K is the incoming degree.
-    func incomingReferences(toPath path: String) -> [ScanItem] {
+    func incomingReferences(toPath path: String) -> [ItemHeader] {
         guard let ids = pathReferencedBy[path] else { return [] }
         return ids.compactMap { items[$0] }
     }
 
-    /// Items whose `owningBundlePath` is this path. O(1) + O(K).
-    func contents(ofBundleAtPath bundlePath: String) -> [ScanItem] {
+    /// Same as `incomingReferences(toPath:)` but materializes at most `limit`
+    /// items and returns the total count separately. The detail view only
+    /// renders the first 64; without this, viewing a popular dylib (libSystem,
+    /// CoreFoundation, …) allocated a header for every binary that linked it
+    /// just to slice it down to 64 rows.
+    func incomingReferencesPrefix(toPath path: String, limit: Int) -> (total: Int, items: [ItemHeader]) {
+        guard let ids = pathReferencedBy[path] else { return (0, []) }
+        let prefix = ids.prefix(limit).compactMap { items[$0] }
+        return (ids.count, prefix)
+    }
+
+    /// Headers whose `owningBundlePath` is this path. O(1) + O(K).
+    func contents(ofBundleAtPath bundlePath: String) -> [ItemHeader] {
         guard let ids = itemsByOwningBundle[bundlePath] else { return [] }
         return ids.compactMap { items[$0] }
     }
 
     /// Legacy plain-text search retained for the simple-search code path.
     /// The richer `SearchQuery`-based filter lives in `Search/SearchQuery.swift`.
-    func search(_ query: String, scope: ItemCategory? = nil) -> [ScanItem] {
+    func search(_ query: String, scope: ItemCategory? = nil) -> [ItemHeader] {
         let q = query.lowercased()
         guard !q.isEmpty else {
             if let s = scope { return items(in: s) }
             return Array(items.values)
         }
-        return items.values.filter { item in
-            if let s = scope, item.category != s { return false }
-            if item.name.lowercased().contains(q) { return true }
-            if item.path.lowercased().contains(q) { return true }
-            if let context = item.context?.lowercased(), context.contains(q) { return true }
-            if item.tags.contains(where: { $0.lowercased().contains(q) }) { return true }
-            if let usage = item.executable?.usageLine?.lowercased(), usage.contains(q) { return true }
-            if let label = item.launchService?.label?.lowercased(), label.contains(q) { return true }
-            if let bundleId = item.application?.bundleIdentifier?.lowercased(), bundleId.contains(q) { return true }
+        return items.values.filter { header in
+            if let s = scope, header.category != s { return false }
+            if header.lowercasedName.contains(q) { return true }
+            if header.path.lowercased().contains(q) { return true }
+            if let context = header.context?.lowercased(), context.contains(q) { return true }
+            if header.tags.contains(where: { $0.lowercased().contains(q) }) { return true }
+            if let usage = header.usageLine?.lowercased(), usage.contains(q) { return true }
+            if let label = header.launchServiceLabel?.lowercased(), label.contains(q) { return true }
+            if let bundleId = header.bundleIdentifier?.lowercased(), bundleId.contains(q) { return true }
             return false
         }
     }
@@ -264,9 +322,13 @@ final class ScanStore {
         self.database = nil
         reset()
         for item in items {
-            self.items[item.id] = item
+            // Build the slim header for in-memory storage, but feed indexes
+            // from the full ScanItem (we still have it locally) so we don't
+            // need a per-item SQLite query for relationships during load.
+            let header = ItemHeader(from: item)
+            self.items[item.id] = header
             self.itemsByPath[item.path] = item.id
-            addIndexes(for: item)
+            addIndexes(forID: item.id, header: header, relationships: item.relationships)
         }
         self.systemInfo = systemInfo
         if let options { self.options = options }

@@ -66,6 +66,8 @@ nonisolated final class Database: @unchecked Sendable {
     private var clearItemsStmt: OpaquePointer?
     private var clearRelsStmt: OpaquePointer?
     private var allItemsStmt: OpaquePointer?
+    private var itemByIdStmt: OpaquePointer?
+    private var outgoingTargetsStmt: OpaquePointer?
     private var setMetaStmt: OpaquePointer?
     private var getMetaStmt: OpaquePointer?
 
@@ -202,6 +204,61 @@ nonisolated final class Database: @unchecked Sendable {
             try? rollbackTransaction()
             throw error
         }
+    }
+
+    /// Single-row fetch by UUID. Used by `ScanStore.fullItem(id:)` when the
+    /// detail view needs the heavy payload (relationships, full executable
+    /// info, etc.) that the in-memory `ItemHeader` deliberately doesn't
+    /// carry. Called from `MainActor`; the lock makes the read safe
+    /// against concurrent writes from the scan worker.
+    func item(id: UUID) throws -> ScanItem? {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        guard let stmt = itemByIdStmt else {
+            throw DBError.prepare("itemById statement nil")
+        }
+        sqlite3_reset(stmt)
+        sqlite3_clear_bindings(stmt)
+        let key = id.uuidString.lowercased()
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+        let rc = sqlite3_step(stmt)
+        if rc == SQLITE_DONE { return nil }
+        guard rc == SQLITE_ROW else {
+            throw DBError.step("item(id) sqlite3_step -> \(rc): \(lastError())")
+        }
+        guard let blob = sqlite3_column_blob(stmt, 0) else { return nil }
+        let len = Int(sqlite3_column_bytes(stmt, 0))
+        let data = Data(bytes: blob, count: len)
+        return try decoder.decode(ScanItem.self, from: data)
+    }
+
+    /// Outgoing target paths for a source item. Needed when `ScanStore` has
+    /// to remove relationship-index entries for an item being replaced
+    /// during a path-collision upsert — the in-memory `ItemHeader` doesn't
+    /// carry relationships, so we fetch the old list from SQLite right
+    /// before overwriting it.
+    func outgoingTargets(sourceID: UUID) throws -> [String] {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        guard let stmt = outgoingTargetsStmt else {
+            throw DBError.prepare("outgoingTargets statement nil")
+        }
+        sqlite3_reset(stmt)
+        sqlite3_clear_bindings(stmt)
+        let key = sourceID.uuidString.lowercased()
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+        var results: [String] = []
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else {
+                throw DBError.step("outgoingTargets sqlite3_step -> \(rc): \(lastError())")
+            }
+            if let cstr = sqlite3_column_text(stmt, 0) {
+                results.append(String(cString: cstr))
+            }
+        }
+        return results
     }
 
     /// Read every row back as a `ScanItem`. Called once on document open; in
@@ -401,6 +458,8 @@ nonisolated final class Database: @unchecked Sendable {
         clearItemsStmt  = try prepare("DELETE FROM items")
         clearRelsStmt   = try prepare("DELETE FROM relationships")
         allItemsStmt    = try prepare("SELECT payload FROM items")
+        itemByIdStmt    = try prepare("SELECT payload FROM items WHERE id = ?")
+        outgoingTargetsStmt = try prepare("SELECT target_path FROM relationships WHERE source_id = ?")
         setMetaStmt     = try prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
         getMetaStmt     = try prepare("SELECT value FROM meta WHERE key = ?")
     }
@@ -408,7 +467,9 @@ nonisolated final class Database: @unchecked Sendable {
     private func finalizeAllStatements() {
         let all: [OpaquePointer?] = [
             upsertItemStmt, deleteRelStmt, insertRelStmt, deleteItemStmt,
-            clearItemsStmt, clearRelsStmt, allItemsStmt, setMetaStmt, getMetaStmt
+            clearItemsStmt, clearRelsStmt, allItemsStmt,
+            itemByIdStmt, outgoingTargetsStmt,
+            setMetaStmt, getMetaStmt
         ]
         for stmt in all {
             if let stmt { sqlite3_finalize(stmt) }
@@ -420,6 +481,8 @@ nonisolated final class Database: @unchecked Sendable {
         clearItemsStmt = nil
         clearRelsStmt = nil
         allItemsStmt = nil
+        itemByIdStmt = nil
+        outgoingTargetsStmt = nil
         setMetaStmt = nil
         getMetaStmt = nil
     }

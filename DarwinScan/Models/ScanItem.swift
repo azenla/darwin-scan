@@ -300,6 +300,91 @@ nonisolated struct ScriptInfo: Codable, Hashable, Sendable {
     var lineCount: Int?
 }
 
+/// Slim in-memory projection of a `ScanItem`. The runtime store keeps one
+/// of these per item rather than the full payload — for a /System scan
+/// that's a ~5-10× cut in RAM because the heavy fields (relationships,
+/// `executable.linkedLibraries`, large per-category payloads) stay in
+/// SQLite and are loaded only when the detail view actually needs them.
+///
+/// Everything the list/sidebar render and everything the `SearchQuery`
+/// engine consults must live here directly — search must NEVER hit SQLite
+/// per item, because a global filter would then mean N synchronous reads
+/// to disk on the main thread.
+///
+/// Building the header from a ScanItem is the moment we denormalise: we
+/// flatten `executable.architectures`, `application.bundleIdentifier`,
+/// `framework.isPrivate`, etc. into top-level scalars. If you add a new
+/// search filter that wants a field on a payload struct, denormalise it
+/// here too.
+nonisolated struct ItemHeader: Sendable, Hashable, Identifiable {
+    var id: UUID
+    var path: String
+    var name: String
+    /// Pre-lowercased for the alphabetical sort in `ItemListView`. Avoids
+    /// re-allocating a lowercased copy of the name on every comparison.
+    var lowercasedName: String
+    var category: ItemCategory
+    var size: Int64
+    var modifiedAt: Date?
+    var sha256: String?
+    var insideBundle: Bool
+    var owningBundlePath: String?
+    var tags: [String]
+    var context: String?
+
+    // Denormalised, search-relevant fields. Defaults are chosen so the
+    // matchers behave identically to the old "guard let executable.foo"
+    // patterns: empty arrays / nil / false rather than absent.
+    var architectures: [String]
+    var platform: String?
+    var usageLine: String?
+    var bundleIdentifier: String?
+    var launchServiceLabel: String?
+    var language: String?
+    var minOS: String?
+    var roles: [ExecutableInfo.Role]
+    var isApple: Bool
+    var isCrossPlatformTool: Bool
+    var isFatBinary: Bool
+    var isPrivateFramework: Bool
+
+    init(from item: ScanItem) {
+        self.id = item.id
+        self.path = item.path
+        self.name = item.name
+        self.lowercasedName = item.name.lowercased()
+        self.category = item.category
+        self.size = item.size
+        self.modifiedAt = item.modifiedAt
+        self.sha256 = item.sha256
+        self.insideBundle = item.insideBundle
+        self.owningBundlePath = item.owningBundlePath
+        self.tags = item.tags
+        self.context = item.context
+
+        self.architectures        = item.executable?.architectures ?? []
+        self.platform             = item.executable?.platform
+        self.usageLine            = item.executable?.usageLine
+        self.bundleIdentifier     = item.application?.bundleIdentifier
+        self.launchServiceLabel   = item.launchService?.label
+        self.language             = item.localization?.language
+        self.minOS                = item.executable?.minOS
+        self.roles                = item.executable?.roles ?? []
+        self.isApple              = item.executable?.isApple ?? false
+        self.isCrossPlatformTool  = item.executable?.isCrossPlatformTool ?? false
+        self.isFatBinary          = item.executable?.isFatBinary ?? false
+        self.isPrivateFramework   = item.framework?.isPrivate ?? false
+    }
+
+    /// Used by `ScanStore.upsert` when a path collision reuses an existing
+    /// UUID — we keep the new content but the stable id.
+    func withId(_ newId: UUID) -> ItemHeader {
+        var copy = self
+        copy.id = newId
+        return copy
+    }
+}
+
 nonisolated struct PlistInfo: Codable, Hashable, Sendable {
     /// Best-effort classification by filename / location, used to drive the
     /// "Kind" tag in the UI without re-parsing.

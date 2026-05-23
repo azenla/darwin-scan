@@ -5,21 +5,85 @@ import AppKit
 /// selected item's category. Heavy on stat tiles + pill chips + clickable
 /// graph rows so users can navigate item ↔ item without leaving the detail
 /// pane.
+///
+/// The list view holds only `ItemHeader` per row to keep memory bounded; the
+/// detail view needs the full `ScanItem` (relationships, full executable
+/// info, etc.). We fetch it from SQLite via `store.fullItem(id:)` once per
+/// selection change, in a `.task(id:)` so the load doesn't run on every
+/// body invalidation.
 struct DetailView: View {
     @Bindable var store: ScanStore
     @Binding var itemSelection: UUID?
 
+    @State private var loadedItem: ScanItem?
+    @State private var loadedID: UUID?
+
     var body: some View {
-        if let id = itemSelection, let item = store.items[id] {
-            DetailContent(item: item, store: store, itemSelection: $itemSelection)
-                .id(item.id) // resets scroll position when selection changes
-        } else {
-            ContentUnavailableView(
-                "No Item Selected",
-                systemImage: "rectangle.on.rectangle",
-                description: Text("Pick an item from the list to see its details.")
-            )
+        Group {
+            if let id = itemSelection, let item = loadedItem, loadedID == id {
+                DetailContent(item: item, store: store, itemSelection: $itemSelection)
+                    .id(id)
+            } else if let id = itemSelection, let header = store.items[id] {
+                // Selection changed but the full payload isn't loaded yet —
+                // typically a single frame. Show a slim placeholder so the
+                // header info doesn't pop in.
+                DetailLoadingPlaceholder(header: header).id(id)
+            } else {
+                ContentUnavailableView(
+                    "No Item Selected",
+                    systemImage: "rectangle.on.rectangle",
+                    description: Text("Pick an item from the list to see its details.")
+                )
+            }
         }
+        .task(id: itemSelection) {
+            guard let id = itemSelection else {
+                loadedItem = nil
+                loadedID = nil
+                return
+            }
+            let item = store.fullItem(id: id)
+            if Task.isCancelled { return }
+            loadedItem = item
+            loadedID = id
+        }
+    }
+}
+
+/// Tiny header-only stub shown for the single frame between a selection
+/// change and the full payload arriving from SQLite. Mirrors the
+/// `HeaderCard` layout so there's no layout jump when the full view swaps
+/// in.
+private struct DetailLoadingPlaceholder: View {
+    let header: ItemHeader
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12).fill(.tint.opacity(0.15))
+                    Image(systemName: header.category.systemImageName)
+                        .font(.system(size: 30))
+                        .foregroundStyle(.tint)
+                }
+                .frame(width: 64, height: 64)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(header.name).font(.title2).bold().lineLimit(2)
+                    if let ctx = header.context {
+                        Text(ctx).font(.callout).foregroundStyle(.secondary)
+                    }
+                    Text(header.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                ProgressView().controlSize(.small)
+            }
+            Spacer()
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -858,7 +922,7 @@ private struct BundleContentsSection: View {
 
 private struct BundleContentsBucket: View {
     let category: ItemCategory
-    let items: [ScanItem]
+    let items: [ItemHeader]
     @Bindable var store: ScanStore
     @Binding var itemSelection: UUID?
 
@@ -866,7 +930,7 @@ private struct BundleContentsBucket: View {
     private let collapsedLimit = 6
 
     var body: some View {
-        let sorted = items.sorted { $0.name.lowercased() < $1.name.lowercased() }
+        let sorted = items.sorted { $0.lowercasedName < $1.lowercasedName }
         let visible = expanded ? sorted : Array(sorted.prefix(collapsedLimit))
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
@@ -915,17 +979,17 @@ private struct IncomingReferencesSection: View {
     @Binding var itemSelection: UUID?
 
     var body: some View {
-        let incoming = store.incomingReferences(toPath: item.path)
-        if incoming.isEmpty {
+        let (total, incoming) = store.incomingReferencesPrefix(toPath: item.path, limit: 64)
+        if total == 0 {
             EmptyView()
         } else {
             Section(
                 title: "Referenced By",
                 systemImage: "arrow.turn.up.left",
-                accessory: "\(incoming.count)"
+                accessory: "\(total)"
             ) {
                 VStack(alignment: .leading, spacing: 3) {
-                    ForEach(incoming.prefix(64), id: \.id) { ref in
+                    ForEach(incoming, id: \.id) { ref in
                         Button {
                             itemSelection = ref.id
                         } label: {
@@ -951,8 +1015,8 @@ private struct IncomingReferencesSection: View {
                         }
                         .buttonStyle(.plain)
                     }
-                    if incoming.count > 64 {
-                        Text("…\(incoming.count - 64) more")
+                    if total > incoming.count {
+                        Text("…\(total - incoming.count) more")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

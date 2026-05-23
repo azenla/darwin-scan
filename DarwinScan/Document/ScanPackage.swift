@@ -95,9 +95,13 @@ enum ScanPackage {
         // session, but if a stale file is somehow there, remove it.
         try? FileManager.default.removeItem(at: dbURL)
 
-        if let dbWrapper = children[databaseFilename],
-           let dbBytes = dbWrapper.regularFileContents {
-            try dbBytes.write(to: dbURL, options: .atomic)
+        if let dbWrapper = children[databaseFilename] {
+            // Use `FileWrapper.write(to:options:)` rather than reading
+            // `regularFileContents` first — for a /System scan with strings
+            // extraction `data.db` can be hundreds of MB, and materialising
+            // it as a `Data` buffer just to write it out doubles peak memory
+            // on open. `write(to:)` streams when the source is file-backed.
+            try dbWrapper.write(to: dbURL, options: [], originalContentsURL: nil)
             try openAndAttachDatabase(at: dbURL, store: store)
             try loadFromAttachedDatabase(store: store)
         } else if let itemsWrapper = children[legacyItemsFilename],

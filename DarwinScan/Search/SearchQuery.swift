@@ -28,7 +28,10 @@ import Foundation
 /// Multiple tokens are AND-combined. Quoting `"like this"` keeps spaces
 /// inside a value. Unknown `field:value` pairs fall through to free text so
 /// users don't get silently filtered to zero results.
-struct SearchQuery: Equatable, Sendable {
+/// `nonisolated` so off-main work (e.g. `ItemListView`'s background filter
+/// pass) can call `matches(_:)` without an actor hop. The struct is a pure
+/// value type — no MainActor state — so this is a no-op semantically.
+nonisolated struct SearchQuery: Equatable, Sendable {
     var freeText: String = ""
     var filters: [Filter] = []
 
@@ -196,38 +199,40 @@ struct SearchQuery: Equatable, Sendable {
 
     // MARK: - Evaluation
 
-    /// True when the item satisfies every filter AND (if non-empty) the
-    /// free-text term is found in one of the searchable fields.
-    /// Designed to be hot — only allocates lowercase strings of the item's
-    /// fields once per call, no per-filter allocations.
-    func matches(_ item: ScanItem) -> Bool {
+    /// True when the header satisfies every filter AND (if non-empty) the
+    /// free-text term is found in one of the searchable fields. Operates on
+    /// `ItemHeader` rather than `ScanItem` so a global filter over a /System
+    /// scan never has to fetch full payloads from SQLite.
+    ///
+    /// Uses `lowercasedName` (cached on the header) and lowercases other
+    /// fields lazily — typical items don't have all of them set.
+    func matches(_ header: ItemHeader) -> Bool {
         for filter in filters {
-            if !evaluate(filter, against: item) { return false }
+            if !evaluate(filter, against: header) { return false }
         }
         guard !freeText.isEmpty else { return true }
         let q = freeText.lowercased()
-        if item.name.lowercased().contains(q) { return true }
-        if item.path.lowercased().contains(q) { return true }
-        if let ctx = item.context?.lowercased(), ctx.contains(q) { return true }
-        for tag in item.tags { if tag.lowercased().contains(q) { return true } }
-        if let usage = item.executable?.usageLine?.lowercased(), usage.contains(q) { return true }
-        if let bundleID = item.application?.bundleIdentifier?.lowercased(), bundleID.contains(q) { return true }
-        if let label = item.launchService?.label?.lowercased(), label.contains(q) { return true }
+        if header.lowercasedName.contains(q) { return true }
+        if header.path.lowercased().contains(q) { return true }
+        if let ctx = header.context?.lowercased(), ctx.contains(q) { return true }
+        for tag in header.tags { if tag.lowercased().contains(q) { return true } }
+        if let usage = header.usageLine?.lowercased(), usage.contains(q) { return true }
+        if let bundleID = header.bundleIdentifier?.lowercased(), bundleID.contains(q) { return true }
+        if let label = header.launchServiceLabel?.lowercased(), label.contains(q) { return true }
         return false
     }
 
-    private func evaluate(_ filter: Filter, against item: ScanItem) -> Bool {
+    private func evaluate(_ filter: Filter, against header: ItemHeader) -> Bool {
         switch filter {
         case .architecture(let val):
             let v = val.lowercased()
-            guard let archs = item.executable?.architectures else { return false }
-            return archs.contains { $0.lowercased().contains(v) }
+            return header.architectures.contains { $0.lowercased().contains(v) }
 
         case .app(let val):
             let v = val.lowercased()
             // The item itself is the app, or one of its ancestors is.
-            if item.category == .application, item.name.lowercased().contains(v) { return true }
-            if let owning = item.owningBundlePath?.lowercased(),
+            if header.category == .application, header.lowercasedName.contains(v) { return true }
+            if let owning = header.owningBundlePath?.lowercased(),
                owning.contains(".app/") || owning.hasSuffix(".app") {
                 let base = ((owning as NSString).lastPathComponent)
                 if base.contains(v) { return true }
@@ -236,23 +241,20 @@ struct SearchQuery: Equatable, Sendable {
 
         case .bundle(let val):
             let v = val.lowercased()
-            // Matches anything whose enclosing bundle's basename contains the
-            // value — works for .app, .framework, .kext, .bundle, etc.
-            if let owning = item.owningBundlePath {
+            if let owning = header.owningBundlePath {
                 let base = ((owning as NSString).lastPathComponent).lowercased()
                 if base.contains(v) { return true }
             }
-            // Or the item itself is a bundle-shaped category.
-            if [.application, .framework, .kext].contains(item.category) {
-                let base = ((item.path as NSString).lastPathComponent).lowercased()
+            if [.application, .framework, .kext].contains(header.category) {
+                let base = ((header.path as NSString).lastPathComponent).lowercased()
                 if base.contains(v) { return true }
             }
             return false
 
         case .kext(let val):
             let v = val.lowercased()
-            if item.category == .kext, item.name.lowercased().contains(v) { return true }
-            if let owning = item.owningBundlePath?.lowercased(), owning.contains(".kext") {
+            if header.category == .kext, header.lowercasedName.contains(v) { return true }
+            if let owning = header.owningBundlePath?.lowercased(), owning.contains(".kext") {
                 let base = ((owning as NSString).lastPathComponent).lowercased()
                 if base.contains(v) { return true }
             }
@@ -260,8 +262,8 @@ struct SearchQuery: Equatable, Sendable {
 
         case .framework(let val):
             let v = val.lowercased()
-            if item.category == .framework, item.name.lowercased().contains(v) { return true }
-            if let owning = item.owningBundlePath?.lowercased(), owning.contains(".framework") {
+            if header.category == .framework, header.lowercasedName.contains(v) { return true }
+            if let owning = header.owningBundlePath?.lowercased(), owning.contains(".framework") {
                 let base = ((owning as NSString).lastPathComponent).lowercased()
                 if base.contains(v) { return true }
             }
@@ -269,38 +271,38 @@ struct SearchQuery: Equatable, Sendable {
 
         case .language(let val):
             let v = val.lowercased()
-            if let lang = item.localization?.language?.lowercased(), lang == v || lang.contains(v) {
+            if let lang = header.language?.lowercased(), lang == v || lang.contains(v) {
                 return true
             }
             return false
 
         case .platform(let val):
-            return item.executable?.platform?.lowercased().contains(val.lowercased()) ?? false
+            return header.platform?.lowercased().contains(val.lowercased()) ?? false
 
         case .tag(let val):
             let v = val.lowercased()
-            return item.tags.contains { $0.lowercased() == v || $0.lowercased().contains(v) }
+            return header.tags.contains { $0.lowercased() == v || $0.lowercased().contains(v) }
 
         case .category(let c):
-            return item.category == c
+            return header.category == c
 
         case .role(let r):
-            return item.executable?.roles.contains(r) ?? false
+            return header.roles.contains(r)
 
         case .apple(let want):
-            return (item.executable?.isApple ?? false) == want
+            return header.isApple == want
 
         case .crossPlatform(let want):
-            return (item.executable?.isCrossPlatformTool ?? false) == want
+            return header.isCrossPlatformTool == want
 
         case .fat(let want):
-            return (item.executable?.isFatBinary ?? false) == want
+            return header.isFatBinary == want
 
         case .privateBundle(let want):
-            return (item.framework?.isPrivate ?? false) == want
+            return header.isPrivateFramework == want
 
         case .minOS(let val):
-            return item.executable?.minOS?.contains(val) ?? false
+            return header.minOS?.contains(val) ?? false
         }
     }
 }
