@@ -4,6 +4,12 @@ import Observation
 /// Single-shot scan controller. Holds an `actor`-isolated worker that does the
 /// heavy lifting and a `@Observable` MainActor-side surface (`progress`,
 /// `isRunning`) that SwiftUI can bind to.
+///
+/// IMPORTANT: `progress` has a single writer — the worker, via `progressSink`.
+/// `batchSink` ingests items but does NOT touch `progress`. This is what keeps
+/// the on-screen counters from flapping: every snapshot is internally
+/// consistent because no other callback can clobber individual fields between
+/// snapshots.
 @Observable
 @MainActor
 final class ScanController {
@@ -17,10 +23,6 @@ final class ScanController {
         workerTask?.cancel()
     }
 
-    /// Kick off a scan. Items are ingested into the provided store in batches
-    /// that are throttled to ~4 per second so the main thread isn't constantly
-    /// re-rendering the list. Blob bytes are written to disk on the worker
-    /// before crossing back to the main actor.
     func startScan(options: ScanOptions, ingestInto store: ScanStore) {
         guard !isRunning else { return }
         isRunning = true
@@ -40,7 +42,9 @@ final class ScanController {
                 progressSink: { [weak self] snapshot in
                     self?.progress = snapshot
                 },
-                batchSink: { [weak self] results in
+                batchSink: { results in
+                    // Ingest only — never write to `progress` from here.
+                    // The worker owns all progress counters.
                     var refs: [String] = []
                     refs.reserveCapacity(results.count)
                     var newItems: [ScanItem] = []
@@ -51,16 +55,13 @@ final class ScanController {
                     }
                     blobStore.registerMany(refs)
                     store.ingest(newItems)
-                    self?.progress.itemsFound = store.items.count
-                    for item in newItems {
-                        self?.progress.perCategoryCounts[item.category, default: 0] += 1
-                    }
                 },
                 systemInfoSink: { info in
                     store.systemInfo = info
                 }
             )
             self?.progress.phase = .done
+            self?.progress.inFlightPaths.removeAll()
             self?.isRunning = false
             store.lastScanCompleted = Date()
         }
@@ -87,6 +88,11 @@ private actor ScanWorker {
     /// actor's body (never from child tasks, which keeps it Sendable-clean).
     /// Throttled flushes batch ingested items so SwiftUI sees ~4 updates per
     /// second instead of one per file.
+    ///
+    /// The TaskGroup payload is `(URL, InspectResult?)` rather than just
+    /// `InspectResult?` so we can identify which URL just completed and
+    /// remove it from the in-flight set — that's what powers the live queue
+    /// view in the UI.
     func run(
         options: ScanOptions,
         blobWriter: BlobWriter,
@@ -97,16 +103,16 @@ private actor ScanWorker {
         let info = SystemInfoCollector.capture()
         await systemInfoSink(info)
 
-        var progress = ScanProgress(phase: .enumerating, startedAt: Date())
-        await progressSink(progress)
-
         let pipeline = ScanPipeline(options: options, blobWriter: blobWriter)
         let walker = FileWalker(options: options)
 
-        // Aim for one task per logical core minus one (leave headroom for UI).
-        // Most inspectors are I/O bound; over-subscribing past CPU count
-        // doesn't help once we're saturating disk.
         let maxConcurrent = max(2, ProcessInfo.processInfo.activeProcessorCount - 1)
+        var progress = ScanProgress(
+            phase: .enumerating,
+            startedAt: Date(),
+            workerCount: maxConcurrent
+        )
+        await progressSink(progress)
 
         var batch: [InspectResult] = []
         batch.reserveCapacity(256)
@@ -116,7 +122,13 @@ private actor ScanWorker {
         let progressInterval: TimeInterval = 0.15
         let batchSize = 256
 
-        await withTaskGroup(of: InspectResult?.self) { group in
+        // Ordered list of paths currently being inspected. Order = enqueue
+        // order, so the UI shows a stable list. We use an array rather than
+        // a Set because rendering wants determinism.
+        var inFlight: [String] = []
+        inFlight.reserveCapacity(maxConcurrent)
+
+        await withTaskGroup(of: (URL, InspectResult?).self) { group in
             var iterator = walker.makeStream().makeAsyncIterator()
 
             // Prime the window with `maxConcurrent` initial tasks. After this,
@@ -125,33 +137,43 @@ private actor ScanWorker {
             for _ in 0..<maxConcurrent {
                 guard let url = await iterator.next() else { break }
                 progress.filesVisited += 1
-                progress.currentPath = url.path
+                inFlight.append(url.path)
                 group.addTask {
-                    if Task.isCancelled { return nil }
-                    return pipeline.inspect(url: url)
+                    if Task.isCancelled { return (url, nil) }
+                    return (url, pipeline.inspect(url: url))
                 }
             }
             progress.phase = .inspecting
+            progress.inFlightPaths = inFlight
             await progressSink(progress)
 
-            while let result = await group.next() {
+            while let (completedURL, result) = await group.next() {
                 if Task.isCancelled {
                     group.cancelAll()
                     continue
                 }
 
+                // Remove the completed URL from the in-flight list. There's
+                // exactly one matching entry — we never enqueue the same URL
+                // twice. firstIndex(of:) is O(n) but n ≤ activeCPUs.
+                if let idx = inFlight.firstIndex(of: completedURL.path) {
+                    inFlight.remove(at: idx)
+                }
+
                 if let result = result {
                     batch.append(result)
                     progress.filesInspected += 1
+                    progress.itemsFound += 1
+                    progress.perCategoryCounts[result.item.category, default: 0] += 1
                 }
 
                 // Top up the window with the next URL, if any.
                 if let url = await iterator.next() {
                     progress.filesVisited += 1
-                    progress.currentPath = url.path
+                    inFlight.append(url.path)
                     group.addTask {
-                        if Task.isCancelled { return nil }
-                        return pipeline.inspect(url: url)
+                        if Task.isCancelled { return (url, nil) }
+                        return (url, pipeline.inspect(url: url))
                     }
                 }
 
@@ -164,6 +186,7 @@ private actor ScanWorker {
                 }
                 if now.timeIntervalSince(lastProgressEmit) >= progressInterval {
                     lastProgressEmit = now
+                    progress.inFlightPaths = inFlight
                     await progressSink(progress)
                 }
             }
@@ -174,7 +197,7 @@ private actor ScanWorker {
         }
 
         progress.phase = .done
-        progress.currentPath = ""
+        progress.inFlightPaths = []
         await progressSink(progress)
     }
 }

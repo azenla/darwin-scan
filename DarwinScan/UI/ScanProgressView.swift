@@ -1,43 +1,115 @@
 import SwiftUI
 
-/// Toolbar / sheet view for an in-flight scan. Shows phase, current path,
-/// running counts, and a cancel button.
+/// Bottom toolbar shown while a scan is running.
+///
+/// Layout: a stable counter row up top (phase, items, visited, workers,
+/// cancel) plus a collapsible "queue" panel below showing one row per
+/// currently-inspecting worker. The queue is the live view of what's being
+/// worked on — paths get added when a task is enqueued and removed when it
+/// completes, so the list grows and shrinks but doesn't flicker between
+/// individual paths the way a "currentPath" string would.
 struct ScanProgressBar: View {
     let progress: ScanProgress
     var onCancel: () -> Void = {}
+    @State private var showQueue: Bool = true
 
     var body: some View {
+        VStack(spacing: 0) {
+            counterRow
+            if showQueue && !progress.inFlightPaths.isEmpty {
+                Divider()
+                queuePanel
+            }
+        }
+        .background(.bar)
+    }
+
+    private var counterRow: some View {
         HStack(spacing: 12) {
             ProgressView()
                 .controlSize(.small)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(headline)
                     .font(.callout)
                     .lineLimit(1)
-                Text(progress.currentPath)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                if progress.workerCount > 0 {
+                    Text("\(progress.inFlightPaths.count) of \(progress.workerCount) workers active")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer()
-            Text("\(progress.itemsFound) items / \(progress.filesVisited) visited")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
+            statsView
+            Button {
+                showQueue.toggle()
+            } label: {
+                Image(systemName: showQueue ? "chevron.down" : "chevron.up")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .help(showQueue ? "Hide queue" : "Show queue")
             Button("Cancel", action: onCancel)
                 .controlSize(.small)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(.bar)
+    }
+
+    private var statsView: some View {
+        HStack(spacing: 14) {
+            statColumn(label: "items", value: progress.itemsFound)
+            statColumn(label: "visited", value: progress.filesVisited)
+            statColumn(label: "inspected", value: progress.filesInspected)
+        }
+        .font(.caption)
+        .monospacedDigit()
+    }
+
+    private func statColumn(label: String, value: Int) -> some View {
+        VStack(alignment: .trailing, spacing: 0) {
+            Text("\(value)")
+                .foregroundStyle(.primary)
+            Text(label)
+                .foregroundStyle(.tertiary)
+                .font(.caption2)
+        }
+    }
+
+    private var queuePanel: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            ForEach(Array(progress.inFlightPaths.enumerated()), id: \.offset) { (idx, path) in
+                HStack(spacing: 6) {
+                    workerIndexBadge(idx: idx)
+                    Text(path)
+                        .font(.system(.caption, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    /// Tiny circular badge showing which worker slot a path belongs to. The
+    /// index is by enqueue order, not stable across the whole scan, but it
+    /// gives a visual cue when the same row updates.
+    private func workerIndexBadge(idx: Int) -> some View {
+        Text("\(idx + 1)")
+            .font(.system(.caption2, design: .monospaced))
+            .foregroundStyle(.white)
+            .frame(width: 16, height: 16)
+            .background(Circle().fill(.tint.opacity(0.85)))
     }
 
     private var headline: String {
         switch progress.phase {
         case .idle:         return "Idle"
         case .enumerating:  return "Enumerating files…"
-        case .inspecting:   return "Inspecting…"
+        case .inspecting:   return "Inspecting in parallel…"
         case .writing:      return "Writing…"
         case .done:         return "Done"
         case .failed:       return progress.lastError ?? "Failed"
