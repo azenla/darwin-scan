@@ -3,59 +3,104 @@ import Observation
 
 /// In-memory database for one open document. The store is the source of truth
 /// while the document is open; serialization (FileWrapper layout) is handled
-/// by `ScanDocument`/`ScanPackage`.
+/// by `ScanDocument`/`ScanPackage`. Bulk content (icons, strings dumps) lives
+/// on disk via `BlobStore` — only metadata sits in memory.
 ///
-/// We keep two indexes: `items` keyed by UUID (for stable identity across UI
-/// renders), and `itemsByPath` for O(1) duplicate detection during scanning.
-/// Bulk content (icons, strings dumps) lives on disk via `BlobStore` — only
-/// metadata sits in memory.
+/// ## Performance design
+///
+/// Three indexes are maintained incrementally on every `upsert` so detail and
+/// sidebar views never have to scan the full item collection:
+///
+/// - `categoryCounts: [ItemCategory: Int]` — drives sidebar count badges.
+///   Without this, the sidebar would re-iterate all items on every render.
+/// - `pathReferencedBy: [String: [UUID]]` — inverse adjacency. For each
+///   `targetPath` mentioned in any item's `relationships`, the list of items
+///   pointing at it. Powers DetailView's "Referenced By" section in O(1)
+///   instead of O(N × E) per render.
+/// - `itemsByOwningBundle: [String: [UUID]]` — bundle contents. Lets the
+///   detail view show what lives inside a `.app` / `.framework` / `.kext`
+///   without filtering the whole store.
+///
+/// All three are reset along with `items` and `itemsByPath` in `reset()`. They
+/// are NOT persisted to disk — they're rebuilt on document load via `load()`.
 @Observable
 final class ScanStore {
     var systemInfo: SystemInfo?
     var options: ScanOptions = ScanOptions()
-    /// Wall-clock when the most recent scan started / completed.
     var lastScanStarted: Date?
     var lastScanCompleted: Date?
 
     private(set) var items: [UUID: ScanItem] = [:]
     private(set) var itemsByPath: [String: UUID] = [:]
 
-    /// Disk-backed payload store. Empty until a scan or a load registers refs.
+    // Derived indexes — invariants enforced by upsert/remove.
+    private(set) var categoryCounts: [ItemCategory: Int] = [:]
+    private(set) var pathReferencedBy: [String: [UUID]] = [:]
+    private(set) var itemsByOwningBundle: [String: [UUID]] = [:]
+
     let blobStore: BlobStore = BlobStore()
 
-    // MARK: - Mutation (all on MainActor by default isolation)
+    // MARK: - Mutation
 
     func reset() {
         items.removeAll()
         itemsByPath.removeAll()
-        // Note: we leave blobStore intact across resets. Refs are content-
-        // addressed so old ones become orphaned but they're idempotent on
-        // re-scan. A future "compact" command can prune unreferenced blobs.
+        categoryCounts.removeAll()
+        pathReferencedBy.removeAll()
+        itemsByOwningBundle.removeAll()
         systemInfo = nil
         lastScanStarted = nil
         lastScanCompleted = nil
     }
 
     func upsert(_ item: ScanItem) {
-        if let existing = itemsByPath[item.path] {
-            items[existing] = item.withId(existing)
+        if let existingID = itemsByPath[item.path], let existing = items[existingID] {
+            // Update path: tear down derived edges of the old item, then add
+            // back for the new one. The UUID stays — keeps UI selection stable.
+            removeIndexes(for: existing)
+            let updated = item.withId(existingID)
+            items[existingID] = updated
+            addIndexes(for: updated)
         } else {
             items[item.id] = item
             itemsByPath[item.path] = item.id
+            addIndexes(for: item)
         }
     }
 
-    /// Bulk insert from a scan. Preserves identity when paths match an existing
-    /// entry so the UI selection stays stable across rescans. Designed to be
-    /// called once per throttled batch — drives a single SwiftUI re-render
-    /// rather than N.
+    /// Bulk insert from a scan. The throttled scanner calls this once per
+    /// batch (≈ every 250 ms), so we get one SwiftUI re-render per flush.
     func ingest(_ produced: [ScanItem]) {
-        for item in produced {
-            upsert(item)
+        for item in produced { upsert(item) }
+    }
+
+    private func addIndexes(for item: ScanItem) {
+        categoryCounts[item.category, default: 0] += 1
+        for rel in item.relationships {
+            pathReferencedBy[rel.targetPath, default: []].append(item.id)
+        }
+        if let owning = item.owningBundlePath {
+            itemsByOwningBundle[owning, default: []].append(item.id)
         }
     }
 
-    // MARK: - Blob access (forwarded to the underlying BlobStore)
+    private func removeIndexes(for item: ScanItem) {
+        categoryCounts[item.category, default: 0] -= 1
+        for rel in item.relationships {
+            pathReferencedBy[rel.targetPath]?.removeAll { $0 == item.id }
+            if pathReferencedBy[rel.targetPath]?.isEmpty == true {
+                pathReferencedBy.removeValue(forKey: rel.targetPath)
+            }
+        }
+        if let owning = item.owningBundlePath {
+            itemsByOwningBundle[owning]?.removeAll { $0 == item.id }
+            if itemsByOwningBundle[owning]?.isEmpty == true {
+                itemsByOwningBundle.removeValue(forKey: owning)
+            }
+        }
+    }
+
+    // MARK: - Blob access
 
     func blob(forRef ref: String) -> Data? {
         blobStore.data(forRef: ref)
@@ -67,13 +112,26 @@ final class ScanStore {
         items.values.filter { $0.category == category }
     }
 
-    /// Resolve a relationship's target path back into an item, if it exists
-    /// in this scan. Used by the detail view to make "Related" rows clickable.
     func item(atPath path: String) -> ScanItem? {
         guard let id = itemsByPath[path] else { return nil }
         return items[id]
     }
 
+    /// Items that reference this path via outgoing relationships.
+    /// O(1) lookup + O(K) materialization where K is the incoming degree.
+    func incomingReferences(toPath path: String) -> [ScanItem] {
+        guard let ids = pathReferencedBy[path] else { return [] }
+        return ids.compactMap { items[$0] }
+    }
+
+    /// Items whose `owningBundlePath` is this path. O(1) + O(K).
+    func contents(ofBundleAtPath bundlePath: String) -> [ScanItem] {
+        guard let ids = itemsByOwningBundle[bundlePath] else { return [] }
+        return ids.compactMap { items[$0] }
+    }
+
+    /// Legacy plain-text search retained for the simple-search code path.
+    /// The richer `SearchQuery`-based filter lives in `Search/SearchQuery.swift`.
     func search(_ query: String, scope: ItemCategory? = nil) -> [ScanItem] {
         let q = query.lowercased()
         guard !q.isEmpty else {
@@ -93,16 +151,17 @@ final class ScanStore {
         }
     }
 
-    /// Aggregate counts. Cheap to recompute — items max out in the low tens
-    /// of thousands for a /System scan.
+    /// Index-backed counts — drives sidebar without recomputation.
     func counts() -> [ItemCategory: Int] {
         var counts: [ItemCategory: Int] = [:]
-        for category in ItemCategory.allCases { counts[category] = 0 }
-        for item in items.values { counts[item.category, default: 0] += 1 }
+        for category in ItemCategory.allCases {
+            counts[category] = categoryCounts[category] ?? 0
+        }
         return counts
     }
 
-    /// Loads a previously-serialized payload. Used by ScanDocument.read.
+    // MARK: - Load
+
     func load(
         items: [ScanItem],
         systemInfo: SystemInfo?,
@@ -114,6 +173,7 @@ final class ScanStore {
         for item in items {
             self.items[item.id] = item
             self.itemsByPath[item.path] = item.id
+            addIndexes(for: item)
         }
         self.systemInfo = systemInfo
         if let options { self.options = options }

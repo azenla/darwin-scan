@@ -26,8 +26,9 @@ DarwinScan/
 ├── DarwinScanApp.swift            # @main, DocumentGroup
 ├── ContentView.swift              # NavigationSplitView root
 ├── Models/                        # ScanItem, ScanOptions, ScanProgress, SystemInfo
-├── Document/                      # ScanDocument (ReferenceFileDocument), ScanPackage (FileWrapper), ScanStore (@Observable)
+├── Document/                      # ScanDocument, ScanPackage, ScanStore, BlobStore
 ├── Scanning/                      # Scanner + per-domain Inspectors + FileWalker + StringsExtractor
+├── Search/                        # SearchQuery (parser + evaluator)
 ├── UI/                            # SidebarView, ItemListView, DetailView, ScanProgressView, WelcomeView
 └── Utilities/                     # Hash, ByteFormat, SystemInfoCollector
 ```
@@ -104,7 +105,55 @@ holds outgoing graph edges.
   then sends just the ref strings to MainActor. Peak memory bounded by
   ~workerCount × one blob.
 
-### Graph model
+### ScanStore indexes
+
+Three indexes are maintained incrementally inside `Document/ScanStore.swift`,
+all updated in `addIndexes(for:)` / `removeIndexes(for:)` on every `upsert`:
+
+| Index                       | Shape                            | Purpose                                                         |
+|-----------------------------|----------------------------------|-----------------------------------------------------------------|
+| `categoryCounts`            | `[ItemCategory: Int]`            | Sidebar badge counts in O(1) per render                         |
+| `pathReferencedBy`          | `[String: [UUID]]`               | Inverse adjacency — "Referenced By" panel in O(1) instead of O(N×E) |
+| `itemsByOwningBundle`       | `[String: [UUID]]`               | "Contents" panel for `.app` / `.framework` / `.kext` bundles    |
+
+These are not persisted — they're rebuilt in `load()` when a document opens.
+Cost is one pass over the manifest at open time, ~10 ms for a /System scan.
+
+**Adding a new index:** edit `addIndexes(for:)` / `removeIndexes(for:)` in
+lockstep, plus `reset()`. Don't try to keep an index sorted — sort at read
+time (it's cheap and avoids `Array.insert` shifting on every upsert).
+
+## Rich search
+
+`Search/SearchQuery.swift` parses Console.app-style faceted queries:
+
+```
+arch:x86_64 app:"Time Machine" tag:cli       # AND across filters
+foo arch:arm64                                # filters + free text
+bundle:CoreFoundation                         # any kind of bundle
+private:true lang:en                          # boolean + value filters
+```
+
+Tokenizer respects `"quoted strings"` so values can contain spaces. Unknown
+`field:value` pairs fall through to free text (no silent zeroing out of
+results). Field aliases are intentional (`arch` / `architecture` /
+`abi`; `framework` / `fw`; `kext` / `extension`; `lang` / `language` /
+`locale`; …).
+
+Free text matches across `name`, `path`, `context`, `tags`,
+`executable.usageLine`, `application.bundleIdentifier`, and
+`launchService.label`. Lowercased once per call to keep the per-item cost
+near-zero — every filter is a substring test on already-lowered fields.
+
+**Wired into `ItemListView`** via `.searchable`. The list shows recognized
+filters as pill chips above the table; the `?` toolbar button opens a help
+popover (driven by `SearchHelp.entries`) listing every field and example.
+
+**Adding a new filter:** extend `SearchQuery.Filter`, add a case to
+`filter(field:value:)`, `displayLabel`, `systemImage`, and `evaluate`. If it
+needs an index to be fast, add the index to `ScanStore`.
+
+## Graph model
 
 `ScanItem.relationships: [Relationship]` carries outgoing edges keyed by
 `targetPath` (paths are stable across scans, UUIDs aren't):
@@ -225,6 +274,38 @@ to the declaration (type, extension, or `let`).
 - **`sha256` field on every ScanItem** so cross-scan diff is a simple set
   comparison.
 
+## On switching to SQLite
+
+We use JSON for the manifest, not SQLite. This is a deliberate call given
+the scan size:
+
+- A /System scan produces on the order of 20K–50K items × ~500 bytes
+  metadata each. The whole manifest is ~10–25 MB of JSON — comfortably
+  in-memory.
+- In-memory filtering with the search query system runs in low single-digit
+  milliseconds for /System-sized scans on Apple Silicon. SQLite with a
+  query planner, parameter binding, and result marshaling rarely beats a
+  hot in-memory linear scan at this scale.
+- The incremental indexes (`categoryCounts`, `pathReferencedBy`,
+  `itemsByOwningBundle`) cover the queries that would otherwise be O(N×E)
+  per render.
+
+**When to revisit:** if scans grow past ~500K items (e.g. cross-cryptex
+recursive scans or strings-cache search across millions of strings), or if
+you want SQLite FTS5 for searching the contents of strings dumps. The
+migration would be straightforward — `ScanPackage` is the only file that
+opens/writes the persistent form, and a `data.db` inside the bundle could
+replace `items.json` without touching the UI or scanner.
+
+If you do migrate:
+- Keep `metadata.json` outside the DB (it's small, useful when grepping the
+  bundle from the shell, and version-checked first).
+- Keep `blobs/` as-is — content-addressed files outperform SQLite BLOBs for
+  multi-MB icons / strings dumps.
+- Use one wide `items` table with the discriminated payload columns
+  nullable; build covering indexes on `category`, `owning_bundle_path`, and
+  any new search field.
+
 ## Known follow-ups (not yet built)
 
 - Code signature parsing for team identifier extraction (we detect
@@ -232,10 +313,12 @@ to the declaration (type, extension, or `let`).
 - DYLD shared cache *image enumeration* (we parse the header but not the
   image list — needs more dyld_cache_format.h ported in).
 - Cross-scan diff UI — the schema supports it but no command/view exists yet.
-- SQLite-backed `ScanStore` for very-large bundles.
 - Asset catalog (`Assets.car`) extraction.
 - Full strings-cache search UI (the blob is stored when extracted, but no
   global search across blobs yet).
+- Token-pill UI for search (`.searchable(text:tokens:)`) so typed filters
+  become removable chips inside the search field instead of below it.
+- SQLite migration if scans outgrow JSON (see § "On switching to SQLite").
 
 ## Testing
 

@@ -2,7 +2,9 @@ import SwiftUI
 import AppKit
 
 /// Trailing column. Renders the appropriate detail subview based on the
-/// selected item's category.
+/// selected item's category. Heavy on stat tiles + pill chips + clickable
+/// graph rows so users can navigate item ↔ item without leaving the detail
+/// pane.
 struct DetailView: View {
     @Bindable var store: ScanStore
     @Binding var itemSelection: UUID?
@@ -10,6 +12,7 @@ struct DetailView: View {
     var body: some View {
         if let id = itemSelection, let item = store.items[id] {
             DetailContent(item: item, store: store, itemSelection: $itemSelection)
+                .id(item.id) // resets scroll position when selection changes
         } else {
             ContentUnavailableView(
                 "No Item Selected",
@@ -28,154 +31,387 @@ private struct DetailContent: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                header
+                HeaderCard(item: item, store: store)
 
                 if let exec = item.executable {
-                    ExecutableDetailView(item: item, info: exec, store: store)
+                    ExecutableSection(item: item, info: exec, store: store, itemSelection: $itemSelection)
                 }
                 if let app = item.application {
-                    AppBundleDetailView(item: item, info: app, store: store)
+                    AppBundleSection(item: item, info: app, store: store)
                 }
                 if let ls = item.launchService {
-                    LaunchServiceDetailView(info: ls)
+                    LaunchServiceSection(info: ls)
                 }
                 if let fw = item.framework {
-                    FrameworkDetailView(info: fw)
+                    FrameworkSection(info: fw)
                 }
                 if let model = item.mlModel {
-                    MLModelDetailView(info: model)
+                    MLModelSection(info: model)
                 }
                 if let icon = item.icon {
-                    IconDetailView(info: icon, store: store)
+                    IconSection(info: icon, store: store)
                 }
                 if let man = item.manPage {
-                    ManPageDetailView(item: item, info: man)
+                    ManPageSection(item: item, info: man)
                 }
                 if let loc = item.localization {
-                    LocalizationDetailView(info: loc)
+                    LocalizationSection(info: loc)
                 }
                 if let cache = item.dyldCache {
-                    DyldCacheDetailView(info: cache)
+                    DyldCacheSection(info: cache)
                 }
                 if let script = item.script {
-                    ScriptDetailView(item: item, info: script)
+                    ScriptSection(info: script)
                 }
 
-                if !item.relationships.isEmpty {
-                    RelationshipsView(item: item, store: store, itemSelection: $itemSelection)
-                }
-                IncomingReferencesView(item: item, store: store, itemSelection: $itemSelection)
+                // Graph: outgoing relationships, contents (if a bundle),
+                // and incoming references — all index-backed so they don't
+                // scan the full store.
+                OutgoingRelationshipsSection(item: item, store: store, itemSelection: $itemSelection)
+                BundleContentsSection(item: item, store: store, itemSelection: $itemSelection)
+                IncomingReferencesSection(item: item, store: store, itemSelection: $itemSelection)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(20)
         }
         .navigationTitle(item.name)
     }
+}
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Image(systemName: item.category.systemImageName)
-                    .font(.title2)
-                    .foregroundStyle(.tint)
-                Text(item.name)
-                    .font(.title2)
-                    .bold()
-            }
-            Text(item.path)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-            HStack(spacing: 12) {
-                Label(ByteFormat.string(item.size), systemImage: "scalemass")
-                if let mtime = item.modifiedAt {
-                    Label(ByteFormat.compactDate(mtime), systemImage: "clock")
-                }
-                if let sha = item.sha256 {
-                    Label(sha.prefix(12) + "…", systemImage: "number")
+// MARK: - Header card
+
+private struct HeaderCard: View {
+    let item: ScanItem
+    @Bindable var store: ScanStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 14) {
+                iconView
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(item.name)
+                            .font(.title2)
+                            .bold()
+                            .lineLimit(2)
+                        Spacer()
+                        CategoryBadge(category: item.category)
+                    }
+                    if let context = item.context {
+                        Text(context)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(item.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
                 }
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            statTiles
             if !item.tags.isEmpty {
-                TagChips(tags: item.tags)
+                ColoredTagChips(tags: item.tags)
             }
-            Button {
-                NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
-            } label: {
-                Label("Reveal in Finder", systemImage: "eye")
+            HStack {
+                Button {
+                    NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
+                } label: {
+                    Label("Reveal in Finder", systemImage: "eye")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Spacer()
             }
-            .buttonStyle(.bordered)
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.separator, lineWidth: 0.5))
+        )
+    }
+
+    @ViewBuilder private var iconView: some View {
+        // App icons live in the blob store under appicon-* refs; show them
+        // when present. Otherwise fall back to the category's SF Symbol.
+        if let ref = item.application?.iconRef,
+           let data = store.blob(forRef: ref),
+           let img = NSImage(data: data) {
+            Image(nsImage: img)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 64, height: 64)
+        } else if let ref = item.icon?.previewBlobRef,
+                  let data = store.blob(forRef: ref),
+                  let img = NSImage(data: data) {
+            Image(nsImage: img)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 64, height: 64)
+        } else {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(.tint.opacity(0.15))
+                Image(systemName: item.category.systemImageName)
+                    .font(.system(size: 30))
+                    .foregroundStyle(.tint)
+            }
+            .frame(width: 64, height: 64)
+        }
+    }
+
+    private var statTiles: some View {
+        HStack(spacing: 10) {
+            StatTile(systemImage: "scalemass", label: "Size", value: ByteFormat.string(item.size))
+            if let mtime = item.modifiedAt {
+                StatTile(systemImage: "clock", label: "Modified", value: ByteFormat.compactDate(mtime))
+            }
+            if let sha = item.sha256 {
+                StatTile(systemImage: "number", label: "SHA-256", value: String(sha.prefix(10)) + "…", monospaced: true, textSelectable: true, selectableValue: sha)
+            }
         }
     }
 }
 
-// MARK: - Per-category detail subviews
+private struct CategoryBadge: View {
+    let category: ItemCategory
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: category.systemImageName)
+                .imageScale(.small)
+            Text(category.displayName)
+                .font(.caption)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(.tint.opacity(0.18)))
+    }
+}
 
-private struct ExecutableDetailView: View {
+private struct StatTile: View {
+    let systemImage: String
+    let label: String
+    let value: String
+    var monospaced: Bool = false
+    var textSelectable: Bool = false
+    /// When the displayed value is truncated for the tile, expose the full
+    /// value to clipboard selection without showing it.
+    var selectableValue: String? = nil
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: systemImage)
+                .foregroundStyle(.secondary)
+                .imageScale(.medium)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Group {
+                    if monospaced {
+                        Text(value).font(.system(.callout, design: .monospaced))
+                    } else {
+                        Text(value).font(.callout)
+                    }
+                }
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .modifier(SelectableIfNeeded(text: textSelectable ? (selectableValue ?? value) : nil))
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.tint.opacity(0.07))
+        )
+    }
+}
+
+private struct SelectableIfNeeded: ViewModifier {
+    let text: String?
+    func body(content: Content) -> some View {
+        if let text {
+            content.textSelection(.enabled).help(text)
+        } else {
+            content
+        }
+    }
+}
+
+// MARK: - Section card (shared shell)
+
+private struct Section<Content: View>: View {
+    let title: String
+    let systemImage: String
+    var accessory: String? = nil
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(.tint)
+                    .imageScale(.medium)
+                Text(title)
+                    .font(.headline)
+                if let accessory {
+                    Text(accessory)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(.secondary.opacity(0.14)))
+                }
+                Spacer()
+            }
+            content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
+        )
+    }
+}
+
+/// Key-value row used inside `Section`. Right-aligned value, label kept
+/// narrow so multiple rows align cleanly.
+private struct InfoRow: View {
+    let label: String
+    let value: String
+    var monospaced: Bool = false
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 110, alignment: .leading)
+            Group {
+                if monospaced {
+                    Text(value).font(.system(.callout, design: .monospaced))
+                } else {
+                    Text(value).font(.callout)
+                }
+            }
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+// MARK: - Per-category sections
+
+private struct ExecutableSection: View {
     let item: ScanItem
     let info: ExecutableInfo
     @Bindable var store: ScanStore
+    @Binding var itemSelection: UUID?
 
     var body: some View {
-        GroupBox("Executable") {
-            VStack(alignment: .leading, spacing: 6) {
-                LabeledContent("Kind", value: info.kind.rawValue.capitalized)
-                LabeledContent("Architectures", value: info.architectures.joined(separator: ", "))
-                if info.isFatBinary { LabeledContent("Fat Binary", value: "Yes") }
+        Section(title: "Executable", systemImage: "terminal") {
+            VStack(alignment: .leading, spacing: 10) {
+                // Architectures get their own colorful row of chips up top.
+                if !info.architectures.isEmpty {
+                    HStack(spacing: 6) {
+                        Text("Architectures")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        WrappingHStack(spacing: 6) {
+                            ForEach(info.architectures, id: \.self) { arch in
+                                ColoredChip(text: arch, color: archColor(arch))
+                            }
+                            if info.isFatBinary {
+                                ColoredChip(text: "fat / universal", color: .teal)
+                            }
+                        }
+                    }
+                }
+                InfoRow(label: "Kind", value: info.kind.rawValue.capitalized)
                 if let platform = info.platform {
-                    LabeledContent("Platform", value: platform)
+                    InfoRow(label: "Platform", value: platform)
                 }
                 if let minOS = info.minOS {
-                    LabeledContent("Min OS", value: minOS)
+                    InfoRow(label: "Min OS", value: minOS)
                 }
                 if let sdk = info.sdkVersion {
-                    LabeledContent("SDK", value: sdk)
+                    InfoRow(label: "SDK", value: sdk)
+                }
+                if !info.roles.isEmpty {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Roles")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        WrappingHStack(spacing: 6) {
+                            ForEach(info.roles, id: \.self) { role in
+                                ColoredChip(text: role.rawValue, color: roleColor(role))
+                            }
+                        }
+                    }
                 }
                 if let usage = info.usageLine {
-                    LabeledContent("Usage") {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Usage")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
                         Text(usage)
                             .font(.system(.callout, design: .monospaced))
                             .textSelection(.enabled)
-                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                LabeledContent("Apple-shipped", value: info.isApple ? "Yes" : "No")
-                if info.isCrossPlatformTool {
-                    LabeledContent("Cross-platform", value: "Yes")
+                HStack(spacing: 12) {
+                    if info.isApple {
+                        ColoredChip(text: "Apple-shipped", color: .red)
+                    } else {
+                        ColoredChip(text: "Third-party", color: .orange)
+                    }
+                    if info.isCrossPlatformTool {
+                        ColoredChip(text: "Cross-platform", color: .yellow)
+                    }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
         if !info.linkedLibraries.isEmpty {
-            GroupBox("Linked Libraries (\(info.linkedLibraries.count))") {
-                ScrollView(.vertical) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(info.linkedLibraries, id: \.self) { lib in
-                            Text(lib)
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                        }
+            Section(
+                title: "Linked Libraries",
+                systemImage: "link",
+                accessory: "\(info.linkedLibraries.count)"
+            ) {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(info.linkedLibraries, id: \.self) { lib in
+                        LinkedLibraryRow(lib: lib, store: store, itemSelection: $itemSelection)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxHeight: 240)
             }
         }
         if !info.rpaths.isEmpty {
-            GroupBox("RPATHs") {
+            Section(title: "RPATHs", systemImage: "arrow.triangle.branch", accessory: "\(info.rpaths.count)") {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(info.rpaths, id: \.self) { rp in
-                        Text(rp).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Text(rp)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         if let ref = info.stringsBlobRef, let data = store.blob(forRef: ref),
            let text = String(data: data, encoding: .utf8) {
-            GroupBox("Strings (\(ByteFormat.string(Int64(data.count))))") {
+            Section(
+                title: "Strings",
+                systemImage: "doc.text.below.ecg",
+                accessory: ByteFormat.string(Int64(data.count))
+            ) {
                 ScrollView {
                     Text(text)
                         .font(.system(.caption2, design: .monospaced))
@@ -188,140 +424,185 @@ private struct ExecutableDetailView: View {
     }
 }
 
-private struct AppBundleDetailView: View {
+/// One row inside the Linked Libraries list. If the linked path resolves to
+/// an item in this scan it becomes a clickable navigation; otherwise it's
+/// shown greyed out (typical for `@rpath/...` libraries or anything we
+/// didn't visit).
+private struct LinkedLibraryRow: View {
+    let lib: String
+    @Bindable var store: ScanStore
+    @Binding var itemSelection: UUID?
+    var body: some View {
+        if let target = store.item(atPath: lib) {
+            Button {
+                itemSelection = target.id
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "link.circle.fill")
+                        .foregroundStyle(.tint)
+                        .imageScale(.small)
+                    Text(lib)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let ctx = target.context {
+                        Text(ctx)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+            }
+            .buttonStyle(.plain)
+        } else {
+            HStack(spacing: 6) {
+                Image(systemName: "link")
+                    .foregroundStyle(.tertiary)
+                    .imageScale(.small)
+                Text(lib)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+            }
+        }
+    }
+}
+
+private struct AppBundleSection: View {
     let item: ScanItem
     let info: AppBundleInfo
     @Bindable var store: ScanStore
-
     var body: some View {
-        GroupBox("Application") {
-            HStack(alignment: .top, spacing: 12) {
-                if let ref = info.iconRef, let data = store.blob(forRef: ref), let img = NSImage(data: data) {
-                    Image(nsImage: img)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 96, height: 96)
+        Section(title: "Application", systemImage: "app.dashed") {
+            VStack(alignment: .leading, spacing: 6) {
+                if let id = info.bundleIdentifier { InfoRow(label: "Bundle ID", value: id) }
+                if let v = info.shortVersionString {
+                    InfoRow(label: "Version", value: v + (info.bundleVersion.map { " (\($0))" } ?? ""))
                 }
-                VStack(alignment: .leading, spacing: 4) {
-                    if let id = info.bundleIdentifier {
-                        LabeledContent("Bundle ID", value: id)
-                    }
-                    if let v = info.shortVersionString {
-                        LabeledContent("Version", value: v + (info.bundleVersion.map { " (\($0))" } ?? ""))
-                    }
-                    if let exec = info.executableName {
-                        LabeledContent("Executable", value: exec)
-                    }
-                    if let category = info.category {
-                        LabeledContent("Category", value: category)
-                    }
-                    if info.isHidden {
-                        LabeledContent("Visibility", value: "Hidden (LSUIElement)")
-                    }
-                    if info.isAgentApp {
-                        LabeledContent("Mode", value: "Background-only")
-                    }
-                    if !info.urlSchemes.isEmpty {
-                        LabeledContent("URL Schemes", value: info.urlSchemes.joined(separator: ", "))
-                    }
+                if let exec = info.executableName { InfoRow(label: "Executable", value: exec) }
+                if let category = info.category { InfoRow(label: "Category", value: category) }
+                if let minSys = info.minimumSystemVersion { InfoRow(label: "Min macOS", value: minSys) }
+                if !info.urlSchemes.isEmpty {
+                    InfoRow(label: "URL Schemes", value: info.urlSchemes.joined(separator: ", "))
+                }
+                HStack(spacing: 8) {
+                    if info.isHidden { ColoredChip(text: "Hidden (LSUIElement)", color: .purple) }
+                    if info.isAgentApp { ColoredChip(text: "Background-only", color: .indigo) }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-private struct LaunchServiceDetailView: View {
+private struct LaunchServiceSection: View {
     let info: LaunchServiceInfo
     var body: some View {
-        GroupBox(info.kind == .daemon ? "Launch Daemon" : "Launch Agent") {
-            VStack(alignment: .leading, spacing: 4) {
-                if let label = info.label {
-                    LabeledContent("Label", value: label)
-                }
-                if let program = info.program {
-                    LabeledContent("Program", value: program)
-                }
+        Section(
+            title: info.kind == .daemon ? "Launch Daemon" : "Launch Agent",
+            systemImage: "gearshape.2"
+        ) {
+            VStack(alignment: .leading, spacing: 6) {
+                if let label = info.label { InfoRow(label: "Label", value: label, monospaced: true) }
+                if let program = info.program { InfoRow(label: "Program", value: program, monospaced: true) }
                 if !info.programArguments.isEmpty {
-                    LabeledContent("Arguments", value: info.programArguments.joined(separator: " "))
+                    InfoRow(label: "Arguments", value: info.programArguments.joined(separator: " "), monospaced: true)
                 }
-                LabeledContent("RunAtLoad", value: info.runAtLoad ? "Yes" : "No")
-                LabeledContent("KeepAlive", value: info.keepAlive ? "Yes" : "No")
-                if let interval = info.startInterval {
-                    LabeledContent("StartInterval", value: "\(interval)s")
+                HStack(spacing: 8) {
+                    if info.runAtLoad { ColoredChip(text: "RunAtLoad", color: .orange) }
+                    if info.keepAlive { ColoredChip(text: "KeepAlive", color: .red) }
+                    if info.disabled  { ColoredChip(text: "Disabled",  color: .gray) }
+                    if let interval = info.startInterval {
+                        ColoredChip(text: "Every \(interval)s", color: .blue)
+                    }
                 }
                 if !info.machServices.isEmpty {
-                    LabeledContent("MachServices", value: info.machServices.joined(separator: ", "))
+                    InfoRow(label: "MachServices", value: info.machServices.joined(separator: ", "), monospaced: true)
                 }
                 if !info.watchPaths.isEmpty {
-                    LabeledContent("WatchPaths", value: info.watchPaths.joined(separator: "\n"))
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("WatchPaths")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 1) {
+                            ForEach(info.watchPaths, id: \.self) { p in
+                                Text(p).font(.system(.caption, design: .monospaced))
+                            }
+                        }
+                        Spacer()
+                    }
                 }
-                if let user = info.userName {
-                    LabeledContent("UserName", value: user)
-                }
-                if info.disabled {
-                    LabeledContent("Status", value: "Disabled")
-                }
+                if let user = info.userName { InfoRow(label: "UserName", value: user) }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-private struct FrameworkDetailView: View {
+private struct FrameworkSection: View {
     let info: FrameworkInfo
     var body: some View {
-        GroupBox(info.isPrivate ? "Private Framework" : "Framework / Library") {
-            VStack(alignment: .leading, spacing: 4) {
-                if let id = info.bundleIdentifier {
-                    LabeledContent("Bundle ID", value: id)
-                }
-                if let v = info.shortVersionString {
-                    LabeledContent("Version", value: v)
-                }
-                if let curr = info.currentVersion {
-                    LabeledContent("Current Version", value: curr)
-                }
-                if let exec = info.executableName {
-                    LabeledContent("Executable", value: exec)
-                }
-                if info.headerCount > 0 {
-                    LabeledContent("Public Headers", value: "\(info.headerCount)")
+        Section(
+            title: info.isPrivate ? "Private Framework" : "Framework / Library",
+            systemImage: "shippingbox"
+        ) {
+            VStack(alignment: .leading, spacing: 6) {
+                if let id = info.bundleIdentifier { InfoRow(label: "Bundle ID", value: id) }
+                if let v = info.shortVersionString { InfoRow(label: "Version", value: v) }
+                if let curr = info.currentVersion { InfoRow(label: "Current Version", value: curr) }
+                if let exec = info.executableName { InfoRow(label: "Executable", value: exec) }
+                if info.headerCount > 0 { InfoRow(label: "Public Headers", value: "\(info.headerCount)") }
+                if info.isPrivate {
+                    HStack { ColoredChip(text: "Private", color: .purple); Spacer() }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-private struct MLModelDetailView: View {
+private struct MLModelSection: View {
     let info: MLModelInfo
     var body: some View {
-        GroupBox("Machine Learning Model") {
-            VStack(alignment: .leading, spacing: 4) {
-                LabeledContent("Container", value: info.container.rawValue)
-                if let t = info.modelType { LabeledContent("Type", value: t) }
-                if let desc = info.modelDescription { LabeledContent("Description", value: desc) }
-                if let author = info.author { LabeledContent("Author", value: author) }
-                if let lic = info.license { LabeledContent("License", value: lic) }
-                if let labels = info.classLabelsCount { LabeledContent("Class Labels", value: "\(labels)") }
-                if !info.inputs.isEmpty { LabeledContent("Inputs", value: info.inputs.joined(separator: ", ")) }
-                if !info.outputs.isEmpty { LabeledContent("Outputs", value: info.outputs.joined(separator: ", ")) }
+        Section(title: "Machine Learning Model", systemImage: "brain") {
+            VStack(alignment: .leading, spacing: 6) {
+                InfoRow(label: "Container", value: info.container.rawValue)
+                if let t = info.modelType { InfoRow(label: "Type", value: t) }
+                if let desc = info.modelDescription { InfoRow(label: "Description", value: desc) }
+                if let author = info.author { InfoRow(label: "Author", value: author) }
+                if let lic = info.license { InfoRow(label: "License", value: lic) }
+                if let labels = info.classLabelsCount { InfoRow(label: "Class Labels", value: "\(labels)") }
+                if !info.inputs.isEmpty { InfoRow(label: "Inputs", value: info.inputs.joined(separator: ", ")) }
+                if !info.outputs.isEmpty { InfoRow(label: "Outputs", value: info.outputs.joined(separator: ", ")) }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-private struct IconDetailView: View {
+private struct IconSection: View {
     let info: IconInfo
     @Bindable var store: ScanStore
     var body: some View {
-        GroupBox("Icon") {
+        Section(title: "Icon", systemImage: "photo.on.rectangle.angled") {
             VStack(alignment: .leading, spacing: 8) {
-                LabeledContent("Kind", value: info.kind.rawValue)
+                InfoRow(label: "Kind", value: info.kind.rawValue)
                 if !info.representations.isEmpty {
-                    LabeledContent("Representations", value: info.representations.joined(separator: ", "))
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Representations")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        WrappingHStack(spacing: 4) {
+                            ForEach(info.representations, id: \.self) { rep in
+                                Text(rep)
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Capsule().fill(.secondary.opacity(0.14)))
+                            }
+                        }
+                    }
                 }
                 if let ref = info.previewBlobRef, let data = store.blob(forRef: ref), let img = NSImage(data: data) {
                     Image(nsImage: img)
@@ -332,23 +613,23 @@ private struct IconDetailView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-private struct ManPageDetailView: View {
+private struct ManPageSection: View {
     let item: ScanItem
     let info: ManPageInfo
     @State private var renderedText: String? = nil
-
     var body: some View {
-        GroupBox("Man Page") {
-            VStack(alignment: .leading, spacing: 4) {
-                if let s = info.section { LabeledContent("Section", value: s) }
-                if let t = info.title { LabeledContent("Title", value: t) }
-                if let d = info.description { LabeledContent("Synopsis", value: d) }
-                if info.compressed { LabeledContent("Compressed", value: "Yes (gzip)") }
+        Section(title: "Man Page", systemImage: "doc.text.magnifyingglass") {
+            VStack(alignment: .leading, spacing: 6) {
+                if let s = info.section { InfoRow(label: "Section", value: s) }
+                if let t = info.title { InfoRow(label: "Title", value: t) }
+                if let d = info.description { InfoRow(label: "Synopsis", value: d) }
+                if info.compressed {
+                    HStack { ColoredChip(text: "gzip", color: .teal); Spacer() }
+                }
                 Divider().padding(.vertical, 4)
                 if let text = renderedText {
                     ScrollView {
@@ -359,89 +640,100 @@ private struct ManPageDetailView: View {
                     }
                     .frame(maxHeight: 360)
                 } else {
-                    Button("Render Source") { renderText() }
-                        .buttonStyle(.bordered)
+                    Button("Render Source") {
+                        if let (_, text) = ManPageInspector.inspect(url: URL(fileURLWithPath: item.path)) {
+                            renderedText = text
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private func renderText() {
-        // Re-parse from the source URL — we don't keep the rendered source in
-        // the store yet to avoid bloating bundles. Cheap re-read on demand.
-        let url = URL(fileURLWithPath: item.path)
-        if let (_, text) = ManPageInspector.inspect(url: url) {
-            renderedText = text
         }
     }
 }
 
-private struct LocalizationDetailView: View {
+private struct LocalizationSection: View {
     let info: LocalizationInfo
     var body: some View {
-        GroupBox("Localization") {
-            VStack(alignment: .leading, spacing: 4) {
-                LabeledContent("Kind", value: info.kind.rawValue)
-                if let lang = info.language { LabeledContent("Language", value: lang) }
-                if let count = info.keyCount { LabeledContent("Keys", value: "\(count)") }
-                if let id = info.owningBundleId { LabeledContent("Owning Bundle", value: id) }
+        Section(title: "Localization", systemImage: "character.bubble") {
+            VStack(alignment: .leading, spacing: 6) {
+                InfoRow(label: "Kind", value: info.kind.rawValue)
+                if let lang = info.language { InfoRow(label: "Language", value: lang) }
+                if let count = info.keyCount { InfoRow(label: "Keys", value: "\(count)") }
+                if let id = info.owningBundleId { InfoRow(label: "Owning Bundle", value: id) }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-private struct DyldCacheDetailView: View {
+private struct DyldCacheSection: View {
     let info: DyldCacheInfo
     var body: some View {
-        GroupBox("DYLD Shared Cache") {
-            VStack(alignment: .leading, spacing: 4) {
-                if let arch = info.architecture { LabeledContent("Architecture", value: arch) }
-                if let v = info.formatVersion { LabeledContent("Format Magic", value: v) }
-                if let n = info.imageCount { LabeledContent("Images", value: "\(n)") }
-                if let m = info.mappingCount { LabeledContent("Mappings", value: "\(m)") }
+        Section(title: "DYLD Shared Cache", systemImage: "cylinder.split.1x2") {
+            VStack(alignment: .leading, spacing: 6) {
+                if let arch = info.architecture {
+                    HStack(spacing: 8) {
+                        Text("Architecture")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        ColoredChip(text: arch, color: archColor(arch))
+                        Spacer()
+                    }
+                }
+                if let v = info.formatVersion { InfoRow(label: "Format Magic", value: v, monospaced: true) }
+                if let n = info.imageCount { InfoRow(label: "Images", value: "\(n)") }
+                if let m = info.mappingCount { InfoRow(label: "Mappings", value: "\(m)") }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-private struct ScriptDetailView: View {
-    let item: ScanItem
+private struct ScriptSection: View {
     let info: ScriptInfo
     var body: some View {
-        GroupBox("Script") {
-            VStack(alignment: .leading, spacing: 4) {
-                if let interp = info.interpreter { LabeledContent("Interpreter", value: interp) }
-                if let lang = info.language { LabeledContent("Language", value: lang) }
+        Section(title: "Script", systemImage: "scroll") {
+            VStack(alignment: .leading, spacing: 6) {
+                if let interp = info.interpreter { InfoRow(label: "Interpreter", value: interp, monospaced: true) }
+                if let lang = info.language {
+                    HStack(spacing: 8) {
+                        Text("Language")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        ColoredChip(text: lang, color: .yellow)
+                        Spacer()
+                    }
+                }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-// MARK: - Graph views (outgoing + incoming edges)
+// MARK: - Graph sections (outgoing / contents / incoming)
 
-/// Outgoing relationships defined on the item itself: dylib links, the
-/// program a launchd plist runs, the bundle that owns this file, etc. Each
-/// row is clickable if the target path also appears in this scan.
-private struct RelationshipsView: View {
+private struct OutgoingRelationshipsSection: View {
     let item: ScanItem
     @Bindable var store: ScanStore
     @Binding var itemSelection: UUID?
-
     var body: some View {
         let grouped = Dictionary(grouping: item.relationships, by: { $0.kind })
-        ForEach(Relationship.Kind.allRenderable, id: \.self) { kind in
+        // linksDylib is already rendered as its own Linked Libraries section
+        // above, so we don't double-up here.
+        let kindsToShow: [Relationship.Kind] = [.ownedByBundle, .launchesProgram, .sameBundle]
+        ForEach(kindsToShow, id: \.self) { kind in
             if let rels = grouped[kind], !rels.isEmpty {
-                GroupBox(label: Label(title(for: kind), systemImage: systemImage(for: kind))) {
+                Section(
+                    title: title(for: kind),
+                    systemImage: systemImage(for: kind),
+                    accessory: rels.count > 1 ? "\(rels.count)" : nil
+                ) {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(Array(rels.enumerated()), id: \.offset) { (_, rel) in
                             RelationshipRow(rel: rel, store: store, itemSelection: $itemSelection)
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         }
@@ -449,50 +741,132 @@ private struct RelationshipsView: View {
 
     private func title(for kind: Relationship.Kind) -> String {
         switch kind {
-        case .linksDylib:       return "Links Libraries"
-        case .ownedByBundle:    return "Inside Bundle"
-        case .launchesProgram:  return "Launches Program"
-        case .sameBundle:       return "Bundle Siblings"
+        case .linksDylib:      return "Links"
+        case .ownedByBundle:   return "Inside Bundle"
+        case .launchesProgram: return "Launches"
+        case .sameBundle:      return "Bundle Siblings"
         }
     }
-
     private func systemImage(for kind: Relationship.Kind) -> String {
         switch kind {
-        case .linksDylib:       return "link"
-        case .ownedByBundle:    return "shippingbox"
-        case .launchesProgram:  return "play.fill"
-        case .sameBundle:       return "square.stack.3d.up"
+        case .linksDylib:      return "link"
+        case .ownedByBundle:   return "shippingbox"
+        case .launchesProgram: return "play.fill"
+        case .sameBundle:      return "square.stack.3d.up"
         }
     }
 }
 
-private extension Relationship.Kind {
-    /// Order we surface kinds in the UI. Excludes any future internal kinds.
-    static var allRenderable: [Relationship.Kind] {
-        [.ownedByBundle, .launchesProgram, .linksDylib, .sameBundle]
-    }
-}
-
-/// Inverse-edge index: who else in this scan points *at* the current item.
-/// We compute on demand by scanning all items' relationship lists. Cheap for
-/// /System-sized scans (tens of thousands of items, a few edges each).
-private struct IncomingReferencesView: View {
+/// Items that live inside this bundle. Only shown for bundle-shaped items
+/// (their path matches another item's `owningBundlePath`). Index-backed —
+/// `itemsByOwningBundle` makes this O(1) instead of an O(N) filter.
+private struct BundleContentsSection: View {
     let item: ScanItem
     @Bindable var store: ScanStore
     @Binding var itemSelection: UUID?
 
     var body: some View {
-        let incoming = computeIncoming()
+        let contents = store.contents(ofBundleAtPath: item.path)
+        if contents.isEmpty {
+            EmptyView()
+        } else {
+            Section(
+                title: "Contents",
+                systemImage: "square.stack.3d.up",
+                accessory: "\(contents.count)"
+            ) {
+                let buckets = Dictionary(grouping: contents, by: { $0.category })
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(ItemCategory.allCases) { cat in
+                        if let bucket = buckets[cat], !bucket.isEmpty {
+                            BundleContentsBucket(
+                                category: cat,
+                                items: bucket,
+                                store: store,
+                                itemSelection: $itemSelection
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct BundleContentsBucket: View {
+    let category: ItemCategory
+    let items: [ScanItem]
+    @Bindable var store: ScanStore
+    @Binding var itemSelection: UUID?
+
+    @State private var expanded: Bool = false
+    private let collapsedLimit = 6
+
+    var body: some View {
+        let sorted = items.sorted { $0.name.lowercased() < $1.name.lowercased() }
+        let visible = expanded ? sorted : Array(sorted.prefix(collapsedLimit))
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Image(systemName: category.systemImageName)
+                    .foregroundStyle(.tint)
+                    .imageScale(.small)
+                Text(category.displayName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text("\(sorted.count)")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                Spacer()
+            }
+            ForEach(visible, id: \.id) { child in
+                Button {
+                    itemSelection = child.id
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(child.name)
+                            .font(.callout)
+                        if let ctx = child.context {
+                            Text(ctx)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            if sorted.count > collapsedLimit {
+                Button(expanded ? "Show less" : "Show all \(sorted.count)") {
+                    expanded.toggle()
+                }
+                .font(.caption)
+                .buttonStyle(.borderless)
+            }
+        }
+    }
+}
+
+private struct IncomingReferencesSection: View {
+    let item: ScanItem
+    @Bindable var store: ScanStore
+    @Binding var itemSelection: UUID?
+
+    var body: some View {
+        let incoming = store.incomingReferences(toPath: item.path)
         if incoming.isEmpty {
             EmptyView()
         } else {
-            GroupBox(label: Label("Referenced By (\(incoming.count))", systemImage: "arrow.turn.up.left")) {
-                VStack(alignment: .leading, spacing: 4) {
+            Section(
+                title: "Referenced By",
+                systemImage: "arrow.turn.up.left",
+                accessory: "\(incoming.count)"
+            ) {
+                VStack(alignment: .leading, spacing: 3) {
                     ForEach(incoming.prefix(64), id: \.id) { ref in
                         Button {
                             itemSelection = ref.id
                         } label: {
-                            HStack {
+                            HStack(spacing: 6) {
                                 Image(systemName: ref.category.systemImageName)
                                     .foregroundStyle(.tint)
                                     .frame(width: 16)
@@ -520,24 +894,8 @@ private struct IncomingReferencesView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-    }
-
-    private func computeIncoming() -> [ScanItem] {
-        let myPath = item.path
-        var results: [ScanItem] = []
-        for other in store.items.values {
-            if other.id == item.id { continue }
-            for rel in other.relationships {
-                if rel.targetPath == myPath {
-                    results.append(other)
-                    break
-                }
-            }
-        }
-        return results.sorted { $0.name.lowercased() < $1.name.lowercased() }
     }
 }
 
@@ -545,7 +903,6 @@ private struct RelationshipRow: View {
     let rel: Relationship
     @Bindable var store: ScanStore
     @Binding var itemSelection: UUID?
-
     var body: some View {
         let target = store.item(atPath: rel.targetPath)
         HStack(spacing: 6) {
@@ -567,8 +924,6 @@ private struct RelationshipRow: View {
                 }
                 .buttonStyle(.plain)
             } else {
-                // Target not in this scan — show the raw path (e.g. an
-                // @rpath-relative dylib or an OS-level dylib not enumerated).
                 HStack(spacing: 4) {
                     Image(systemName: "questionmark.circle")
                         .foregroundStyle(.tertiary)
@@ -587,6 +942,143 @@ private struct RelationshipRow: View {
     }
 }
 
+// MARK: - Chips
+
+/// Coloured tag chip. Tags that map to a known semantic (architectures,
+/// platforms, roles) get a meaningful colour; everything else falls back to
+/// neutral grey. Keeps the row vertically aligned with `WrappingHStack`.
+private struct ColoredTagChips: View {
+    let tags: [String]
+    var body: some View {
+        WrappingHStack(spacing: 6) {
+            ForEach(tags, id: \.self) { tag in
+                ColoredChip(text: tag, color: tagColor(tag))
+            }
+        }
+    }
+}
+
+private struct ColoredChip: View {
+    let text: String
+    let color: Color
+    var body: some View {
+        Text(text)
+            .font(.caption2)
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(color.opacity(0.18)))
+            .overlay(Capsule().strokeBorder(color.opacity(0.35), lineWidth: 0.5))
+    }
+}
+
+private func archColor(_ arch: String) -> Color {
+    let lower = arch.lowercased()
+    if lower.hasPrefix("arm64")  { return .green }
+    if lower.hasPrefix("x86_64") { return .blue }
+    if lower.hasPrefix("arm")    { return .mint }
+    if lower.hasPrefix("i386")   { return .orange }
+    return .gray
+}
+
+private func roleColor(_ role: ExecutableInfo.Role) -> Color {
+    switch role {
+    case .cli:         return .orange
+    case .daemon:      return .red
+    case .agent:       return .pink
+    case .helper:      return .purple
+    case .library:     return .blue
+    case .interpreter: return .yellow
+    case .gui:         return .indigo
+    case .unknown:     return .gray
+    }
+}
+
+private func tagColor(_ tag: String) -> Color {
+    let lower = tag.lowercased()
+    if let arch = ["arm64", "arm64e", "x86_64", "x86_64h", "i386", "arm", "arm64_32"].first(where: { lower == $0 }) {
+        return archColor(arch)
+    }
+    if ["macos", "ios", "tvos", "watchos", "visionos", "maccatalyst", "driverkit", "bridgeos"].contains(lower) {
+        return .indigo
+    }
+    if ["cli", "daemon", "agent", "helper", "library", "interpreter"].contains(lower) {
+        return .orange
+    }
+    if lower == "fat" { return .teal }
+    if lower == "cross-platform" { return .yellow }
+    if lower == "third-party" { return .red }
+    if lower == "private" || lower == "private-framework" { return .purple }
+    if lower == "hidden" || lower == "background-only" { return .indigo }
+    if lower == "dyld-cache" { return .blue }
+    if lower == "executable" { return .green }
+    if lower == "dylib" || lower == "bundle" { return .blue }
+    if lower == "kext" { return .purple }
+    if lower == "framework" { return .blue }
+    if lower == "ml" { return .pink }
+    if lower == "app" { return .green }
+    if lower == "lproj" || lower == "strings" || lower == "stringsdict" { return .cyan }
+    if lower == "man" { return .brown }
+    return .gray
+}
+
+// MARK: - WrappingHStack (poor man's flow layout)
+
+/// Lightweight wrapping HStack — enough for chip rows without pulling in a
+/// full layout. SwiftUI's native `Layout` protocol would be the proper home
+/// for this; for our needs the simpler GeometryReader-based pattern is fine.
+private struct WrappingHStack<Content: View>: View {
+    let spacing: CGFloat
+    @ViewBuilder let content: () -> Content
+    init(spacing: CGFloat = 6, @ViewBuilder content: @escaping () -> Content) {
+        self.spacing = spacing
+        self.content = content
+    }
+    var body: some View {
+        FlowLayout(spacing: spacing) { content() }
+    }
+}
+
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let containerWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for s in subviews {
+            let size = s.sizeThatFits(.unspecified)
+            if x + size.width > containerWidth && x > 0 {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: containerWidth, height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+        let containerWidth = bounds.width
+        for s in subviews {
+            let size = s.sizeThatFits(.unspecified)
+            if x + size.width > bounds.minX + containerWidth && x > bounds.minX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            s.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
 // MARK: - System info overview
 
 struct SystemInfoView: View {
@@ -595,35 +1087,34 @@ struct SystemInfoView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             if let info = store.systemInfo {
-                GroupBox("Host") {
-                    VStack(alignment: .leading, spacing: 4) {
+                Section(title: "Host", systemImage: "macpro.gen3") {
+                    VStack(alignment: .leading, spacing: 6) {
                         if let p = info.productName, let v = info.productVersion {
-                            LabeledContent("OS", value: "\(p) \(v)")
+                            InfoRow(label: "OS", value: "\(p) \(v)")
                         }
-                        if let b = info.productBuildVersion {
-                            LabeledContent("Build", value: b)
-                        }
-                        if let h = info.hardwareModel {
-                            LabeledContent("Model", value: h)
-                        }
-                        if let cpu = info.cpuBrand {
-                            LabeledContent("CPU", value: cpu)
-                        }
+                        if let b = info.productBuildVersion { InfoRow(label: "Build", value: b) }
+                        if let h = info.hardwareModel { InfoRow(label: "Model", value: h) }
+                        if let cpu = info.cpuBrand { InfoRow(label: "CPU", value: cpu) }
                         if !info.architectures.isEmpty {
-                            LabeledContent("Architectures", value: info.architectures.joined(separator: ", "))
+                            HStack(alignment: .firstTextBaseline) {
+                                Text("Arch")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 110, alignment: .leading)
+                                WrappingHStack(spacing: 6) {
+                                    ForEach(info.architectures, id: \.self) { arch in
+                                        ColoredChip(text: arch, color: archColor(arch))
+                                    }
+                                }
+                            }
                         }
-                        if let host = info.hostName {
-                            LabeledContent("Hostname", value: host)
-                        }
-                        if let sip = info.sipStatus {
-                            LabeledContent("SIP", value: sip)
-                        }
-                        LabeledContent("Captured", value: ByteFormat.compactDate(info.capturedAt))
+                        if let host = info.hostName { InfoRow(label: "Hostname", value: host) }
+                        if let sip = info.sipStatus { InfoRow(label: "SIP", value: sip) }
+                        InfoRow(label: "Captured", value: ByteFormat.compactDate(info.capturedAt))
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if let kv = info.kernelVersion {
-                    GroupBox("Kernel") {
+                    Section(title: "Kernel", systemImage: "cpu") {
                         Text(kv)
                             .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
@@ -631,7 +1122,7 @@ struct SystemInfoView: View {
                     }
                 }
                 if let boot = info.bootArgs, !boot.isEmpty {
-                    GroupBox("Boot Args") {
+                    Section(title: "Boot Args", systemImage: "power") {
                         Text(boot)
                             .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
