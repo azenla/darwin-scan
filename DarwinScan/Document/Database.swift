@@ -304,11 +304,11 @@ nonisolated final class Database: @unchecked Sendable {
             } else {
                 sqlite3_bind_null(stmt, 4)
             }
-            payload.withUnsafeBytes { raw in
+            _ = payload.withUnsafeBytes { raw -> Int32 in
                 if let base = raw.baseAddress {
-                    sqlite3_bind_blob(stmt, 5, base, Int32(payload.count), SQLITE_TRANSIENT)
+                    return sqlite3_bind_blob(stmt, 5, base, Int32(payload.count), SQLITE_TRANSIENT)
                 } else {
-                    sqlite3_bind_zeroblob(stmt, 5, 0)
+                    return sqlite3_bind_zeroblob(stmt, 5, 0)
                 }
             }
         }
@@ -335,11 +335,11 @@ nonisolated final class Database: @unchecked Sendable {
     private func setMetaLocked(key: String, blob: Data) throws {
         try bindAndStep(setMetaStmt, label: "setMeta") { stmt in
             sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
-            blob.withUnsafeBytes { raw in
+            _ = blob.withUnsafeBytes { raw -> Int32 in
                 if let base = raw.baseAddress {
-                    sqlite3_bind_blob(stmt, 2, base, Int32(blob.count), SQLITE_TRANSIENT)
+                    return sqlite3_bind_blob(stmt, 2, base, Int32(blob.count), SQLITE_TRANSIENT)
                 } else {
-                    sqlite3_bind_zeroblob(stmt, 2, 0)
+                    return sqlite3_bind_zeroblob(stmt, 2, 0)
                 }
             }
         }

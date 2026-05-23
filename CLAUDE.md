@@ -172,21 +172,41 @@ needs an index to be fast, add the index to `ScanStore`.
 
 ```
 MyScan.darwinscan/
-├── metadata.json     # version (currently 2), SystemInfo, ScanOptions, timestamps
-├── items.json        # array of ScanItem (the manifest, incl. context+relationships)
+├── data.db           # SQLite (schema v1): items + relationships + meta
 └── blobs/
     └── <2-char prefix>/
         └── <ref>.bin # content-addressed payload (icon PNG, strings dump…)
 ```
 
+(Bundle format version 3.)
+
+The SQLite database has three tables:
+
+| Table          | Shape                                                                 |
+|----------------|-----------------------------------------------------------------------|
+| `meta`         | `(key TEXT PK, value BLOB)` — schema_version, system_info JSON, options JSON, timestamps |
+| `items`        | `(id TEXT PK, path UNIQUE, category, owning_bundle_path, payload BLOB)` — payload is the full ScanItem JSON; denormalised columns exist only to support `category` and `owning_bundle_path` indexes |
+| `relationships`| `(source_id, kind, target_path, note, PRIMARY KEY (source_id, kind, target_path))` — indexed on both `source_id` and `target_path` |
+
+WAL mode + `synchronous=NORMAL`. Writes are transactional: `ScanStore.ingest`
+batches one transaction per ~250 ms flush. Reads only happen at document
+open (`Database.allItems` populates the in-memory dictionary).
+
+When a document is **open**, the live `data.db` lives in
+`~/Library/Caches/io.zenla.DarwinScan/session-<uuid>/data.db` alongside the
+blob shards. `ScanDocument.snapshot` calls `database.checkpoint()` (WAL →
+main file) before `FileWrapper(url:)` streams the file into the saved
+bundle. On open we copy `data.db` out of the bundle into a fresh session
+cache dir and attach it — that way the saved bundle stays untouched while
+the user works.
+
+**Legacy v2 bundles** (with `items.json` + `metadata.json`) still open:
+`ScanPackage.load` detects them, parses the JSON, seeds a fresh `data.db`
+in the session cache, and prints `[ScanPackage] Migrated legacy v2 bundle
+to SQLite`. The next save writes a v3 bundle — there's no roundtrip back.
+
 `<ref>` is `<hint>-<sha256-hex>`, e.g. `icon-3a4f...`, `strings-9b21...`.
 Sharding by 2-char prefix mirrors git's loose-object scheme.
-
-When a document is **open** the live blobs sit in
-`~/Library/Caches/io.zenla.DarwinScan/session-<uuid>/` and the BlobStore
-points at them. On save, `FileWrapper(url:)` streams those files into the
-saved package without materializing the bytes in memory. On open, the
-BlobStore registers each blob's source FileWrapper instead of copying.
 
 ## Default scan scope
 
@@ -274,37 +294,37 @@ to the declaration (type, extension, or `let`).
 - **`sha256` field on every ScanItem** so cross-scan diff is a simple set
   comparison.
 
-## On switching to SQLite
+## SQLite design notes
 
-We use JSON for the manifest, not SQLite. This is a deliberate call given
-the scan size:
+The manifest is SQLite (see schema above). The store keeps an in-memory
+`[UUID: ScanItem]` dictionary as the source of truth at runtime — every
+`upsert` and `ingest` mirrors into SQLite via `Database.upsertItem(s)`,
+and `reset()` mirrors into `clearItems`. We did NOT remove the in-memory
+dictionary: this migration was about persistence (incremental writes
+during scan, no full-manifest JSON rewrite on save, no crash-loss risk)
+rather than memory reduction. A future change can flip this around
+(SQLite as primary, in-memory as a working set) once we want lazy
+loading; the `Database` API already supports it.
 
-- A /System scan produces on the order of 20K–50K items × ~500 bytes
-  metadata each. The whole manifest is ~10–25 MB of JSON — comfortably
-  in-memory.
-- In-memory filtering with the search query system runs in low single-digit
-  milliseconds for /System-sized scans on Apple Silicon. SQLite with a
-  query planner, parameter binding, and result marshaling rarely beats a
-  hot in-memory linear scan at this scale.
-- The incremental indexes (`categoryCounts`, `pathReferencedBy`,
-  `itemsByOwningBundle`) cover the queries that would otherwise be O(N×E)
-  per render.
+Why ScanItem stays a JSON blob in the `items.payload` column rather than
+denormalised columns: the model has 11+ optional discriminated payload
+structs and would balloon the schema. Hot query paths (`item(atPath:)`,
+`items(in:)`, `contents(ofBundleAtPath:)`) all hit dedicated columns +
+indexes. The `payload` column is only read in bulk on document open.
 
-**When to revisit:** if scans grow past ~500K items (e.g. cross-cryptex
-recursive scans or strings-cache search across millions of strings), or if
-you want SQLite FTS5 for searching the contents of strings dumps. The
-migration would be straightforward — `ScanPackage` is the only file that
-opens/writes the persistent form, and a `data.db` inside the bundle could
-replace `items.json` without touching the UI or scanner.
+Why content-addressed blobs stay as files outside SQLite: a single
+strings-dump blob can be 50+ MB, and SQLite BLOBs aren't great at that
+size. Files in `blobs/<2-prefix>/<ref>.bin` are also straightforward to
+diff between bundles with `git diff` or `diff -r`.
 
-If you do migrate:
-- Keep `metadata.json` outside the DB (it's small, useful when grepping the
-  bundle from the shell, and version-checked first).
-- Keep `blobs/` as-is — content-addressed files outperform SQLite BLOBs for
-  multi-MB icons / strings dumps.
-- Use one wide `items` table with the discriminated payload columns
-  nullable; build covering indexes on `category`, `owning_bundle_path`, and
-  any new search field.
+**Sendable / actor isolation gotcha:** the project's
+`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` means all model types
+(`ScanItem`, `ScanOptions`, `SystemInfo`, every `*Info` struct) are
+implicitly `@MainActor`, **including their `Codable` conformances**. The
+nonisolated `Database` couldn't use those conformances. Every model
+type is therefore explicitly `nonisolated` — if you add a new payload
+struct, mark it `nonisolated` too or you'll get "main actor-isolated
+conformance of X to Decodable cannot be used in nonisolated context".
 
 ## Known follow-ups (not yet built)
 
@@ -318,7 +338,9 @@ If you do migrate:
   global search across blobs yet).
 - Token-pill UI for search (`.searchable(text:tokens:)`) so typed filters
   become removable chips inside the search field instead of below it.
-- SQLite migration if scans outgrow JSON (see § "On switching to SQLite").
+- Lazy loading on top of SQLite (in-memory as a bounded working set; full
+  payloads fetched from `data.db` on demand). The Database API and bundle
+  format are already in place — only ScanStore would need to change.
 
 ## Testing
 

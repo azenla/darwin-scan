@@ -3,7 +3,7 @@ import Foundation
 /// Top-level category — drives sidebar navigation and the UI's mental model of
 /// what the scanner found. An item can belong to exactly one category; cross-
 /// category relationships are expressed via references inside the detail payload.
-enum ItemCategory: String, Codable, CaseIterable, Identifiable, Sendable {
+nonisolated enum ItemCategory: String, Codable, CaseIterable, Identifiable, Sendable {
     case executable        // CLI tools and other MH_EXECUTE Mach-Os outside .app bundles
     case application       // .app bundles
     case launchService     // launchd plists (agents/daemons)
@@ -63,7 +63,12 @@ enum ItemCategory: String, Codable, CaseIterable, Identifiable, Sendable {
 /// Discriminated payload for any single discovered item. The category determines
 /// which optional field is populated; that "tagged union via optionals" approach
 /// keeps the manifest one-table-shaped without per-category subclassing.
-struct ScanItem: Codable, Identifiable, Hashable, Sendable {
+///
+/// Explicitly `nonisolated` because the project default isolation is
+/// `@MainActor`. Without this annotation, the implicit `Codable` conformance
+/// would also be MainActor-isolated, and the SQLite `Database` (which encodes
+/// /decodes off the main actor) couldn't use it.
+nonisolated struct ScanItem: Codable, Identifiable, Hashable, Sendable {
     var id: UUID
     var path: String
     var name: String
@@ -110,7 +115,7 @@ struct ScanItem: Codable, Identifiable, Hashable, Sendable {
     var relationships: [Relationship] = []
 }
 
-struct Relationship: Codable, Hashable, Sendable {
+nonisolated struct Relationship: Codable, Hashable, Sendable {
     enum Kind: String, Codable, Sendable {
         case linksDylib        // Mach-O LC_LOAD_DYLIB
         case ownedByBundle     // child of a .app / .framework / .bundle / .kext
@@ -129,7 +134,7 @@ struct Relationship: Codable, Hashable, Sendable {
 
 // MARK: - Per-category payloads
 
-struct ExecutableInfo: Codable, Hashable, Sendable {
+nonisolated struct ExecutableInfo: Codable, Hashable, Sendable {
     enum Kind: String, Codable, Sendable {
         case object         // MH_OBJECT
         case executable     // MH_EXECUTE
@@ -183,7 +188,7 @@ struct ExecutableInfo: Codable, Hashable, Sendable {
     var stringsBlobRef: String?
 }
 
-struct AppBundleInfo: Codable, Hashable, Sendable {
+nonisolated struct AppBundleInfo: Codable, Hashable, Sendable {
     var bundleIdentifier: String?
     var displayName: String?
     var executableName: String?
@@ -199,7 +204,7 @@ struct AppBundleInfo: Codable, Hashable, Sendable {
     var urlSchemes: [String] = []
 }
 
-struct LaunchServiceInfo: Codable, Hashable, Sendable {
+nonisolated struct LaunchServiceInfo: Codable, Hashable, Sendable {
     enum Kind: String, Codable, Sendable {
         case daemon         // /System/Library/LaunchDaemons
         case agent          // /System/Library/LaunchAgents
@@ -218,7 +223,7 @@ struct LaunchServiceInfo: Codable, Hashable, Sendable {
     var disabled: Bool = false
 }
 
-struct FrameworkInfo: Codable, Hashable, Sendable {
+nonisolated struct FrameworkInfo: Codable, Hashable, Sendable {
     var bundleIdentifier: String?
     var shortVersionString: String?
     var currentVersion: String?
@@ -227,7 +232,7 @@ struct FrameworkInfo: Codable, Hashable, Sendable {
     var isPrivate: Bool            // .../PrivateFrameworks/...
 }
 
-struct MLModelInfo: Codable, Hashable, Sendable {
+nonisolated struct MLModelInfo: Codable, Hashable, Sendable {
     enum Container: String, Codable, Sendable {
         case mlmodel        // source .mlmodel
         case mlpackage      // .mlpackage directory
@@ -250,7 +255,7 @@ struct MLModelInfo: Codable, Hashable, Sendable {
     var inferredPurpose: String?
 }
 
-struct IconInfo: Codable, Hashable, Sendable {
+nonisolated struct IconInfo: Codable, Hashable, Sendable {
     enum Kind: String, Codable, Sendable {
         case icns           // .icns Apple icon file
         case carAsset       // Assets.car (asset catalog)
@@ -262,7 +267,7 @@ struct IconInfo: Codable, Hashable, Sendable {
     var previewBlobRef: String?
 }
 
-struct ManPageInfo: Codable, Hashable, Sendable {
+nonisolated struct ManPageInfo: Codable, Hashable, Sendable {
     var section: String?           // "1", "8", etc.
     var title: String?             // NAME line first token
     var description: String?       // NAME line, the part after the dash
@@ -270,7 +275,7 @@ struct ManPageInfo: Codable, Hashable, Sendable {
     var compressed: Bool
 }
 
-struct LocalizationInfo: Codable, Hashable, Sendable {
+nonisolated struct LocalizationInfo: Codable, Hashable, Sendable {
     enum Kind: String, Codable, Sendable {
         case strings        // .strings
         case stringsdict    // .stringsdict
@@ -282,20 +287,20 @@ struct LocalizationInfo: Codable, Hashable, Sendable {
     var owningBundleId: String?
 }
 
-struct DyldCacheInfo: Codable, Hashable, Sendable {
+nonisolated struct DyldCacheInfo: Codable, Hashable, Sendable {
     var architecture: String?      // x86_64, arm64, arm64e
     var formatVersion: String?     // "dyld_v1 ..."
     var imageCount: Int?
     var mappingCount: Int?
 }
 
-struct ScriptInfo: Codable, Hashable, Sendable {
+nonisolated struct ScriptInfo: Codable, Hashable, Sendable {
     var interpreter: String?       // /bin/bash, /usr/bin/env perl, ...
     var language: String?          // bash / python / perl / ruby / ...
     var lineCount: Int?
 }
 
-struct PlistInfo: Codable, Hashable, Sendable {
+nonisolated struct PlistInfo: Codable, Hashable, Sendable {
     /// Best-effort classification by filename / location, used to drive the
     /// "Kind" tag in the UI without re-parsing.
     enum Kind: String, Codable, Sendable {

@@ -3,7 +3,7 @@ import Foundation
 /// User-configurable knobs for a scan. Defaults exclude user-state paths
 /// (/Users, /Applications, /Library, /Volumes, /usr/local, /opt) so we only
 /// touch material that would be present in an IPSW.
-struct ScanOptions: Codable, Hashable, Sendable {
+nonisolated struct ScanOptions: Codable, Hashable, Sendable {
     /// Top-level roots to traverse.
     var roots: [String] = [
         "/System",

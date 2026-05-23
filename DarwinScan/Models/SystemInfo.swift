@@ -3,7 +3,7 @@ import Foundation
 /// Snapshot of host configuration at scan time. Captured once per scan; used
 /// for cross-scan diffs ("what changed between macOS 26.4 and 26.5?") and as
 /// a header in the inspector.
-struct SystemInfo: Codable, Hashable, Sendable {
+nonisolated struct SystemInfo: Codable, Hashable, Sendable {
     var productName: String?       // "macOS"
     var productVersion: String?    // "26.5"
     var productBuildVersion: String?
