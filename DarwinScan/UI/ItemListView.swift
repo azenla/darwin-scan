@@ -72,8 +72,21 @@ struct ItemRow: View {
                 .foregroundStyle(.tint)
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
-                Text(item.name)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(item.name)
+                        .lineLimit(1)
+                    if let context = item.context, !context.isEmpty {
+                        Text(context)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(
+                                Capsule().fill(.tint.opacity(0.12))
+                            )
+                            .lineLimit(1)
+                    }
+                }
                 Text(item.path)
                     .lineLimit(1)
                     .truncationMode(.middle)

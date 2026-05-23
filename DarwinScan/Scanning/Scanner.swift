@@ -9,8 +9,6 @@ import Observation
 final class ScanController {
     var progress: ScanProgress = ScanProgress()
     var isRunning: Bool = false
-    /// Set after a successful run — the items the scanner produced, ready to
-    /// be ingested into a document's store.
     var lastResult: ScanResult?
 
     private var workerTask: Task<Void, Never>?
@@ -19,9 +17,10 @@ final class ScanController {
         workerTask?.cancel()
     }
 
-    /// Kick off a scan. Items are ingested into the provided store as they
-    /// finish — that way you can see live counts updating in the sidebar
-    /// while a long /System walk is still running.
+    /// Kick off a scan. Items are ingested into the provided store in batches
+    /// that are throttled to ~4 per second so the main thread isn't constantly
+    /// re-rendering the list. Blob bytes are written to disk on the worker
+    /// before crossing back to the main actor.
     func startScan(options: ScanOptions, ingestInto store: ScanStore) {
         guard !isRunning else { return }
         isRunning = true
@@ -30,21 +29,32 @@ final class ScanController {
         store.options = options
         store.lastScanStarted = Date()
 
+        let writer = store.blobStore.makeWriter()
+        let blobStore = store.blobStore
+
         let worker = ScanWorker()
         workerTask = Task { @MainActor [weak self] in
             await worker.run(
                 options: options,
+                blobWriter: writer,
                 progressSink: { [weak self] snapshot in
                     self?.progress = snapshot
                 },
-                itemSink: { [weak self] item, blobs in
-                    guard let self else { return }
-                    for (ref, data) in blobs {
-                        store.setBlob(data, forRef: ref)
+                batchSink: { [weak self] results in
+                    var refs: [String] = []
+                    refs.reserveCapacity(results.count)
+                    var newItems: [ScanItem] = []
+                    newItems.reserveCapacity(results.count)
+                    for r in results {
+                        newItems.append(r.item)
+                        for ref in r.blobRefs { refs.append(ref) }
                     }
-                    store.upsert(item)
-                    self.progress.itemsFound = store.items.count
-                    self.progress.perCategoryCounts[item.category, default: 0] += 1
+                    blobStore.registerMany(refs)
+                    store.ingest(newItems)
+                    self?.progress.itemsFound = store.items.count
+                    for item in newItems {
+                        self?.progress.perCategoryCounts[item.category, default: 0] += 1
+                    }
                 },
                 systemInfoSink: { info in
                     store.systemInfo = info
@@ -57,80 +67,150 @@ final class ScanController {
     }
 }
 
-/// Result envelope — currently just a count. Kept so we can grow features
-/// (timing breakdowns, error log) without changing the controller surface.
 struct ScanResult: Sendable {
     var itemCount: Int
 }
 
-/// Where `ScanStore` is `@MainActor`-by-default-isolation, this worker runs on
-/// a background actor and never touches the store directly. Inspector outputs
-/// are funnelled through closures (`itemSink`) so the MainActor side can
-/// serialize all store mutations.
-private actor ScanWorker {
-    let machO = MachOInspector()
+/// Output of one inspector run, with any blob bytes already persisted to disk
+/// by the worker before this struct crosses an actor boundary.
+struct InspectResult: Sendable {
+    let item: ScanItem
+    let blobRefs: [String]
+}
 
+// MARK: - Worker
+
+private actor ScanWorker {
+    /// Run a scan. Architecture: a sliding-window `TaskGroup` keeps N
+    /// inspector tasks in flight at any time, where N = (activeCPUs - 1).
+    /// The walker is a single producer; its iterator is pumped from this
+    /// actor's body (never from child tasks, which keeps it Sendable-clean).
+    /// Throttled flushes batch ingested items so SwiftUI sees ~4 updates per
+    /// second instead of one per file.
     func run(
         options: ScanOptions,
+        blobWriter: BlobWriter,
         progressSink: @escaping @Sendable @MainActor (ScanProgress) -> Void,
-        itemSink: @escaping @Sendable @MainActor (ScanItem, [String: Data]) -> Void,
+        batchSink: @escaping @Sendable @MainActor ([InspectResult]) -> Void,
         systemInfoSink: @escaping @Sendable @MainActor (SystemInfo) -> Void
     ) async {
-        // System info first — cheap, and the UI can show it immediately.
         let info = SystemInfoCollector.capture()
         await systemInfoSink(info)
 
         var progress = ScanProgress(phase: .enumerating, startedAt: Date())
         await progressSink(progress)
 
+        let pipeline = ScanPipeline(options: options, blobWriter: blobWriter)
         let walker = FileWalker(options: options)
 
-        // We pull URLs out of the walker stream and batch the per-item work
-        // so we don't hop back to MainActor on every single file (would slow
-        // a /System scan dramatically).
-        var batch: [(ScanItem, [String: Data])] = []
-        batch.reserveCapacity(64)
+        // Aim for one task per logical core minus one (leave headroom for UI).
+        // Most inspectors are I/O bound; over-subscribing past CPU count
+        // doesn't help once we're saturating disk.
+        let maxConcurrent = max(2, ProcessInfo.processInfo.activeProcessorCount - 1)
 
-        for await url in walker.makeStream() {
-            if Task.isCancelled { break }
-            progress.filesVisited += 1
-            progress.currentPath = url.path
-            if progress.filesVisited % 64 == 0 {
-                await progressSink(progress)
+        var batch: [InspectResult] = []
+        batch.reserveCapacity(256)
+        var lastFlush = Date()
+        var lastProgressEmit = Date()
+        let flushInterval: TimeInterval = 0.25
+        let progressInterval: TimeInterval = 0.15
+        let batchSize = 256
+
+        await withTaskGroup(of: InspectResult?.self) { group in
+            var iterator = walker.makeStream().makeAsyncIterator()
+
+            // Prime the window with `maxConcurrent` initial tasks. After this,
+            // every completed task triggers one new task — keeping the window
+            // saturated until the walker is exhausted.
+            for _ in 0..<maxConcurrent {
+                guard let url = await iterator.next() else { break }
+                progress.filesVisited += 1
+                progress.currentPath = url.path
+                group.addTask {
+                    if Task.isCancelled { return nil }
+                    return pipeline.inspect(url: url)
+                }
             }
+            progress.phase = .inspecting
+            await progressSink(progress)
 
-            if let produced = inspect(url: url, options: options) {
-                progress.filesInspected += 1
-                batch.append(produced)
-                if batch.count >= 32 {
-                    let toFlush = batch
-                    batch.removeAll(keepingCapacity: true)
-                    for (item, blobs) in toFlush {
-                        await itemSink(item, blobs)
+            while let result = await group.next() {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    continue
+                }
+
+                if let result = result {
+                    batch.append(result)
+                    progress.filesInspected += 1
+                }
+
+                // Top up the window with the next URL, if any.
+                if let url = await iterator.next() {
+                    progress.filesVisited += 1
+                    progress.currentPath = url.path
+                    group.addTask {
+                        if Task.isCancelled { return nil }
+                        return pipeline.inspect(url: url)
                     }
+                }
+
+                let now = Date()
+                if batch.count >= batchSize || (now.timeIntervalSince(lastFlush) >= flushInterval && !batch.isEmpty) {
+                    let toSend = batch
+                    batch.removeAll(keepingCapacity: true)
+                    lastFlush = now
+                    await batchSink(toSend)
+                }
+                if now.timeIntervalSince(lastProgressEmit) >= progressInterval {
+                    lastProgressEmit = now
+                    await progressSink(progress)
                 }
             }
         }
+
         if !batch.isEmpty {
-            for (item, blobs) in batch {
-                await itemSink(item, blobs)
-            }
+            await batchSink(batch)
         }
 
         progress.phase = .done
         progress.currentPath = ""
         await progressSink(progress)
     }
+}
 
-    /// Routes a URL to the appropriate inspector. Returns nil for files we
-    /// don't classify (e.g. plain text data files inside /usr/share).
-    nonisolated func inspect(url: URL, options: ScanOptions) -> (ScanItem, [String: Data])? {
+// MARK: - Pipeline
+
+/// Stateless inspector dispatcher. `Sendable` so it can be captured by the
+/// concurrent child tasks. The `BlobWriter` it carries writes to disk without
+/// any actor hops — bytes never cross thread boundaries.
+nonisolated struct ScanPipeline: Sendable {
+    let options: ScanOptions
+    let blobWriter: BlobWriter
+    let machO = MachOInspector()
+
+    /// Routes a URL to the appropriate inspector and returns the resulting
+    /// item plus the set of blob refs we wrote to disk for it.
+    func inspect(url: URL) -> InspectResult? {
+        guard let (item, blobs) = classify(url: url) else { return nil }
+        // Write blobs to disk on this worker thread before crossing back to
+        // MainActor — keeps peak memory low and keeps the main thread out of
+        // the byte-pushing path entirely.
+        for (ref, data) in blobs {
+            blobWriter.write(data, ref: ref)
+        }
+        var enriched = item
+        populateContextAndRelationships(item: &enriched, originalURL: url)
+        return InspectResult(item: enriched, blobRefs: Array(blobs.keys))
+    }
+
+    // MARK: Classification
+
+    private func classify(url: URL) -> (ScanItem, [String: Data])? {
         let path = url.path
         let filename = url.lastPathComponent
         let ext = url.pathExtension.lowercased()
-        let fm = FileManager.default
 
-        // Resource values: cheaper than two stat calls for size + mtime + type.
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .isSymbolicLinkKey]
         guard let values = try? url.resourceValues(forKeys: keys) else { return nil }
         let isDir = values.isDirectory ?? false
@@ -138,17 +218,13 @@ private actor ScanWorker {
         let size = Int64((values.fileSize ?? 0))
         let mtime = values.contentModificationDate
 
-        // Directories first — bundles are categorized by extension.
         if isDir {
             switch ext {
-            case "app":
-                return makeAppBundleItem(at: url, size: size, mtime: mtime)
-            case "framework":
-                return makeFrameworkItem(at: url, size: size, mtime: mtime, kind: .framework)
-            case "kext":
-                return makeKextItem(at: url, size: size, mtime: mtime)
+            case "app":         return makeAppBundleItem(at: url, size: size, mtime: mtime)
+            case "framework":   return makeFrameworkItem(at: url, size: size, mtime: mtime)
+            case "kext":        return makeKextItem(at: url, size: size, mtime: mtime)
             case "mlpackage", "mlmodelc":
-                return makeMLModelItem(at: url, size: size, mtime: mtime)
+                                return makeMLModelItem(at: url, size: size, mtime: mtime)
             case "lproj":
                 if options.inspectLocalizations,
                    let info = LocalizationInspector.inspectLprojDirectory(url) {
@@ -161,23 +237,13 @@ private actor ScanWorker {
                     ), [:])
                 }
                 return nil
-            case "bundle":
-                // Generic resource bundle — record as framework for now since
-                // they behave similarly (.framework is a kind of .bundle).
-                return makeFrameworkItem(at: url, size: size, mtime: mtime, kind: .framework)
-            default:
-                // Plain directory — not interesting on its own.
-                return nil
+            case "bundle":      return makeFrameworkItem(at: url, size: size, mtime: mtime)
+            default:            return nil
             }
         }
 
         guard isFile else { return nil }
 
-        // File-based dispatch ---------------------------------------------------
-        // Order matters: prefer "rich" inspectors before falling back to
-        // generic Mach-O detection.
-
-        // DYLD shared cache files (under /System/Library/dyld/ and inside cryptexes)
         if options.inspectDyldCache, DyldCacheInspector.looksLikeDyldCache(filename: filename),
            let info = DyldCacheInspector.inspect(url: url) {
             var tags: [String] = ["dyld-cache"]
@@ -192,7 +258,6 @@ private actor ScanWorker {
             ), [:])
         }
 
-        // Launch plists.
         if (path.hasPrefix("/System/Library/LaunchDaemons/") || path.hasPrefix("/System/Library/LaunchAgents/"))
             && ext == "plist",
            let info = PlistInspector.decodeLaunchService(at: url) {
@@ -209,7 +274,6 @@ private actor ScanWorker {
             ), [:])
         }
 
-        // Localizations.
         if options.inspectLocalizations,
            (ext == "strings" || ext == "stringsdict"),
            let info = LocalizationInspector.inspect(url: url) {
@@ -225,7 +289,6 @@ private actor ScanWorker {
             ), [:])
         }
 
-        // Man pages.
         if options.indexManPages && isManPagePath(path) {
             if let (info, _) = ManPageInspector.inspect(url: url) {
                 var tags: [String] = ["man"]
@@ -241,7 +304,6 @@ private actor ScanWorker {
             }
         }
 
-        // Standalone ML models.
         if options.inspectMLModels, isMLModelExtension(ext),
            let info = MLModelInspector.inspect(url: url) {
             return (ScanItem(
@@ -254,7 +316,6 @@ private actor ScanWorker {
             ), [:])
         }
 
-        // Icons and images that look like app/system icons.
         if isIconExtension(ext), let (info, preview) = IconInspector.inspect(url: url) {
             var blobs: [String: Data] = [:]
             var infoCopy = info
@@ -273,8 +334,7 @@ private actor ScanWorker {
             ), blobs)
         }
 
-        // Scripts — detected by shebang.
-        if isFile, let scriptInfo = readShebang(url) {
+        if let scriptInfo = readShebang(url) {
             return (ScanItem(
                 id: UUID(), path: path, name: filename, category: .script,
                 size: size, modifiedAt: mtime,
@@ -285,9 +345,8 @@ private actor ScanWorker {
             ), [:])
         }
 
-        // Mach-O — last because magic-byte sniffing is the most expensive.
         if let machoInfo = machO.inspect(url: url) {
-            return makeMachOItem(at: url, size: size, mtime: mtime, info: machoInfo, options: options, fm: fm)
+            return makeMachOItem(at: url, size: size, mtime: mtime, info: machoInfo)
         }
 
         return nil
@@ -295,7 +354,7 @@ private actor ScanWorker {
 
     // MARK: Item builders
 
-    private nonisolated func makeAppBundleItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
+    private func makeAppBundleItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
         guard let info = PlistInspector.decodeAppBundle(at: url) else { return nil }
         var infoCopy = info
         var blobs: [String: Data] = [:]
@@ -320,10 +379,8 @@ private actor ScanWorker {
         ), blobs)
     }
 
-    private nonisolated func makeFrameworkItem(at url: URL, size: Int64, mtime: Date?, kind: ItemCategory) -> (ScanItem, [String: Data])? {
+    private func makeFrameworkItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
         guard let info = PlistInspector.decodeFrameworkBundle(at: url) else {
-            // Some bundles have no Info.plist but are still framework-shaped;
-            // surface them with a minimal record so they're findable.
             let bare = FrameworkInfo(
                 bundleIdentifier: nil, shortVersionString: nil, currentVersion: nil,
                 executableName: nil, headerCount: 0,
@@ -348,7 +405,7 @@ private actor ScanWorker {
         ), [:])
     }
 
-    private nonisolated func makeKextItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
+    private func makeKextItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
         let info = PlistInspector.decodeFrameworkBundle(at: url)
             ?? FrameworkInfo(
                 bundleIdentifier: nil, shortVersionString: nil, currentVersion: nil,
@@ -363,7 +420,7 @@ private actor ScanWorker {
         ), [:])
     }
 
-    private nonisolated func makeMLModelItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
+    private func makeMLModelItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
         guard let info = MLModelInspector.inspect(url: url) else { return nil }
         return (ScanItem(
             id: UUID(), path: url.path, name: url.deletingPathExtension().lastPathComponent,
@@ -374,7 +431,7 @@ private actor ScanWorker {
         ), [:])
     }
 
-    private nonisolated func makeMachOItem(at url: URL, size: Int64, mtime: Date?, info: ExecutableInfo, options: ScanOptions, fm: FileManager) -> (ScanItem, [String: Data])? {
+    private func makeMachOItem(at url: URL, size: Int64, mtime: Date?, info: ExecutableInfo) -> (ScanItem, [String: Data])? {
         var enriched = info
         var blobs: [String: Data] = [:]
         let path = url.path
@@ -382,32 +439,23 @@ private actor ScanWorker {
         let inside = isInsideBundle(path)
         let owning = owningBundle(path)
 
-        // Heuristic enrichment ------------------------------------------------
         enriched.isApple = isApplePath(path)
         enriched.isCrossPlatformTool = WellKnownCrossPlatformTools.contains(filename.lowercased())
 
-        // Look for a "usage:" line by reading the file head — cheap CLI signal.
         if info.kind == .executable, let usage = StringsExtractor.grepInBinary(url: url, needle: "usage:") {
             enriched.usageLine = usage
         } else if info.kind == .executable, let usage = StringsExtractor.grepInBinary(url: url, needle: "Usage:") {
             enriched.usageLine = usage
         }
 
-        // Decide category. dylibs and frameworks-as-files go to "framework"
-        // because users think of them together; bare bundles too.
         let category: ItemCategory
         switch info.kind {
-        case .dylib, .bundle:
-            category = .framework
-        case .kext:
-            category = .kext
-        case .executable:
-            category = inside ? .executable : .executable
-        default:
-            category = .other
+        case .dylib, .bundle: category = .framework
+        case .kext:           category = .kext
+        case .executable:     category = .executable
+        default:              category = .other
         }
 
-        // Roles --------------------------------------------------------------
         var roles: [ExecutableInfo.Role] = []
         if info.kind == .executable {
             if enriched.usageLine != nil { roles.append(.cli) }
@@ -418,7 +466,6 @@ private actor ScanWorker {
         }
         enriched.roles = roles
 
-        // Optional strings cache.
         if options.extractStrings && info.kind == .executable && size <= options.maxInspectFileSize {
             if let dump = StringsExtractor.extract(from: url, minLength: options.stringsMinLength) {
                 let ref = "strings-" + Hash.sha256Hex(dump)
@@ -429,15 +476,15 @@ private actor ScanWorker {
 
         var tags: [String] = []
         switch info.kind {
-        case .executable:    tags.append("executable")
-        case .dylib:         tags.append("dylib")
-        case .bundle:        tags.append("bundle")
-        case .dylinker:      tags.append("dylinker")
-        case .kext:          tags.append("kext")
-        case .object:        tags.append("object")
-        case .dsym:          tags.append("dsym")
-        case .core:          tags.append("core")
-        case .unknown:       tags.append("macho")
+        case .executable: tags.append("executable")
+        case .dylib:      tags.append("dylib")
+        case .bundle:     tags.append("bundle")
+        case .dylinker:   tags.append("dylinker")
+        case .kext:       tags.append("kext")
+        case .object:     tags.append("object")
+        case .dsym:       tags.append("dsym")
+        case .core:       tags.append("core")
+        case .unknown:    tags.append("macho")
         }
         for arch in info.architectures { tags.append(arch) }
         if info.isFatBinary { tags.append("fat") }
@@ -456,21 +503,81 @@ private actor ScanWorker {
         ), blobs)
     }
 
+    // MARK: Context + relationships
+
+    /// Compute `context` (the disambiguating label shown next to the name in
+    /// lists) and `relationships` (outgoing graph edges). Pure derivation from
+    /// the item's own fields plus the original URL — no cross-item lookups, so
+    /// it's safe to run in the inspector pipeline before items are reconciled.
+    private func populateContextAndRelationships(item: inout ScanItem, originalURL: URL) {
+        // --- context ---
+        if let bundlePath = item.owningBundlePath {
+            let basename = (bundlePath as NSString).lastPathComponent
+            let displayName = (basename as NSString).deletingPathExtension
+            switch item.category {
+            case .localization:
+                if let lang = item.localization?.language {
+                    item.context = "\(displayName) · \(lang)"
+                } else {
+                    item.context = displayName
+                }
+            case .manPage:
+                if let section = item.manPage?.section {
+                    item.context = "\(displayName) · section \(section)"
+                } else {
+                    item.context = displayName
+                }
+            default:
+                item.context = displayName
+            }
+        } else {
+            // Top-level item — show parent directory for disambiguation.
+            let parent = originalURL.deletingLastPathComponent().path
+            let parentName = (parent as NSString).lastPathComponent
+            switch item.category {
+            case .manPage:
+                if let section = item.manPage?.section {
+                    item.context = "section \(section)"
+                }
+            case .application:
+                // Top-level apps: parent path like /System/Applications or /System/Library/CoreServices
+                if !parent.isEmpty, parent != "/" { item.context = parent }
+            default:
+                if !parentName.isEmpty { item.context = parentName }
+            }
+        }
+
+        // --- relationships ---
+        var rels: [Relationship] = []
+        if let owning = item.owningBundlePath {
+            rels.append(Relationship(kind: .ownedByBundle, targetPath: owning, note: nil))
+        }
+        if let exec = item.executable {
+            for lib in exec.linkedLibraries {
+                rels.append(Relationship(kind: .linksDylib, targetPath: lib, note: nil))
+            }
+        }
+        if let ls = item.launchService, let program = ls.program {
+            rels.append(Relationship(kind: .launchesProgram, targetPath: program, note: "Program"))
+        }
+        item.relationships = rels
+    }
+
     // MARK: Heuristics
 
-    private nonisolated func isMLModelExtension(_ ext: String) -> Bool {
+    private func isMLModelExtension(_ ext: String) -> Bool {
         ["mlmodel", "mlpackage", "mlmodelc", "onnx", "tflite", "pt", "pth"].contains(ext)
     }
 
-    private nonisolated func isIconExtension(_ ext: String) -> Bool {
+    private func isIconExtension(_ ext: String) -> Bool {
         ["icns", "png", "jpg", "jpeg", "tiff", "heic", "car"].contains(ext)
     }
 
-    private nonisolated func isManPagePath(_ path: String) -> Bool {
+    private func isManPagePath(_ path: String) -> Bool {
         path.contains("/share/man/man")
     }
 
-    private nonisolated func isInsideBundle(_ path: String) -> Bool {
+    private func isInsideBundle(_ path: String) -> Bool {
         path.contains(".app/") ||
             path.contains(".framework/") ||
             path.contains(".bundle/") ||
@@ -479,13 +586,10 @@ private actor ScanWorker {
             path.contains(".mlmodelc/")
     }
 
-    /// Returns the closest enclosing `.app`/`.framework`/`.bundle`/`.kext`
-    /// path, if any.
-    private nonisolated func owningBundle(_ path: String) -> String? {
+    private func owningBundle(_ path: String) -> String? {
         for suffix in [".app", ".framework", ".bundle", ".kext", ".mlpackage", ".mlmodelc"] {
             if let range = path.range(of: "\(suffix)/") {
                 let endIndex = range.upperBound
-                // Backtrack to include the suffix itself, exclude the trailing slash.
                 let bundleEnd = path.index(before: endIndex)
                 return String(path[path.startIndex..<bundleEnd])
             }
@@ -493,7 +597,7 @@ private actor ScanWorker {
         return nil
     }
 
-    private nonisolated func isApplePath(_ path: String) -> Bool {
+    private func isApplePath(_ path: String) -> Bool {
         path.hasPrefix("/System/") ||
             path.hasPrefix("/usr/lib") ||
             path.hasPrefix("/usr/libexec") ||
@@ -501,21 +605,16 @@ private actor ScanWorker {
             (path.hasPrefix("/usr/bin/") && WellKnownAppleBinaries.contains((path as NSString).lastPathComponent))
     }
 
-    private nonisolated func readShebang(_ url: URL) -> ScriptInfo? {
+    private func readShebang(_ url: URL) -> ScriptInfo? {
         guard let head = try? FileHandle(forReadingFrom: url).read(upToCount: 256), head.count >= 2 else { return nil }
         guard head[0] == 0x23, head[1] == 0x21 else { return nil } // "#!"
-        // Find newline.
         guard let nl = head.firstIndex(of: 0x0A) else { return nil }
         let interp = String(data: head[2..<nl], encoding: .utf8)?.trimmingCharacters(in: .whitespaces)
         let language = languageFromInterpreter(interp ?? "")
         return ScriptInfo(interpreter: interp, language: language, lineCount: nil)
     }
 
-    private nonisolated func languageFromInterpreter(_ line: String) -> String? {
-        // Common forms:
-        //   /bin/bash
-        //   /usr/bin/env perl
-        //   /usr/bin/python3 -u
+    private func languageFromInterpreter(_ line: String) -> String? {
         let firstToken = line.split(separator: " ").first.map(String.init) ?? line
         let last = (firstToken as NSString).lastPathComponent
         if last == "env" {
@@ -528,7 +627,7 @@ private actor ScanWorker {
         return normalizeLanguage(last)
     }
 
-    private nonisolated func normalizeLanguage(_ name: String) -> String? {
+    private func normalizeLanguage(_ name: String) -> String? {
         let lower = name.lowercased()
         if lower.hasPrefix("python") { return "python" }
         if lower.hasPrefix("perl")   { return "perl" }
@@ -542,9 +641,8 @@ private actor ScanWorker {
     }
 }
 
-/// Names that we treat as "Apple-shipped" even when they live in /usr/bin
-/// (Apple-signed tools that aren't easy to spot otherwise). Conservative — the
-/// real test is the code signature; this is the cheap fallback.
+// MARK: - Reference data (nonisolated so the pipeline can use them off-main)
+
 nonisolated private let WellKnownAppleBinaries: Set<String> = [
     "diskutil", "tmutil", "csrutil", "softwareupdate", "pmset",
     "launchctl", "systemsetup", "asr", "dscl", "scutil",
@@ -553,9 +651,6 @@ nonisolated private let WellKnownAppleBinaries: Set<String> = [
     "log", "system_profiler", "ioreg", "kextstat", "vm_stat"
 ]
 
-/// Well-known scripting language interpreters / cross-platform tools shipped
-/// with the OS. Marked so a user looking for "non-Apple things in /usr/bin"
-/// can find them quickly. Not exhaustive — easy to extend.
 nonisolated private let WellKnownCrossPlatformTools: Set<String> = [
     "perl", "perl5.34", "perl5.28", "perl5.30", "perl5.32",
     "python", "python3", "python3.9", "python3.10", "python3.11", "python3.12",

@@ -7,7 +7,8 @@ import Observation
 ///
 /// We keep two indexes: `items` keyed by UUID (for stable identity across UI
 /// renders), and `itemsByPath` for O(1) duplicate detection during scanning.
-/// Both are pure-Swift dictionaries — performance is dominated by I/O.
+/// Bulk content (icons, strings dumps) lives on disk via `BlobStore` — only
+/// metadata sits in memory.
 @Observable
 final class ScanStore {
     var systemInfo: SystemInfo?
@@ -19,16 +20,17 @@ final class ScanStore {
     private(set) var items: [UUID: ScanItem] = [:]
     private(set) var itemsByPath: [String: UUID] = [:]
 
-    /// Content-addressed payload registry. Key: blob ref (sha256-prefixed).
-    /// Value: arbitrary bytes — strings extracts, icon PNGs, etc.
-    private(set) var blobs: [String: Data] = [:]
+    /// Disk-backed payload store. Empty until a scan or a load registers refs.
+    let blobStore: BlobStore = BlobStore()
 
     // MARK: - Mutation (all on MainActor by default isolation)
 
     func reset() {
         items.removeAll()
         itemsByPath.removeAll()
-        blobs.removeAll()
+        // Note: we leave blobStore intact across resets. Refs are content-
+        // addressed so old ones become orphaned but they're idempotent on
+        // re-scan. A future "compact" command can prune unreferenced blobs.
         systemInfo = nil
         lastScanStarted = nil
         lastScanCompleted = nil
@@ -43,37 +45,33 @@ final class ScanStore {
         }
     }
 
-    /// Bulk insert from a scan; preserves identity when paths match an existing
-    /// entry so the UI selection stays stable across rescans.
+    /// Bulk insert from a scan. Preserves identity when paths match an existing
+    /// entry so the UI selection stays stable across rescans. Designed to be
+    /// called once per throttled batch — drives a single SwiftUI re-render
+    /// rather than N.
     func ingest(_ produced: [ScanItem]) {
         for item in produced {
             upsert(item)
         }
     }
 
-    /// Store a payload addressed by SHA-256 of its bytes. Returns the ref to
-    /// embed in an item's payload. Idempotent — duplicate content reuses the
-    /// same ref, so an icon shared by 50 .apps occupies one blob.
-    @discardableResult
-    func storeBlob(_ data: Data, hint: String = "") -> String {
-        let digest = Hash.sha256Hex(data)
-        let ref = hint.isEmpty ? digest : "\(hint)-\(digest)"
-        blobs[ref] = data
-        return ref
-    }
+    // MARK: - Blob access (forwarded to the underlying BlobStore)
 
-    /// Direct insertion when the caller has already computed the ref — used by
-    /// the scanner ingest path where the worker computes the digest off-thread.
-    func setBlob(_ data: Data, forRef ref: String) {
-        blobs[ref] = data
+    func blob(forRef ref: String) -> Data? {
+        blobStore.data(forRef: ref)
     }
-
-    func blob(forRef ref: String) -> Data? { blobs[ref] }
 
     // MARK: - Queries
 
     func items(in category: ItemCategory) -> [ScanItem] {
         items.values.filter { $0.category == category }
+    }
+
+    /// Resolve a relationship's target path back into an item, if it exists
+    /// in this scan. Used by the detail view to make "Related" rows clickable.
+    func item(atPath path: String) -> ScanItem? {
+        guard let id = itemsByPath[path] else { return nil }
+        return items[id]
     }
 
     func search(_ query: String, scope: ItemCategory? = nil) -> [ScanItem] {
@@ -86,6 +84,7 @@ final class ScanStore {
             if let s = scope, item.category != s { return false }
             if item.name.lowercased().contains(q) { return true }
             if item.path.lowercased().contains(q) { return true }
+            if let context = item.context?.lowercased(), context.contains(q) { return true }
             if item.tags.contains(where: { $0.lowercased().contains(q) }) { return true }
             if let usage = item.executable?.usageLine?.lowercased(), usage.contains(q) { return true }
             if let label = item.launchService?.label?.lowercased(), label.contains(q) { return true }
@@ -106,7 +105,6 @@ final class ScanStore {
     /// Loads a previously-serialized payload. Used by ScanDocument.read.
     func load(
         items: [ScanItem],
-        blobs: [String: Data],
         systemInfo: SystemInfo?,
         options: ScanOptions?,
         lastScanStarted: Date?,
@@ -117,7 +115,6 @@ final class ScanStore {
             self.items[item.id] = item
             self.itemsByPath[item.path] = item.id
         }
-        self.blobs = blobs
         self.systemInfo = systemInfo
         if let options { self.options = options }
         self.lastScanStarted = lastScanStarted

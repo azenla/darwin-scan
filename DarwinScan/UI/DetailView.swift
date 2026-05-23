@@ -5,11 +5,11 @@ import AppKit
 /// selected item's category.
 struct DetailView: View {
     @Bindable var store: ScanStore
-    var itemID: UUID?
+    @Binding var itemSelection: UUID?
 
     var body: some View {
-        if let id = itemID, let item = store.items[id] {
-            DetailContent(item: item, store: store)
+        if let id = itemSelection, let item = store.items[id] {
+            DetailContent(item: item, store: store, itemSelection: $itemSelection)
         } else {
             ContentUnavailableView(
                 "No Item Selected",
@@ -23,6 +23,7 @@ struct DetailView: View {
 private struct DetailContent: View {
     let item: ScanItem
     @Bindable var store: ScanStore
+    @Binding var itemSelection: UUID?
 
     var body: some View {
         ScrollView {
@@ -59,6 +60,11 @@ private struct DetailContent: View {
                 if let script = item.script {
                     ScriptDetailView(item: item, info: script)
                 }
+
+                if !item.relationships.isEmpty {
+                    RelationshipsView(item: item, store: store, itemSelection: $itemSelection)
+                }
+                IncomingReferencesView(item: item, store: store, itemSelection: $itemSelection)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(20)
@@ -411,6 +417,172 @@ private struct ScriptDetailView: View {
                 if let lang = info.language { LabeledContent("Language", value: lang) }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+// MARK: - Graph views (outgoing + incoming edges)
+
+/// Outgoing relationships defined on the item itself: dylib links, the
+/// program a launchd plist runs, the bundle that owns this file, etc. Each
+/// row is clickable if the target path also appears in this scan.
+private struct RelationshipsView: View {
+    let item: ScanItem
+    @Bindable var store: ScanStore
+    @Binding var itemSelection: UUID?
+
+    var body: some View {
+        let grouped = Dictionary(grouping: item.relationships, by: { $0.kind })
+        ForEach(Relationship.Kind.allRenderable, id: \.self) { kind in
+            if let rels = grouped[kind], !rels.isEmpty {
+                GroupBox(label: Label(title(for: kind), systemImage: systemImage(for: kind))) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(rels.enumerated()), id: \.offset) { (_, rel) in
+                            RelationshipRow(rel: rel, store: store, itemSelection: $itemSelection)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    private func title(for kind: Relationship.Kind) -> String {
+        switch kind {
+        case .linksDylib:       return "Links Libraries"
+        case .ownedByBundle:    return "Inside Bundle"
+        case .launchesProgram:  return "Launches Program"
+        case .sameBundle:       return "Bundle Siblings"
+        }
+    }
+
+    private func systemImage(for kind: Relationship.Kind) -> String {
+        switch kind {
+        case .linksDylib:       return "link"
+        case .ownedByBundle:    return "shippingbox"
+        case .launchesProgram:  return "play.fill"
+        case .sameBundle:       return "square.stack.3d.up"
+        }
+    }
+}
+
+private extension Relationship.Kind {
+    /// Order we surface kinds in the UI. Excludes any future internal kinds.
+    static var allRenderable: [Relationship.Kind] {
+        [.ownedByBundle, .launchesProgram, .linksDylib, .sameBundle]
+    }
+}
+
+/// Inverse-edge index: who else in this scan points *at* the current item.
+/// We compute on demand by scanning all items' relationship lists. Cheap for
+/// /System-sized scans (tens of thousands of items, a few edges each).
+private struct IncomingReferencesView: View {
+    let item: ScanItem
+    @Bindable var store: ScanStore
+    @Binding var itemSelection: UUID?
+
+    var body: some View {
+        let incoming = computeIncoming()
+        if incoming.isEmpty {
+            EmptyView()
+        } else {
+            GroupBox(label: Label("Referenced By (\(incoming.count))", systemImage: "arrow.turn.up.left")) {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(incoming.prefix(64), id: \.id) { ref in
+                        Button {
+                            itemSelection = ref.id
+                        } label: {
+                            HStack {
+                                Image(systemName: ref.category.systemImageName)
+                                    .foregroundStyle(.tint)
+                                    .frame(width: 16)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    HStack(spacing: 6) {
+                                        Text(ref.name)
+                                        if let ctx = ref.context {
+                                            Text(ctx).font(.caption).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Text(ref.path)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                Spacer()
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    if incoming.count > 64 {
+                        Text("…\(incoming.count - 64) more")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private func computeIncoming() -> [ScanItem] {
+        let myPath = item.path
+        var results: [ScanItem] = []
+        for other in store.items.values {
+            if other.id == item.id { continue }
+            for rel in other.relationships {
+                if rel.targetPath == myPath {
+                    results.append(other)
+                    break
+                }
+            }
+        }
+        return results.sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+}
+
+private struct RelationshipRow: View {
+    let rel: Relationship
+    @Bindable var store: ScanStore
+    @Binding var itemSelection: UUID?
+
+    var body: some View {
+        let target = store.item(atPath: rel.targetPath)
+        HStack(spacing: 6) {
+            if let target {
+                Button {
+                    itemSelection = target.id
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: target.category.systemImageName)
+                            .foregroundStyle(.tint)
+                            .frame(width: 14)
+                        Text(target.name)
+                        if let ctx = target.context {
+                            Text("·").foregroundStyle(.tertiary)
+                            Text(ctx).foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.callout)
+                }
+                .buttonStyle(.plain)
+            } else {
+                // Target not in this scan — show the raw path (e.g. an
+                // @rpath-relative dylib or an OS-level dylib not enumerated).
+                HStack(spacing: 4) {
+                    Image(systemName: "questionmark.circle")
+                        .foregroundStyle(.tertiary)
+                    Text(rel.targetPath)
+                        .font(.system(.callout, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            if let note = rel.note {
+                Text(note).font(.caption2).foregroundStyle(.tertiary)
+            }
+            Spacer()
         }
     }
 }

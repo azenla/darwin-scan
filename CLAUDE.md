@@ -48,40 +48,83 @@ DarwinScan/
 ## Architecture
 
 ```
-┌─────────────────────────┐         ┌──────────────────────────┐
-│ ScanController          │         │ ScanWorker (actor)        │
-│  @Observable @MainActor │ ──────▶ │  walks files,             │
-│  isRunning              │ ◀────── │  dispatches to inspectors │
-│  progress               │         │                           │
-└─────────────────────────┘         └──────────────────────────┘
+┌─────────────────────────┐         ┌──────────────────────────────────────┐
+│ ScanController          │         │ ScanWorker (actor)                   │
+│  @Observable @MainActor │ ──────▶ │  drives a bounded TaskGroup          │
+│  isRunning              │ ◀────── │  (window = activeCPUs - 1)           │
+│  progress               │         │  consumes URLs from FileWalker stream│
+└─────────────────────────┘         └──────────────────────────────────────┘
             │                                    │
-            ▼                                    ▼ (closure callbacks)
-┌─────────────────────────┐         ┌──────────────────────────┐
-│ ScanDocument            │         │ Inspectors                │
-│  ReferenceFileDocument  │         │  MachOInspector           │
-│  ObservableObject       │         │  PlistInspector           │
-│   └─ store (ScanStore)  │         │  AppBundleInspector       │
-└─────────────────────────┘         │  MLModelInspector         │
-            │                       │  ManPageInspector         │
-            ▼                       │  LocalizationInspector    │
-┌─────────────────────────┐         │  IconInspector            │
-│ ScanStore               │         │  DyldCacheInspector       │
-│  @Observable @MainActor │         │  StringsExtractor         │
-│  items: [UUID:ScanItem] │         │  (all `nonisolated enum`) │
-│  blobs: [String:Data]   │         └──────────────────────────┘
+            ▼                                    ▼ (child tasks, parallel)
+┌─────────────────────────┐         ┌──────────────────────────────────────┐
+│ ScanDocument            │         │ ScanPipeline (Sendable struct)       │
+│  ReferenceFileDocument  │         │  - classifies one URL → ScanItem     │
+│  ObservableObject       │         │  - populates context + relationships │
+│   └─ store (ScanStore)  │         │  - writes blob bytes to disk via     │
+└─────────────────────────┘         │    BlobWriter before returning       │
+            │                       └──────────────────────────────────────┘
+            ▼                                    │
+┌─────────────────────────┐                      ▼
+│ ScanStore               │         ┌──────────────────────────┐
+│  @Observable @MainActor │         │ Inspectors               │
+│  items: [UUID:ScanItem] │         │  MachOInspector          │
+│  itemsByPath            │         │  PlistInspector          │
+│  blobStore: BlobStore   │ ──────▶ │  AppBundleInspector      │
+└─────────────────────────┘         │  MLModelInspector / etc. │
+            │                       │  (all `nonisolated`)     │
+            ▼                       └──────────────────────────┘
+┌─────────────────────────┐
+│ BlobStore               │
+│  @Observable @MainActor │
+│  refs: Set<String>      │  ← lightweight registry; bytes live on disk
+│  cacheDirectory: URL    │
+│  loadedWrappers (after  │
+│   document open)        │
 └─────────────────────────┘
 ```
 
 `ScanItem` is a single discriminated record (one row per discovered thing).
 The `category` field picks which of `executable` / `application` / `mlModel` /
-etc. is populated. Tags are free-form chips for the UI.
+etc. is populated. Tags are free-form chips for the UI; `context` is the
+human disambiguator (e.g. owning bundle's display name); `relationships`
+holds outgoing graph edges.
+
+### Throttling and parallelism
+
+- **Concurrency:** TaskGroup keeps `activeCPUs - 1` inspector tasks in flight
+  at any time. The FileWalker producer is pumped from the actor body (single
+  consumer), child tasks each process one URL.
+- **Batch flush:** worker accumulates `InspectResult`s and flushes to the
+  MainActor `batchSink` every **250 ms** or **256 items**, whichever comes
+  first. Each flush is one SwiftUI re-render rather than N.
+- **Progress emit:** separate **150 ms** throttle on `ScanProgress` snapshots
+  so the toolbar/footer stays responsive without spam.
+- **Blob bytes never cross actor boundaries.** Worker writes the data to
+  `~/Library/Caches/io.zenla.DarwinScan/session-<uuid>/` via `BlobWriter`,
+  then sends just the ref strings to MainActor. Peak memory bounded by
+  ~workerCount × one blob.
+
+### Graph model
+
+`ScanItem.relationships: [Relationship]` carries outgoing edges keyed by
+`targetPath` (paths are stable across scans, UUIDs aren't):
+
+| Kind             | Source                  | Target                         |
+|------------------|-------------------------|--------------------------------|
+| `linksDylib`     | Mach-O LC_LOAD_DYLIB    | linked library path/`@rpath/…` |
+| `ownedByBundle`  | child of any `.app/.framework/.bundle/.kext/.mlpackage/.mlmodelc` | enclosing bundle path |
+| `launchesProgram`| LaunchAgent / LaunchDaemon plist | program executable path |
+| `sameBundle`     | reserved for future     |                                |
+
+`DetailView` renders both outgoing relationships *and* incoming references
+(scans `store.items` for anyone pointing at this item's path).
 
 ## `.darwinscan` bundle layout
 
 ```
 MyScan.darwinscan/
-├── metadata.json     # version, SystemInfo, ScanOptions, scan timestamps
-├── items.json        # array of ScanItem (the manifest)
+├── metadata.json     # version (currently 2), SystemInfo, ScanOptions, timestamps
+├── items.json        # array of ScanItem (the manifest, incl. context+relationships)
 └── blobs/
     └── <2-char prefix>/
         └── <ref>.bin # content-addressed payload (icon PNG, strings dump…)
@@ -89,6 +132,12 @@ MyScan.darwinscan/
 
 `<ref>` is `<hint>-<sha256-hex>`, e.g. `icon-3a4f...`, `strings-9b21...`.
 Sharding by 2-char prefix mirrors git's loose-object scheme.
+
+When a document is **open** the live blobs sit in
+`~/Library/Caches/io.zenla.DarwinScan/session-<uuid>/` and the BlobStore
+points at them. On save, `FileWrapper(url:)` streams those files into the
+saved package without materializing the bytes in memory. On open, the
+BlobStore registers each blob's source FileWrapper instead of copying.
 
 ## Default scan scope
 
@@ -118,10 +167,17 @@ are never scanned. The UI surfaces this guarantee.
    }
    ```
 
-4. In `Scanning/Scanner.swift::inspect(url:options:)`, add a dispatch arm —
-   order matters (richer inspectors before fall-through Mach-O detection).
+4. In `Scanning/Scanner.swift`, the `ScanPipeline.classify(url:)` switch —
+   add a dispatch arm. Order matters (richer inspectors before fall-through
+   Mach-O detection). If the item should have graph edges or a custom
+   `context`, update `populateContextAndRelationships` too.
 5. Add a `private struct FooDetailView` in `UI/DetailView.swift` and wire it
    into `DetailContent.body`.
+
+If the inspector touches AppKit drawing APIs (NSGraphicsContext, image
+drawing), it needs to be thread-safe — see `AppBundleInspector`/
+`IconInspector` for the pattern (TIFF round-trip or `CGImageSource`
+thumbnail).
 
 ## Recipe — adding a new field to an existing payload
 
@@ -142,12 +198,18 @@ list but not re-parsed (load commands repeat).
 
 ## Concurrency
 
-- `ScanStore`, `ScanDocument`, `ScanController` are `@MainActor`-isolated.
+- `ScanStore`, `ScanDocument`, `ScanController`, `BlobStore` are
+  `@MainActor`-isolated.
 - `ScanWorker` is an `actor` with its own isolation domain.
-- Inspectors and `FileWalker` are `nonisolated` so the worker can call them
-  synchronously without `await`.
-- Progress and item ingestion cross actor boundaries via `@Sendable @MainActor`
-  closures (`progressSink`, `itemSink`, `systemInfoSink`).
+- `ScanPipeline` is a `nonisolated struct: Sendable` — child tasks of the
+  worker's TaskGroup execute its methods directly, without any actor hops.
+- `BlobWriter` is `nonisolated struct: Sendable` and just carries a directory
+  URL. Concurrent writes to distinct files are safe on APFS.
+- Inspectors and `FileWalker` are `nonisolated` so the pipeline can call
+  them synchronously.
+- Progress and batch ingestion cross actor boundaries via
+  `@Sendable @MainActor` closures (`progressSink`, `batchSink`,
+  `systemInfoSink`).
 
 If you see a "main actor-isolated X in a synchronous nonisolated context"
 warning when adding a helper, the fix is almost always: add `nonisolated`

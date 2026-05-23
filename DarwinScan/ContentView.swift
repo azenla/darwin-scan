@@ -23,7 +23,7 @@ struct ContentView: View {
             if document.store.items.isEmpty && !controller.isRunning {
                 WelcomeView { showScanOptions() }
             } else {
-                DetailView(store: document.store, itemID: itemSelection)
+                DetailView(store: document.store, itemSelection: $itemSelection)
                     .frame(minWidth: 360, idealWidth: 540)
             }
         }

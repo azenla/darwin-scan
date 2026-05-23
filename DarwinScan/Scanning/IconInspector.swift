@@ -1,5 +1,6 @@
 import Foundation
-import AppKit
+import ImageIO
+import UniformTypeIdentifiers
 
 nonisolated enum IconInspector {
     /// Detect an icon-bearing file and produce an IconInfo + a rendered PNG
@@ -17,8 +18,6 @@ nonisolated enum IconInspector {
             // catalog parser).
             return (IconInfo(kind: .carAsset, representations: [], previewBlobRef: nil), nil)
         default:
-            // `.icns` and asset catalogs sometimes live without an extension
-            // (e.g. `Assets.car` is the standard name). Fall through.
             if url.lastPathComponent == "Assets.car" {
                 return (IconInfo(kind: .carAsset, representations: [], previewBlobRef: nil), nil)
             }
@@ -61,32 +60,23 @@ nonisolated enum IconInspector {
         return types
     }
 
-    /// Render an image at `size` and return PNG bytes. Used for icon previews.
+    /// Render an image at `size` and return PNG bytes. Uses ImageIO
+    /// (`CGImageSource`) which is fully thread-safe — safe to call from many
+    /// concurrent worker tasks without any locking.
     static func renderImagePNG(url: URL, size: CGFloat) -> Data? {
-        guard let image = NSImage(contentsOf: url) else { return nil }
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil,
-            pixelsWide: Int(size),
-            pixelsHigh: Int(size),
-            bitsPerSample: 8,
-            samplesPerPixel: 4,
-            hasAlpha: true,
-            isPlanar: false,
-            colorSpaceName: .deviceRGB,
-            bytesPerRow: 0,
-            bitsPerPixel: 32
-        ) else { return nil }
-        rep.size = NSSize(width: size, height: size)
-        NSGraphicsContext.saveGraphicsState()
-        defer { NSGraphicsContext.restoreGraphicsState() }
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        image.draw(
-            in: NSRect(origin: .zero, size: NSSize(width: size, height: size)),
-            from: .zero,
-            operation: .copy,
-            fraction: 1.0
-        )
-        return rep.representation(using: .png, properties: [:])
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let thumbOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: false,
+            kCGImageSourceThumbnailMaxPixelSize: Int(size)
+        ]
+        guard let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) else { return nil }
+        let out = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, thumb, nil)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return out as Data
     }
 }
 

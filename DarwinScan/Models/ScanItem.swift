@@ -91,6 +91,36 @@ struct ScanItem: Codable, Identifiable, Hashable, Sendable {
     /// "cross-platform", "scripting-runtime". Cheap way to add new facets without
     /// schema changes.
     var tags: [String] = []
+
+    /// Human-readable disambiguator surfaced next to `name` in the UI. For
+    /// items inside a bundle this is the bundle's display name (e.g.
+    /// "Safari" or "CoreFoundation"). For top-level items it's the parent
+    /// directory or some other helpful prefix. The point: when the list shows
+    /// 200 files all called `Localizable.strings`, this is what tells you which
+    /// one belongs to which app at a glance.
+    var context: String?
+
+    /// Outgoing graph edges to other items in the same scan. Resolved by
+    /// `targetPath` against `ScanStore.itemsByPath`. Used to render a "Related"
+    /// section in the detail view and to power future graph navigation.
+    var relationships: [Relationship] = []
+}
+
+struct Relationship: Codable, Hashable, Sendable {
+    enum Kind: String, Codable, Sendable {
+        case linksDylib        // Mach-O LC_LOAD_DYLIB
+        case ownedByBundle     // child of a .app / .framework / .bundle / .kext
+        case launchesProgram   // LaunchService → executable it runs
+        case sameBundle        // sibling within the same enclosing bundle
+    }
+    var kind: Kind
+    /// Stable identifier — the target item's *path*. We use paths instead of
+    /// UUIDs because UUIDs are regenerated each scan; paths are stable across
+    /// scans which lets future diff features work.
+    var targetPath: String
+    /// Optional human description, e.g. "weak link", "rpath: @loader_path",
+    /// "ProgramArguments[0]".
+    var note: String?
 }
 
 // MARK: - Per-category payloads

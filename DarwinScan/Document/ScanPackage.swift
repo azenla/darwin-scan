@@ -17,7 +17,7 @@ enum ScanPackage {
     static let metadataFilename = "metadata.json"
     static let itemsFilename    = "items.json"
     static let blobsDirectory   = "blobs"
-    static let packageVersion   = 1
+    static let packageVersion   = 2
 
     struct Metadata: Codable {
         var version: Int
@@ -54,14 +54,13 @@ enum ScanPackage {
             itemsFilename:    FileWrapper(regularFileWithContents: payloadData)
         ]
 
-        if !store.blobs.isEmpty {
-            var prefixes: [String: [String: FileWrapper]] = [:]
-            for (ref, data) in store.blobs {
-                let prefix = String(blobHashPart(ref).prefix(2))
-                prefixes[prefix, default: [:]]["\(ref).bin"] = FileWrapper(regularFileWithContents: data)
-            }
+        // Blobs come from the disk-backed store. `FileWrapper(url:)` streams
+        // bytes when the parent wrapper is written out — we never hold all
+        // blob bytes in memory at once.
+        let bucketed = store.blobStore.makeFileWrappersForSave()
+        if !bucketed.isEmpty {
             var subdirs: [String: FileWrapper] = [:]
-            for (prefix, files) in prefixes {
+            for (prefix, files) in bucketed {
                 subdirs[prefix] = FileWrapper(directoryWithFileWrappers: files)
             }
             contents[blobsDirectory] = FileWrapper(directoryWithFileWrappers: subdirs)
@@ -72,7 +71,8 @@ enum ScanPackage {
         return root
     }
 
-    /// Reads a directory FileWrapper back into a fresh `ScanStore`.
+    /// Reads a directory FileWrapper back into the supplied store. Blob bytes
+    /// stay inside the loaded FileWrappers and are read on demand.
     static func load(into store: ScanStore, from wrapper: FileWrapper) throws {
         guard wrapper.isDirectory, let children = wrapper.fileWrappers else {
             throw NSError(domain: "ScanPackage", code: 1, userInfo: [NSLocalizedDescriptionKey: "Not a package"])
@@ -92,34 +92,23 @@ enum ScanPackage {
             items = try decoder.decode(Payload.self, from: itemsData).items
         }
 
-        var blobs: [String: Data] = [:]
-        if let blobsRoot = children[blobsDirectory], let prefixes = blobsRoot.fileWrappers {
-            for (_, prefixWrapper) in prefixes {
-                guard prefixWrapper.isDirectory, let files = prefixWrapper.fileWrappers else { continue }
-                for (filename, file) in files {
-                    guard filename.hasSuffix(".bin"), let data = file.regularFileContents else { continue }
-                    let ref = String(filename.dropLast(4))
-                    blobs[ref] = data
-                }
-            }
-        }
-
         store.load(
             items: items,
-            blobs: blobs,
             systemInfo: metadata.systemInfo,
             options: metadata.options,
             lastScanStarted: metadata.lastScanStarted,
             lastScanCompleted: metadata.lastScanCompleted
         )
-    }
 
-    /// Strips an optional "hint-" prefix from a blob ref so we can extract the
-    /// raw hash to use as a sharded directory prefix.
-    private static func blobHashPart(_ ref: String) -> String {
-        if let dash = ref.firstIndex(of: "-") {
-            return String(ref[ref.index(after: dash)...])
+        if let blobsRoot = children[blobsDirectory], let prefixes = blobsRoot.fileWrappers {
+            for (_, prefixWrapper) in prefixes {
+                guard prefixWrapper.isDirectory, let files = prefixWrapper.fileWrappers else { continue }
+                for (filename, file) in files {
+                    guard filename.hasSuffix(".bin") else { continue }
+                    let ref = String(filename.dropLast(4))
+                    store.blobStore.registerLoaded(ref: ref, wrapper: file)
+                }
+            }
         }
-        return ref
     }
 }
