@@ -1,25 +1,36 @@
 import Foundation
 
-/// On-disk layout for a `.darwinscan` directory bundle:
+/// On-disk layout for a `.darwinscan` directory bundle (v3 — SQLite manifest):
 ///
 /// ```
 /// MyScan.darwinscan/
-///   metadata.json        — package version, system info, options, timestamps
-///   items.json           — manifest: array of every ScanItem
+///   data.db              — SQLite database, schema v1 (items + meta + relationships)
 ///   blobs/
 ///     <2-char-prefix>/
 ///       <ref>.bin        — content-addressed payload
 /// ```
 ///
-/// The blob layout mirrors git's loose-object scheme — keeps directory sizes
-/// reasonable when there are tens of thousands of small icons/strings dumps.
+/// The blob layout still mirrors git's loose-object scheme — keeps directory
+/// sizes reasonable when there are tens of thousands of small icons / strings
+/// dumps.
+///
+/// ### Legacy bundles
+///
+/// v2 bundles (the JSON `items.json` + `metadata.json` form) are read on open:
+/// we parse the JSON, seed a fresh `data.db` inside the BlobStore cache, and
+/// surface the store as if it had been opened from a v3 bundle. The next save
+/// writes a v3 bundle — there's no roundtrip back to v2.
 enum ScanPackage {
-    static let metadataFilename = "metadata.json"
-    static let itemsFilename    = "items.json"
+    // v3 names
+    static let databaseFilename = "data.db"
     static let blobsDirectory   = "blobs"
-    static let packageVersion   = 2
+    static let packageVersion   = 3
 
-    struct Metadata: Codable {
+    // v2 legacy names — read only.
+    static let legacyMetadataFilename = "metadata.json"
+    static let legacyItemsFilename    = "items.json"
+
+    struct LegacyMetadata: Codable {
         var version: Int
         var systemInfo: SystemInfo?
         var options: ScanOptions
@@ -27,32 +38,28 @@ enum ScanPackage {
         var lastScanCompleted: Date?
     }
 
-    struct Payload: Codable {
+    struct LegacyPayload: Codable {
         var items: [ScanItem]
     }
 
+    // MARK: - Save
+
     /// Builds a `FileWrapper` directory representation of the current store.
+    /// Caller is responsible for calling `database.checkpoint()` first so the
+    /// WAL is folded into the main DB file before we read it back through
+    /// `FileWrapper`.
     static func makeFileWrapper(from store: ScanStore) throws -> FileWrapper {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
+        var contents: [String: FileWrapper] = [:]
 
-        let metadata = Metadata(
-            version: packageVersion,
-            systemInfo: store.systemInfo,
-            options: store.options,
-            lastScanStarted: store.lastScanStarted,
-            lastScanCompleted: store.lastScanCompleted
-        )
-        let metadataData = try encoder.encode(metadata)
-
-        let payload = Payload(items: Array(store.items.values))
-        let payloadData = try encoder.encode(payload)
-
-        var contents: [String: FileWrapper] = [
-            metadataFilename: FileWrapper(regularFileWithContents: metadataData),
-            itemsFilename:    FileWrapper(regularFileWithContents: payloadData)
-        ]
+        if let db = store.database, let dbURL = store.databaseURL {
+            // Make sure WAL contents are committed into the main file. We
+            // checkpoint defensively even though `ScanDocument.snapshot`
+            // already does this — keeps `makeFileWrapper` standalone.
+            try db.checkpoint()
+            let dbWrapper = try FileWrapper(url: dbURL, options: [.immediate])
+            dbWrapper.preferredFilename = databaseFilename
+            contents[databaseFilename] = dbWrapper
+        }
 
         // Blobs come from the disk-backed store. `FileWrapper(url:)` streams
         // bytes when the parent wrapper is written out — we never hold all
@@ -71,34 +78,55 @@ enum ScanPackage {
         return root
     }
 
-    /// Reads a directory FileWrapper back into the supplied store. Blob bytes
-    /// stay inside the loaded FileWrappers and are read on demand.
+    // MARK: - Load
+
+    /// Reads a directory FileWrapper back into the supplied store. Opens (or
+    /// creates from legacy JSON) the persistent `data.db`, then attaches it to
+    /// the store so subsequent scans write through.
     static func load(into store: ScanStore, from wrapper: FileWrapper) throws {
         guard wrapper.isDirectory, let children = wrapper.fileWrappers else {
             throw NSError(domain: "ScanPackage", code: 1, userInfo: [NSLocalizedDescriptionKey: "Not a package"])
         }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
 
-        guard let metaWrapper = children[metadataFilename],
-              let metaData = metaWrapper.regularFileContents else {
-            throw NSError(domain: "ScanPackage", code: 2, userInfo: [NSLocalizedDescriptionKey: "Missing metadata.json"])
+        let cacheDir = store.blobStore.cacheDirectory
+        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        let dbURL = cacheDir.appendingPathComponent(databaseFilename)
+        // Always start from a clean slate — the cache dir is fresh per
+        // session, but if a stale file is somehow there, remove it.
+        try? FileManager.default.removeItem(at: dbURL)
+
+        if let dbWrapper = children[databaseFilename],
+           let dbBytes = dbWrapper.regularFileContents {
+            try dbBytes.write(to: dbURL, options: .atomic)
+            try openAndAttachDatabase(at: dbURL, store: store)
+            try loadFromAttachedDatabase(store: store)
+        } else if let itemsWrapper = children[legacyItemsFilename],
+                  let itemsData = itemsWrapper.regularFileContents {
+            // Legacy v2 path: decode the JSON, seed a new SQLite at dbURL,
+            // attach it to the store.
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let items = try decoder.decode(LegacyPayload.self, from: itemsData).items
+            var legacyMeta: LegacyMetadata?
+            if let metaWrapper = children[legacyMetadataFilename],
+               let metaData = metaWrapper.regularFileContents {
+                legacyMeta = try? decoder.decode(LegacyMetadata.self, from: metaData)
+            }
+            try openAndAttachDatabase(at: dbURL, store: store)
+            store.load(
+                items: items,
+                systemInfo: legacyMeta?.systemInfo,
+                options: legacyMeta?.options,
+                lastScanStarted: legacyMeta?.lastScanStarted,
+                lastScanCompleted: legacyMeta?.lastScanCompleted,
+                mirrorToDatabase: true
+            )
+            print("[ScanPackage] Migrated legacy v2 bundle to SQLite")
+        } else {
+            // Empty / unknown bundle — give the store an empty database so
+            // ongoing writes still persist.
+            try openAndAttachDatabase(at: dbURL, store: store)
         }
-        let metadata = try decoder.decode(Metadata.self, from: metaData)
-
-        var items: [ScanItem] = []
-        if let itemsWrapper = children[itemsFilename],
-           let itemsData = itemsWrapper.regularFileContents {
-            items = try decoder.decode(Payload.self, from: itemsData).items
-        }
-
-        store.load(
-            items: items,
-            systemInfo: metadata.systemInfo,
-            options: metadata.options,
-            lastScanStarted: metadata.lastScanStarted,
-            lastScanCompleted: metadata.lastScanCompleted
-        )
 
         if let blobsRoot = children[blobsDirectory], let prefixes = blobsRoot.fileWrappers {
             for (_, prefixWrapper) in prefixes {
@@ -110,5 +138,31 @@ enum ScanPackage {
                 }
             }
         }
+    }
+
+    // MARK: - Helpers
+
+    private static func openAndAttachDatabase(at url: URL, store: ScanStore) throws {
+        let db = try Database(at: url)
+        store.databaseURL = url
+        store.attachDatabase(db)
+    }
+
+    private static func loadFromAttachedDatabase(store: ScanStore) throws {
+        guard let db = store.database else { return }
+        let items = try db.allItems()
+        let systemInfo: SystemInfo? = (try? db.meta("system_info", as: SystemInfo.self)) ?? nil
+        let options:    ScanOptions? = (try? db.meta("options", as: ScanOptions.self)) ?? nil
+        let started:    Date?        = (try? db.meta("last_scan_started", as: Date.self)) ?? nil
+        let completed:  Date?        = (try? db.meta("last_scan_completed", as: Date.self)) ?? nil
+
+        store.load(
+            items: items,
+            systemInfo: systemInfo,
+            options: options,
+            lastScanStarted: started,
+            lastScanCompleted: completed,
+            mirrorToDatabase: false
+        )
     }
 }
