@@ -1046,7 +1046,7 @@ private struct OutgoingRelationshipsSection: View {
         let grouped = Dictionary(grouping: item.relationships, by: { $0.kind })
         // linksDylib is already rendered as its own Linked Libraries section
         // above, so we don't double-up here.
-        let kindsToShow: [Relationship.Kind] = [.ownedByBundle, .launchesProgram, .sameBundle]
+        let kindsToShow: [Relationship.Kind] = [.containsExecutable, .ownedByBundle, .launchesProgram, .sameBundle, .inDyldCache]
         ForEach(kindsToShow, id: \.self) { kind in
             if let rels = grouped[kind], !rels.isEmpty {
                 Section(
@@ -1066,22 +1066,24 @@ private struct OutgoingRelationshipsSection: View {
 
     private func title(for kind: Relationship.Kind) -> String {
         switch kind {
-        case .linksDylib:      return "Links"
-        case .ownedByBundle:   return "Inside Bundle"
-        case .launchesProgram: return "Launches"
-        case .sameBundle:      return "Bundle Siblings"
-        case .inDyldCache:     return "In DYLD Cache"
-        case .containsImage:   return "Cached Images"
+        case .linksDylib:         return "Links"
+        case .ownedByBundle:      return "Inside Bundle"
+        case .launchesProgram:    return "Launches"
+        case .sameBundle:         return "Bundle Siblings"
+        case .inDyldCache:        return "In DYLD Cache"
+        case .containsImage:      return "Cached Images"
+        case .containsExecutable: return "Main Executable"
         }
     }
     private func systemImage(for kind: Relationship.Kind) -> String {
         switch kind {
-        case .linksDylib:      return "link"
-        case .ownedByBundle:   return "shippingbox"
-        case .launchesProgram: return "play.fill"
-        case .sameBundle:      return "square.stack.3d.up"
-        case .inDyldCache:     return "cylinder.split.1x2"
-        case .containsImage:   return "shippingbox.fill"
+        case .linksDylib:         return "link"
+        case .ownedByBundle:      return "shippingbox"
+        case .launchesProgram:    return "play.fill"
+        case .sameBundle:         return "square.stack.3d.up"
+        case .inDyldCache:        return "cylinder.split.1x2"
+        case .containsImage:      return "shippingbox.fill"
+        case .containsExecutable: return "terminal"
         }
     }
 }

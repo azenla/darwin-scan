@@ -180,6 +180,14 @@ public nonisolated struct Relationship: Codable, Hashable, Sendable {
         /// at each image it contains. Useful for the cache's detail panel
         /// to list everything it ships.
         case containsImage
+        /// Bundle (`.app` / `.framework` / `.kext`) points at the
+        /// executable Mach-O it wraps. `targetPath` is the on-disk path
+        /// of the executable; for an app it's `Contents/MacOS/<name>`,
+        /// for a framework `Versions/A/<name>` (versioned) or `<name>`
+        /// (unversioned), for a kext `Contents/MacOS/<name>`. The
+        /// inspector emits multiple candidates when the layout is
+        /// ambiguous — at most one will resolve to an item in the scan.
+        case containsExecutable
     }
     public var kind: Kind
     public var targetPath: String

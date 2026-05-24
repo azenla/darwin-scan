@@ -843,6 +843,48 @@ public nonisolated struct ScanPipeline: Sendable {
         if let ls = item.launchService, let program = ls.program {
             rels.append(Relationship(kind: .launchesProgram, targetPath: program, note: "Program"))
         }
+        // App / framework / kext bundle → main executable. The bundle item
+        // exposes its executable's name via the appropriate info struct;
+        // the layout (Contents/MacOS/, Versions/A/, or top-level) depends
+        // on the bundle kind. We emit one or two candidate paths; the one
+        // that matches an on-disk item resolves in the DetailView, the
+        // other renders as a dangling-target row and is harmless.
+        if let app = item.application, let execPath = app.executablePath {
+            rels.append(Relationship(
+                kind: .containsExecutable,
+                targetPath: execPath,
+                note: app.executableName
+            ))
+        }
+        if let fw = item.framework, let execName = fw.executableName {
+            switch item.category {
+            case .kext:
+                // Kexts ship the binary in Contents/MacOS/<name>, just like
+                // an app bundle. No Versions/ symlink chain.
+                rels.append(Relationship(
+                    kind: .containsExecutable,
+                    targetPath: "\(item.path)/Contents/MacOS/\(execName)",
+                    note: execName
+                ))
+            default:
+                // Frameworks: standard layout is Versions/A/<name> with a
+                // Versions/Current symlink. Bundles ship the binary at the
+                // top level. The walker yields the on-disk path (not the
+                // symlink target), so Versions/A/<name> is what we expect
+                // to find in the scan. Also emit the flat path for
+                // unversioned `.bundle` directories.
+                rels.append(Relationship(
+                    kind: .containsExecutable,
+                    targetPath: "\(item.path)/Versions/A/\(execName)",
+                    note: execName
+                ))
+                rels.append(Relationship(
+                    kind: .containsExecutable,
+                    targetPath: "\(item.path)/\(execName)",
+                    note: execName
+                ))
+            }
+        }
         item.relationships = rels
     }
 
