@@ -31,7 +31,11 @@ public final class ScanController {
         progress = ScanProgress(phase: .enumerating, startedAt: Date())
         store.reset()
         store.options = options
-        store.lastScanStarted = Date()
+        let started = Date()
+        store.lastScanStarted = started
+        // Open a snapshot row for this scan. `ingest` will record per-item
+        // membership; `completeCurrentSnapshot` below stamps the end time.
+        store.beginSnapshot(at: started)
 
         let writer = store.blobStore.makeWriter()
         let blobStore = store.blobStore
@@ -87,7 +91,9 @@ public final class ScanController {
             self?.progress.phase = .done
             self?.progress.inFlightPaths.removeAll()
             self?.isRunning = false
-            store.lastScanCompleted = Date()
+            let completed = Date()
+            store.lastScanCompleted = completed
+            store.completeCurrentSnapshot(at: completed)
         }
     }
 }

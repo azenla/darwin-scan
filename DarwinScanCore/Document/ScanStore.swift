@@ -76,6 +76,15 @@ public nonisolated final class ScanStore {
     /// `attachDatabase`.
     public var databaseURL: URL?
 
+    /// Active snapshot ID for the in-progress scan. nil when no scan is
+    /// running. `ingest` mirrors items into `snapshot_items(snapshotID, item)`
+    /// when this is set so the new snapshot's membership is recorded.
+    public private(set) var currentSnapshotID: Int64?
+
+    /// Read-only snapshot history, newest-first. Loaded lazily by the
+    /// `snapshotHistory()` call and cached until `beginSnapshot` invalidates.
+    private var cachedHistory: [SnapshotRecord]?
+
     public init() {}
 
     /// Attach (or detach) the persistent database. Called by `ScanDocument`
@@ -110,6 +119,8 @@ public nonisolated final class ScanStore {
         systemInfo = nil
         lastScanStarted = nil
         lastScanCompleted = nil
+        currentSnapshotID = nil
+        cachedHistory = nil
         // Mirror the wipe to the persistent layer so reopening the doc
         // doesn't resurrect stale rows.
         if let database {
@@ -117,6 +128,51 @@ public nonisolated final class ScanStore {
                 print("[ScanStore] database.clearItems failed: \(error)")
             }
         }
+    }
+
+    // MARK: - Snapshot lifecycle
+
+    /// Open a new snapshot row in the database and stamp `currentSnapshotID`.
+    /// The next `ingest` will record per-item membership in this snapshot.
+    ///
+    /// Chains off the previous snapshot via `parent_id` so the history is a
+    /// single linked list — that's what a future diff command will walk.
+    public func beginSnapshot(at startedAt: Date = Date(), label: String? = nil) {
+        guard let database else { return }
+        do {
+            let parent = try database.latestSnapshotID()
+            let id = try database.insertSnapshot(
+                parentID: parent,
+                label: label,
+                startedAt: startedAt,
+                completedAt: nil
+            )
+            currentSnapshotID = id
+            cachedHistory = nil
+        } catch {
+            print("[ScanStore] beginSnapshot failed: \(error)")
+        }
+    }
+
+    /// Mark the current snapshot as finished. No-op if no snapshot is open.
+    public func completeCurrentSnapshot(at completedAt: Date = Date()) {
+        guard let database, let id = currentSnapshotID else { return }
+        do {
+            try database.completeSnapshot(id: id, at: completedAt)
+        } catch {
+            print("[ScanStore] completeSnapshot failed: \(error)")
+        }
+        cachedHistory = nil
+        // Leave currentSnapshotID set — a saved bundle should still report
+        // "this is the latest snapshot". reset() is what clears it.
+    }
+
+    public func snapshotHistory() -> [SnapshotRecord] {
+        if let cachedHistory { return cachedHistory }
+        guard let database else { return [] }
+        let history = (try? database.allSnapshots()) ?? []
+        cachedHistory = history
+        return history
     }
 
     public func upsert(_ item: ScanItem) {
@@ -184,6 +240,14 @@ public nonisolated final class ScanStore {
         if let database {
             do { try database.upsertItems(persisted) } catch {
                 print("[ScanStore] database.upsertItems failed: \(error)")
+            }
+            // Record membership in the active snapshot so the bundle
+            // history captures exactly which items belonged to this scan.
+            if let snapshotID = currentSnapshotID {
+                let ids = persisted.map(\.id)
+                do { try database.addItemsToSnapshot(snapshotID: snapshotID, itemIDs: ids) } catch {
+                    print("[ScanStore] addItemsToSnapshot failed: \(error)")
+                }
             }
         }
     }

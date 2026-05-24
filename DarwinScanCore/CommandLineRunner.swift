@@ -43,7 +43,9 @@ public enum CommandLineRunner {
         let store = ScanStore()
         try attachFreshDatabase(to: store)
         store.options = options
-        store.lastScanStarted = Date()
+        let started = Date()
+        store.lastScanStarted = started
+        store.beginSnapshot(at: started)
 
         let writer = store.blobStore.makeWriter()
         let blobStore = store.blobStore
@@ -85,7 +87,9 @@ public enum CommandLineRunner {
             }
         )
 
-        store.lastScanCompleted = Date()
+        let completed = Date()
+        store.lastScanCompleted = completed
+        store.completeCurrentSnapshot(at: completed)
 
         // Build the FileWrapper and write to disk. Replace any prior bundle
         // at the destination — generating into an existing bundle would

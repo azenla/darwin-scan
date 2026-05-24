@@ -585,6 +585,91 @@ public nonisolated final class Database: @unchecked Sendable {
         }
     }
 
+    /// Mark a snapshot as completed. Idempotent — a re-call just overwrites
+    /// the timestamp, which is what you want when a scan resumes after a
+    /// crash and finishes the second time around.
+    public func completeSnapshot(id: Int64, at completedAt: Date) throws {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { throw DBError.prepare("db is nil") }
+        var stmt: OpaquePointer?
+        defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = "UPDATE snapshots SET completed_at = ? WHERE id = ?;"
+        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        guard rc == SQLITE_OK, let stmt else {
+            throw DBError.prepare("completeSnapshot prepare -> \(rc)")
+        }
+        sqlite3_bind_double(stmt, 1, completedAt.timeIntervalSince1970)
+        sqlite3_bind_int64(stmt, 2, id)
+        let stepRC = sqlite3_step(stmt)
+        guard stepRC == SQLITE_DONE else {
+            throw DBError.step("completeSnapshot step -> \(stepRC)")
+        }
+    }
+
+    /// Rowid of the most-recent snapshot, or nil for a fresh bundle.
+    public func latestSnapshotID() throws -> Int64? {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return nil }
+        var stmt: OpaquePointer?
+        defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = "SELECT id FROM snapshots ORDER BY id DESC LIMIT 1;"
+        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        guard rc == SQLITE_OK, let stmt else { return nil }
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            return sqlite3_column_int64(stmt, 0)
+        }
+        return nil
+    }
+
+    /// Full snapshot history. Returned newest-first so the UI doesn't need
+    /// to reverse it. Used by future diff / history views.
+    public func allSnapshots() throws -> [SnapshotRecord] {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return [] }
+        var stmt: OpaquePointer?
+        defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = "SELECT id, parent_id, label, started_at, completed_at FROM snapshots ORDER BY id DESC;"
+        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        guard rc == SQLITE_OK, let stmt else { return [] }
+        var out: [SnapshotRecord] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            let parent: Int64? = (sqlite3_column_type(stmt, 1) == SQLITE_NULL) ? nil : sqlite3_column_int64(stmt, 1)
+            let label: String? = sqlite3_column_text(stmt, 2).map { String(cString: $0) }
+            let started = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3))
+            let completed: Date? = (sqlite3_column_type(stmt, 4) == SQLITE_NULL)
+                ? nil
+                : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
+            out.append(SnapshotRecord(id: id, parentID: parent, label: label, startedAt: started, completedAt: completed))
+        }
+        return out
+    }
+
+    /// Set membership of a snapshot: the item IDs of everything it contains.
+    /// Future diff code: `itemsInSnapshot(a) symmetric-difference itemsInSnapshot(b)`.
+    public func itemsInSnapshot(_ snapshotID: Int64) throws -> Set<UUID> {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return [] }
+        var stmt: OpaquePointer?
+        defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = "SELECT item_id FROM snapshot_items WHERE snapshot_id = ?;"
+        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        guard rc == SQLITE_OK, let stmt else { return [] }
+        sqlite3_bind_int64(stmt, 1, snapshotID)
+        var out: Set<UUID> = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let c = sqlite3_column_text(stmt, 0),
+               let uuid = UUID(uuidString: String(cString: c)) {
+                out.insert(uuid)
+            }
+        }
+        return out
+    }
+
     // MARK: - Meta
 
     public func setMeta(_ key: String, json: Data) throws {
@@ -1082,6 +1167,19 @@ public nonisolated struct StringsHit: Sendable, Hashable {
     public var itemID: UUID
     public var itemPath: String
     public var snippet: String
+}
+
+/// Snapshot history row. Each scan run produces one of these; `parentID`
+/// chains to the previous run, enabling a future diff UI to walk the
+/// chain backwards. `label` is reserved for user-supplied names (e.g.
+/// "macOS 26.5 GM") once the UI exposes a rename affordance — the scan
+/// pipeline never sets it directly.
+public nonisolated struct SnapshotRecord: Sendable, Hashable, Identifiable {
+    public var id: Int64
+    public var parentID: Int64?
+    public var label: String?
+    public var startedAt: Date
+    public var completedAt: Date?
 }
 
 // SQLite's SQLITE_TRANSIENT macro isn't bridged to Swift — declare the
