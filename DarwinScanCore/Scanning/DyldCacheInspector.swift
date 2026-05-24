@@ -71,6 +71,31 @@ public nonisolated enum DyldCacheInspector {
         return archPart.isEmpty ? nil : archPart
     }
 
+    /// True when the filename names a numbered subcache shard
+    /// (`dyld_shared_cache_arm64e.01`, `.02`, …) rather than the main
+    /// cache file (`dyld_shared_cache_arm64e`). Subcaches each carry a
+    /// dyld_v1 header so they still classify as `.dyldCache`, but only
+    /// the main cache file owns the canonical image table —
+    /// `enumerateImages` should be called on it alone, otherwise every
+    /// dylib reappears once per shard.
+    ///
+    /// Empirically: arm64e subcaches report imagesCount=0 in their
+    /// headers (which would naturally suppress duplicates), but x86_64
+    /// subcaches replicate the count, so we can't rely on
+    /// header-driven detection alone.
+    public static func isSubcache(filename: String) -> Bool {
+        let prefix = "dyld_shared_cache_"
+        guard filename.hasPrefix(prefix) else { return false }
+        let tail = filename.dropFirst(prefix.count)
+        // tail is like "arm64e", "arm64e.01", "arm64e.development".
+        // A numeric suffix (one or two digits) after a '.' marks a
+        // subcache shard. ".development", ".symbols", etc. are sidecar
+        // names that looksLikeDyldCache already rejects.
+        guard let dotIdx = tail.firstIndex(of: ".") else { return false }
+        let suffix = tail[tail.index(after: dotIdx)...]
+        return !suffix.isEmpty && suffix.allSatisfy { $0.isASCII && $0.isNumber }
+    }
+
     public static func inspect(url: URL) -> DyldCacheInfo? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }

@@ -365,9 +365,19 @@ public nonisolated struct ScanPipeline: Sendable {
         // cache file via `.inDyldCache`. The virtual items have no on-disk
         // path and no fileBlobRef — extraction restores the cache file,
         // not the individual virtuals.
+        //
+        // We only enumerate from the **main** cache file, not the numbered
+        // subcache shards (`.01`, `.02`, …). Each shard has its own
+        // dyld_v1 header so they all classify as `.dyldCache`, but for
+        // arches where the shard replicates the main cache's imagesCount
+        // (x86_64 does this on macOS 26) we'd otherwise emit the same
+        // dylib once per shard. Subcache shards stay as their own
+        // `.dyldCache` items so the user still sees them in the list —
+        // they just don't synthesise children.
         var additionalItems: [ScanItem] = []
         if enriched.category == .dyldCache,
            options.inspectDyldCache,
+           !DyldCacheInspector.isSubcache(filename: (enriched.path as NSString).lastPathComponent),
            let images = DyldCacheInspector.enumerateImages(url: url),
            !images.isEmpty {
             let cacheArch = enriched.dyldCache?.architecture ?? "?"

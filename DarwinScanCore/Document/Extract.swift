@@ -172,7 +172,7 @@ public nonisolated enum Extract {
                 // case the destination filesystem doesn't preserve mode on
                 // copyItem (it should — APFS does — but defensive).
                 if category == "executable" {
-                    var attrs = (try? fm.attributesOfItem(atPath: dst.path)) ?? [:]
+                    let attrs = (try? fm.attributesOfItem(atPath: dst.path)) ?? [:]
                     if let perm = attrs[.posixPermissions] as? NSNumber {
                         let m = perm.uint16Value | 0o111
                         try? fm.setAttributes([.posixPermissions: NSNumber(value: m)], ofItemAtPath: dst.path)
