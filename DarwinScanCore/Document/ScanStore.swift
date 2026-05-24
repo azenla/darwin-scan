@@ -280,6 +280,59 @@ public nonisolated final class ScanStore {
         return history
     }
 
+    /// Finalize the in-progress snapshot: compute the diff against the
+    /// parent snapshot, discard the new row if nothing changed, otherwise
+    /// stamp completed_at and keep it. Returns a summary so the caller can
+    /// surface "wrote N items, X added / Y changed / Z removed" or
+    /// "discarded — nothing changed since previous scan."
+    ///
+    /// "Nothing changed" means the deterministic id sets for the current
+    /// and parent snapshots are identical. Per the identity rules: same
+    /// (path, sha256) → same id; any byte-level change yields a new id at
+    /// the same path. So set equality is a true content equality check
+    /// for hashed files. Unhashed files use random UUIDs and therefore
+    /// always look "different" — disable hashing only when you don't care
+    /// about cross-scan diff.
+    @discardableResult
+    public func finalizeScan(at completedAt: Date = Date()) -> FinalizeResult {
+        guard let database, let currentID = currentSnapshotID else {
+            return FinalizeResult(kind: .noSnapshot, added: 0, removed: 0, changed: 0)
+        }
+        let diff = diffAgainstParent() ?? (added: [], removed: [], changed: [])
+        let unchanged = diff.added.isEmpty && diff.removed.isEmpty && diff.changed.isEmpty
+        if unchanged && parentSnapshotID != nil {
+            // Identical to parent — discard the new snapshot row + items
+            // membership. The parent snapshot remains the latest.
+            discardCurrentSnapshot()
+            return FinalizeResult(kind: .discarded, added: 0, removed: 0, changed: 0)
+        }
+        do {
+            try database.completeSnapshot(id: currentID, at: completedAt)
+        } catch {
+            print("[ScanStore] completeSnapshot failed: \(error)")
+        }
+        lastScanCompleted = completedAt
+        cachedHistory = nil
+        return FinalizeResult(
+            kind: .kept,
+            added: diff.added.count,
+            removed: diff.removed.count,
+            changed: diff.changed.count
+        )
+    }
+
+    public struct FinalizeResult: Sendable, Hashable {
+        public enum Kind: String, Sendable, Hashable {
+            case noSnapshot  // beginSnapshot was never called
+            case kept        // snapshot retained because something changed
+            case discarded   // identical to parent — row removed
+        }
+        public let kind: Kind
+        public let added: Int
+        public let removed: Int
+        public let changed: Int
+    }
+
     public func upsert(_ item: ScanItem) {
         let written: ScanItem
         if let existingID = itemsByPath[item.path], let existing = items[existingID] {

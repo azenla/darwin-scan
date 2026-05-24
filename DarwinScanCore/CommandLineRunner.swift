@@ -41,11 +41,30 @@ public enum CommandLineRunner {
         progressHandler: @escaping @MainActor (ProgressUpdate) -> Void = { _ in }
     ) async throws {
         let store = ScanStore()
-        try attachFreshDatabase(to: store)
+
+        // If the destination already exists and is a darwinscan bundle,
+        // open it instead of clobbering — the new scan lands as an
+        // additional snapshot chained off the previous one. The "discard
+        // if nothing changed" path in finalizeScan() will then keep the
+        // bundle unchanged when re-scanning produces no diff.
+        let fm = FileManager.default
+        if fm.fileExists(atPath: outputBundleURL.path) {
+            do {
+                let wrapper = try FileWrapper(url: outputBundleURL, options: [])
+                try ScanPackage.load(into: store, from: wrapper)
+                FileHandle.standardError.write(Data("Re-scanning existing bundle (latest snapshot will become the parent of this one)\n".utf8))
+            } catch {
+                throw error
+            }
+        } else {
+            try attachFreshDatabase(to: store)
+        }
         store.options = options
         let started = Date()
         store.lastScanStarted = started
-        store.beginSnapshot(at: started)
+        let info = SystemInfoCollector.capture()
+        store.systemInfo = info
+        store.beginSnapshot(at: started, systemInfo: info)
 
         let writer = store.blobStore.makeWriter()
         let blobStore = store.blobStore
@@ -88,14 +107,32 @@ public enum CommandLineRunner {
         )
 
         let completed = Date()
-        store.lastScanCompleted = completed
-        store.completeCurrentSnapshot(at: completed)
+        let result = store.finalizeScan(at: completed)
+        switch result.kind {
+        case .discarded:
+            store.reloadFromLatestSnapshot()
+            FileHandle.standardError.write(Data("No changes detected — snapshot discarded; bundle on disk is unchanged.\n".utf8))
+            // Discarded scans on an existing bundle have nothing to write —
+            // the database state is identical to what's on disk already.
+            // Still flush whatever blob writes accumulated, to be safe.
+            if !fm.fileExists(atPath: outputBundleURL.path) {
+                // First scan that discarded somehow (shouldn't really happen
+                // since parent is nil). Write something so the user has a
+                // bundle at the path.
+                let wrapper = try ScanPackage.makeFileWrapper(from: store)
+                try wrapper.write(to: outputBundleURL, options: [.atomic], originalContentsURL: nil)
+            }
+            return
+        case .kept:
+            FileHandle.standardError.write(Data("Snapshot kept: +\(result.added) -\(result.removed) ~\(result.changed)\n".utf8))
+        case .noSnapshot:
+            break
+        }
 
         // Build the FileWrapper and write to disk. Replace any prior bundle
-        // at the destination — generating into an existing bundle would
-        // intermix old & new blobs without diffing.
+        // at the destination — we've already loaded its contents into the
+        // store, so the new write includes the union of old + new snapshots.
         let wrapper = try ScanPackage.makeFileWrapper(from: store)
-        let fm = FileManager.default
         if fm.fileExists(atPath: outputBundleURL.path) {
             try fm.removeItem(at: outputBundleURL)
         }

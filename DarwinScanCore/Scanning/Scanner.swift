@@ -33,9 +33,16 @@ public final class ScanController {
         store.options = options
         let started = Date()
         store.lastScanStarted = started
+        // Capture sw_vers / uname / SIP state at scan start so the snapshot
+        // row records OS-level metadata for later diff. Also seed
+        // `store.systemInfo` so the toolbar reflects the host immediately
+        // (worker would otherwise set it again ~150ms in).
+        let capturedInfo = SystemInfoCollector.capture()
+        store.systemInfo = capturedInfo
         // Open a snapshot row for this scan. `ingest` will record per-item
-        // membership; `completeCurrentSnapshot` below stamps the end time.
-        store.beginSnapshot(at: started)
+        // membership; `finalizeScan` below either keeps it or discards it
+        // depending on whether anything changed.
+        store.beginSnapshot(at: started, systemInfo: capturedInfo)
 
         let writer = store.blobStore.makeWriter()
         let blobStore = store.blobStore
@@ -92,8 +99,20 @@ public final class ScanController {
             self?.progress.inFlightPaths.removeAll()
             self?.isRunning = false
             let completed = Date()
-            store.lastScanCompleted = completed
-            store.completeCurrentSnapshot(at: completed)
+            // Finalize the snapshot. If nothing changed since the parent
+            // snapshot, the new row is discarded (and the in-memory view
+            // is reloaded from the parent so the user sees the prior
+            // state). Otherwise the row is kept with completed_at set.
+            let result = store.finalizeScan(at: completed)
+            switch result.kind {
+            case .discarded:
+                store.reloadFromLatestSnapshot()
+                print("[ScanController] snapshot discarded — no changes since previous scan")
+            case .kept:
+                print("[ScanController] snapshot kept: +\(result.added) -\(result.removed) ~\(result.changed)")
+            case .noSnapshot:
+                break
+            }
         }
     }
 }

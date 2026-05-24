@@ -263,6 +263,12 @@ public nonisolated final class Database: @unchecked Sendable {
         guard let stmt = stmts.itemByID else { throw DBError.prepare("itemByID statement nil") }
         sqlite3_reset(stmt)
         sqlite3_clear_bindings(stmt)
+        // After reading and returning, the prepared statement must be
+        // reset before the function exits — leaving it in SQLITE_ROW state
+        // keeps a read cursor open, which makes the next WAL checkpoint
+        // fail with SQLITE_LOCKED. (Same fix applies to every other
+        // single-row prepared-statement read below.)
+        defer { sqlite3_reset(stmt) }
         sqlite3_bind_text(stmt, 1, id.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
         let rc = sqlite3_step(stmt)
         if rc == SQLITE_DONE { return nil }
@@ -278,6 +284,7 @@ public nonisolated final class Database: @unchecked Sendable {
         guard let stmt = stmts.itemByPath else { throw DBError.prepare("itemByPath statement nil") }
         sqlite3_reset(stmt)
         sqlite3_clear_bindings(stmt)
+        defer { sqlite3_reset(stmt) }
         sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
         let rc = sqlite3_step(stmt)
         if rc == SQLITE_DONE { return nil }
@@ -293,6 +300,7 @@ public nonisolated final class Database: @unchecked Sendable {
         guard let stmt = stmts.outgoingTargets else { throw DBError.prepare("outgoingTargets statement nil") }
         sqlite3_reset(stmt)
         sqlite3_clear_bindings(stmt)
+        defer { sqlite3_reset(stmt) }
         sqlite3_bind_text(stmt, 1, sourceID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
         var results: [String] = []
         while true {
@@ -316,6 +324,7 @@ public nonisolated final class Database: @unchecked Sendable {
         defer { os_unfair_lock_unlock(&lock) }
         guard let stmt = stmts.allItems else { throw DBError.prepare("allItems statement nil") }
         sqlite3_reset(stmt)
+        defer { sqlite3_reset(stmt) }
         var result: [ScanItem] = []
         result.reserveCapacity(1024)
         while true {
@@ -764,6 +773,7 @@ public nonisolated final class Database: @unchecked Sendable {
         defer { os_unfair_lock_unlock(&lock) }
         guard let stmt = stmts.getMeta else { return nil }
         sqlite3_reset(stmt)
+        defer { sqlite3_reset(stmt) }
         sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
         let rc = sqlite3_step(stmt)
         if rc == SQLITE_DONE { return nil }
