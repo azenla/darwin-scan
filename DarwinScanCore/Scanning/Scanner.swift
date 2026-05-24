@@ -266,6 +266,29 @@ public nonisolated struct ScanPipeline: Sendable {
         }
         var enriched = item
         populateContextAndRelationships(item: &enriched, originalURL: url)
+
+        // File capture: copy the file bytes verbatim into the blob store so
+        // a future `darwin-scan extract` can rebuild the original tree. Only
+        // for regular files (no bundles) under the size cap. We need a
+        // SHA-256 — reuse the item's if hashing is on, compute one if not.
+        if options.captureFiles, enriched.size > 0, enriched.size <= options.maxCaptureFileSize {
+            let isRegularFile = (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
+            if isRegularFile {
+                let sha: String?
+                if let existing = enriched.sha256 {
+                    sha = existing
+                } else {
+                    sha = Hash.sha256(of: url)
+                    enriched.sha256 = sha
+                }
+                if let sha {
+                    let ref = "file-\(sha)"
+                    blobWriter.copy(from: url, ref: ref)
+                    enriched.fileBlobRef = ref
+                }
+            }
+        }
+
         // Collect every ref this item references, whether it came in via
         // the in-memory `blobs` dict (icons, app icons) OR was streamed
         // directly to disk by an inspector (strings). The BlobStore needs
@@ -274,6 +297,7 @@ public nonisolated struct ScanPipeline: Sendable {
         if let r = enriched.executable?.stringsBlobRef { refs.append(r) }
         if let r = enriched.application?.iconRef { refs.append(r) }
         if let r = enriched.icon?.previewBlobRef { refs.append(r) }
+        if let r = enriched.fileBlobRef { refs.append(r) }
 
         // Symbol extraction: only for Mach-O items whose category indicates
         // a binary we'd actually want symbols for. Skip dyldCache (multi-GB

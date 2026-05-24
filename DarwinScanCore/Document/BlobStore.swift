@@ -123,4 +123,28 @@ public nonisolated struct BlobWriter: Sendable {
         }
         try? data.write(to: url, options: .atomic)
     }
+
+    /// Copy `source` into the blob directory as `<ref>.bin` using
+    /// FileManager — the byte stream stays in the kernel rather than passing
+    /// through Foundation Data, so capturing a 200 MB Mach-O is constant-
+    /// memory for the scanner. Idempotent: if a file with the same ref and
+    /// size already exists, the copy is skipped (typical for content-
+    /// addressed dedup across identical binaries).
+    public func copy(from source: URL, ref: String) {
+        let dst = directory.appendingPathComponent("\(ref).bin")
+        let fm = FileManager.default
+        if let attrs = try? fm.attributesOfItem(atPath: dst.path),
+           let dstSize = attrs[.size] as? Int,
+           let srcAttrs = try? fm.attributesOfItem(atPath: source.path),
+           let srcSize = srcAttrs[.size] as? Int,
+           srcSize == dstSize {
+            return
+        }
+        // Use clonefile (APFS copy-on-write) under the hood via copyItem.
+        // If the dst already exists with the wrong size, remove first.
+        if fm.fileExists(atPath: dst.path) {
+            try? fm.removeItem(at: dst)
+        }
+        try? fm.copyItem(at: source, to: dst)
+    }
 }
