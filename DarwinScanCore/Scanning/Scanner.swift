@@ -73,6 +73,10 @@ public final class ScanController {
                     var symbolIDs: [UUID] = []
                     for r in results {
                         newItems.append(r.item)
+                        // Secondary items (e.g. dyld_shared_cache virtual
+                        // images) ride alongside their parent in the same
+                        // ingest call so they share a transaction.
+                        newItems.append(contentsOf: r.additionalItems)
                         for ref in r.blobRefs { refs.append(ref) }
                         if !r.symbols.isEmpty {
                             symbolRows.append(contentsOf: r.symbols)
@@ -132,11 +136,19 @@ public nonisolated struct InspectResult: Sendable {
     /// so the main-actor sink can hand them straight to the database without
     /// re-parsing. Empty for non-Mach-O items and when `extractSymbols` is off.
     public let symbols: [SymbolRow]
+    /// Secondary items emitted alongside the primary one. Today this is
+    /// populated only by the dyld_shared_cache classifier — one cache URL
+    /// expands to thousands of virtual `framework` items, one per cached
+    /// dylib image. These items have no `fileBlobRef` (the cache file
+    /// itself is what gets captured) and aren't symbol/strings-inspected
+    /// from this entry point; they cross-link back via `.inDyldCache`.
+    public let additionalItems: [ScanItem]
 
-    public init(item: ScanItem, blobRefs: [String], symbols: [SymbolRow] = []) {
+    public init(item: ScanItem, blobRefs: [String], symbols: [SymbolRow] = [], additionalItems: [ScanItem] = []) {
         self.item = item
         self.blobRefs = blobRefs
         self.symbols = symbols
+        self.additionalItems = additionalItems
     }
 }
 
@@ -347,7 +359,76 @@ public nonisolated struct ScanPipeline: Sendable {
         } else {
             symbols = []
         }
-        return InspectResult(item: enriched, blobRefs: refs, symbols: symbols)
+
+        // DYLD shared cache: enumerate the cached dylib images and emit a
+        // virtual `framework` item per image, cross-linked back to the
+        // cache file via `.inDyldCache`. The virtual items have no on-disk
+        // path and no fileBlobRef — extraction restores the cache file,
+        // not the individual virtuals.
+        var additionalItems: [ScanItem] = []
+        if enriched.category == .dyldCache,
+           options.inspectDyldCache,
+           let images = DyldCacheInspector.enumerateImages(url: url),
+           !images.isEmpty {
+            let cacheArch = enriched.dyldCache?.architecture ?? "?"
+            additionalItems.reserveCapacity(images.count)
+            for image in images {
+                additionalItems.append(buildVirtualImageItem(
+                    image: image,
+                    cachePath: enriched.path,
+                    cacheName: enriched.name,
+                    cacheArch: cacheArch
+                ))
+            }
+        }
+
+        return InspectResult(item: enriched, blobRefs: refs, symbols: symbols, additionalItems: additionalItems)
+    }
+
+    /// Build a virtual `framework` item for one image inside a
+    /// dyld_shared_cache file. The synthesized path uses `#` as a
+    /// separator (`<cachePath>#<imagePath>`) so the deterministic id is
+    /// unique even when the same dylib appears across multiple
+    /// architectures' caches.
+    private func buildVirtualImageItem(
+        image: DyldCacheImage,
+        cachePath: String,
+        cacheName: String,
+        cacheArch: String
+    ) -> ScanItem {
+        let virtualPath = "\(cachePath)#\(image.path)"
+        let imageName = (image.path as NSString).lastPathComponent
+        let frameworkInfo = FrameworkInfo(
+            bundleIdentifier: nil,
+            shortVersionString: nil,
+            currentVersion: nil,
+            executableName: imageName,
+            headerCount: 0,
+            isPrivate: image.path.contains("/PrivateFrameworks/")
+        )
+        var tags: [String] = ["dyld-cache-image", "framework"]
+        if !cacheArch.isEmpty, cacheArch != "?" { tags.append(cacheArch) }
+        if frameworkInfo.isPrivate { tags.append("private") }
+
+        return ScanItem(
+            id: ItemIdentity.uuid(path: virtualPath, sha256: nil, bundlePathOnly: true),
+            path: virtualPath,
+            name: imageName,
+            category: .framework,
+            size: 0, // bytes inside the cache — unknown without parsing Mach-O headers.
+            modifiedAt: image.modTime > 0
+                ? Date(timeIntervalSince1970: TimeInterval(image.modTime))
+                : nil,
+            sha256: nil,
+            insideBundle: true,
+            owningBundlePath: cachePath,
+            framework: frameworkInfo,
+            tags: tags,
+            context: "in \(cacheName)",
+            relationships: [
+                Relationship(kind: .inDyldCache, targetPath: cachePath, note: cacheArch)
+            ]
+        )
     }
 
     // MARK: Classification

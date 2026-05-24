@@ -139,6 +139,128 @@ public nonisolated enum DyldCacheInspector {
             subCacheCount: subCacheCount
         )
     }
+
+    /// Enumerate the cached dylib images. Each entry has its runtime path
+    /// (e.g. `/usr/lib/libSystem.B.dylib`), unslid load address, modTime,
+    /// and inode. Only the main cache file (not subcaches) carries the
+    /// image table; subcache files have imagesCount == 0 and return [].
+    ///
+    /// Subcaches share the address space with the main cache via the
+    /// mappings table — we don't expose them as separate "images" because
+    /// each cached dylib is reachable through the main cache's table.
+    ///
+    /// Returns nil if the file isn't a dyld cache; an empty array for a
+    /// valid cache with zero images.
+    public static func enumerateImages(url: URL) -> [DyldCacheImage]? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        // Read enough to cover the header (~0x1D0) and the start of the
+        // image array. We still need to seek to read path strings.
+        guard let header = try? handle.read(upToCount: 4096), header.count >= 0x1C8 else {
+            return nil
+        }
+
+        // Validate magic.
+        let sig: [UInt8] = [0x64, 0x79, 0x6C, 0x64, 0x5F, 0x76, 0x31]
+        for (i, b) in sig.enumerated() {
+            if header[header.startIndex.advanced(by: i)] != b { return nil }
+        }
+
+        // Resolve image table location. Prefer the modern fields (0x1C0 /
+        // 0x1C4); fall back to legacy (0x18 / 0x1C) when the modern slot is
+        // zero, for forward compatibility with future caches that might
+        // rearrange again.
+        let imagesOffsetNew = UInt64(header.readUInt32LE(at: 0x1C0))
+        let imagesCountNew  = Int(header.readUInt32LE(at: 0x1C4))
+        let imagesOffsetOld = UInt64(header.readUInt32LE(at: 0x18))
+        let imagesCountOld  = Int(header.readUInt32LE(at: 0x1C))
+        let imagesOffset: UInt64
+        let imagesCount: Int
+        if imagesCountNew > 0 {
+            imagesOffset = imagesOffsetNew
+            imagesCount = imagesCountNew
+        } else {
+            imagesOffset = imagesOffsetOld
+            imagesCount = imagesCountOld
+        }
+        guard imagesCount > 0, imagesOffset > 0 else { return [] }
+
+        // Read the entire image array in one shot. Each entry is 32 bytes
+        // (`dyld_cache_image_info`). 4096 images × 32 = 128 KB, fits
+        // comfortably in a single read.
+        do {
+            try handle.seek(toOffset: imagesOffset)
+        } catch { return nil }
+        let arrayBytes = imagesCount * 32
+        guard let arr = try? handle.read(upToCount: arrayBytes),
+              arr.count == arrayBytes else { return nil }
+
+        // For each entry, read the C-string at `pathFileOffset`. We could
+        // batch these — adjacent images often have adjacent path strings —
+        // but the kernel's read-ahead and the pageable cache make per-entry
+        // pread cheap enough for a one-time scan.
+        var images: [DyldCacheImage] = []
+        images.reserveCapacity(imagesCount)
+        for i in 0..<imagesCount {
+            let base = i * 32
+            let address = arr.readUInt64LE(at: base + 0)
+            let modTime = arr.readUInt64LE(at: base + 8)
+            let inode   = arr.readUInt64LE(at: base + 16)
+            let pathFileOffset = UInt64(arr.readUInt32LE(at: base + 24))
+            guard pathFileOffset > 0 else { continue }
+            let path = readCString(handle: handle, fileOffset: pathFileOffset, maxLen: 1024)
+            guard let path else { continue }
+            images.append(DyldCacheImage(
+                path: path,
+                address: address,
+                modTime: modTime,
+                inode: inode
+            ))
+        }
+        return images
+    }
+
+    /// Read a null-terminated UTF-8 string at `fileOffset`, up to `maxLen`.
+    /// Returns nil on read failure or empty strings.
+    private static func readCString(handle: FileHandle, fileOffset: UInt64, maxLen: Int) -> String? {
+        do {
+            try handle.seek(toOffset: fileOffset)
+        } catch { return nil }
+        guard let chunk = try? handle.read(upToCount: maxLen), !chunk.isEmpty else { return nil }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(chunk.count)
+        for b in chunk {
+            if b == 0 { break }
+            bytes.append(b)
+        }
+        if bytes.isEmpty { return nil }
+        return String(bytes: bytes, encoding: .utf8)
+    }
+}
+
+/// One image entry inside a dyld shared cache. Returned by
+/// `DyldCacheInspector.enumerateImages`.
+public nonisolated struct DyldCacheImage: Sendable, Hashable {
+    /// Runtime path the image expects to be loaded from. The actual bytes
+    /// live inside the cache file, not at this on-disk path.
+    public var path: String
+    /// Unslid load address inside the cache's address space. Combined with
+    /// the cache's mappings, this resolves to a file offset where the
+    /// Mach-O header for this image lives — useful for symbol enumeration
+    /// in a follow-up commit.
+    public var address: UInt64
+    /// dyld records the source dylib's modTime and inode at cache-build
+    /// time. Lets the runtime check whether an on-disk override has
+    /// changed since the cache was built.
+    public var modTime: UInt64
+    public var inode: UInt64
+
+    public init(path: String, address: UInt64, modTime: UInt64, inode: UInt64) {
+        self.path = path
+        self.address = address
+        self.modTime = modTime
+        self.inode = inode
+    }
 }
 
 nonisolated private extension Data {
@@ -150,5 +272,13 @@ nonisolated private extension Data {
         let b2 = UInt32(self[base + 2])
         let b3 = UInt32(self[base + 3])
         return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
+    func readUInt64LE(at offset: Int) -> UInt64 {
+        guard offset + 8 <= count else { return 0 }
+        let base = startIndex.advanced(by: offset)
+        var v: UInt64 = 0
+        for i in 0..<8 { v |= UInt64(self[base + i]) << (8 * i) }
+        return v
     }
 }

@@ -1070,6 +1070,8 @@ private struct OutgoingRelationshipsSection: View {
         case .ownedByBundle:   return "Inside Bundle"
         case .launchesProgram: return "Launches"
         case .sameBundle:      return "Bundle Siblings"
+        case .inDyldCache:     return "In DYLD Cache"
+        case .containsImage:   return "Cached Images"
         }
     }
     private func systemImage(for kind: Relationship.Kind) -> String {
@@ -1078,6 +1080,8 @@ private struct OutgoingRelationshipsSection: View {
         case .ownedByBundle:   return "shippingbox"
         case .launchesProgram: return "play.fill"
         case .sameBundle:      return "square.stack.3d.up"
+        case .inDyldCache:     return "cylinder.split.1x2"
+        case .containsImage:   return "shippingbox.fill"
         }
     }
 }

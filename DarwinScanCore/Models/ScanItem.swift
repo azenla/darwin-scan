@@ -170,6 +170,16 @@ public nonisolated struct Relationship: Codable, Hashable, Sendable {
         case ownedByBundle
         case launchesProgram
         case sameBundle
+        /// Virtual dylib image residing inside a dyld_shared_cache_* file.
+        /// `targetPath` is the on-disk cache file (e.g.
+        /// `/System/Volumes/Preboot/.../dyld_shared_cache_arm64e`); the
+        /// `source` item is the virtual framework item synthesized from
+        /// the cache's image table.
+        case inDyldCache
+        /// The opposite direction of `inDyldCache` — the cache file points
+        /// at each image it contains. Useful for the cache's detail panel
+        /// to list everything it ships.
+        case containsImage
     }
     public var kind: Kind
     public var targetPath: String

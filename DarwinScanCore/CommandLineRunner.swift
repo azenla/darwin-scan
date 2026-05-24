@@ -86,6 +86,7 @@ public enum CommandLineRunner {
                 var symbolIDs: [UUID] = []
                 for r in results {
                     newItems.append(r.item)
+                    newItems.append(contentsOf: r.additionalItems)
                     for ref in r.blobRefs { refs.append(ref) }
                     if !r.symbols.isEmpty {
                         symbolRows.append(contentsOf: r.symbols)
