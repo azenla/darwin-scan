@@ -14,9 +14,71 @@ struct DarwinScanCLI: AsyncParsableCommand {
             writing the result to a .darwinscan directory package that the
             DarwinScan GUI can open.
             """,
-        subcommands: [Generate.self],
+        subcommands: [Generate.self, Extract.self],
         defaultSubcommand: Generate.self
     )
+}
+
+struct Extract: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "extract",
+        abstract: "Recreate the captured system directory from a .darwinscan bundle.",
+        discussion: """
+            Requires that the bundle was generated with --capture-files.
+            Items missing their original bytes (no fileBlobRef) are skipped.
+            The destination is created if it doesn't exist; existing files
+            at conflicting paths are replaced.
+            """
+    )
+
+    @Argument(
+        help: ArgumentHelp(
+            "Path to the .darwinscan bundle.",
+            valueName: "input.darwinscan"
+        ),
+        completion: .file(extensions: ["darwinscan"])
+    )
+    var input: String
+
+    @Argument(
+        help: ArgumentHelp(
+            "Destination directory for the reconstructed tree.",
+            valueName: "destination"
+        ),
+        completion: .directory
+    )
+    var destination: String
+
+    @Flag(name: .shortAndLong,
+          help: "Suppress per-N-files progress lines; print only the final summary.")
+    var quiet: Bool = false
+
+    @MainActor
+    mutating func run() async throws {
+        let bundleURL = URL(fileURLWithPath: input).standardizedFileURL
+        let destURL = URL(fileURLWithPath: destination).standardizedFileURL
+        guard bundleURL.pathExtension.lowercased() == "darwinscan" else {
+            throw ValidationError("Input must end in .darwinscan, got \(bundleURL.lastPathComponent)")
+        }
+        FileHandle.standardError.write(Data("Extracting: \(bundleURL.path) -> \(destURL.path)\n".utf8))
+        let quietFlag = quiet
+        var opts = DarwinScanCore.Extract.Options()
+        if quietFlag {
+            opts.progressEvery = 0
+        }
+        let started = Date()
+        let summary = try DarwinScanCore.Extract.run(
+            bundleURL: bundleURL,
+            destination: destURL,
+            options: opts
+        )
+        let elapsed = Date().timeIntervalSince(started)
+        let line = String(
+            format: "Done. %.1fs elapsed. Wrote %d files (%@), skipped %d.\n",
+            elapsed, summary.written, ByteFormat.string(summary.bytesWritten), summary.skipped
+        )
+        FileHandle.standardError.write(Data(line.utf8))
+    }
 }
 
 struct Generate: AsyncParsableCommand {
