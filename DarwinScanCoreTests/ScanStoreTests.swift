@@ -27,7 +27,7 @@ struct ScanStoreTests {
 
         // Touch a different in-memory id but the same path — store should
         // reuse the previous UUID so UI selection stays stable.
-        var second = makeItem(path: "/x", category: .executable)
+        let second = makeItem(path: "/x", category: .executable)
         let collisionID = second.id
         store.upsert(second)
         let storedID = store.itemsByPath["/x"]

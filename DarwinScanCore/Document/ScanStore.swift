@@ -41,7 +41,7 @@ import Observation
 /// the upsert to know which paths to scrub from `pathReferencedBy`. For
 /// initial scans nothing collides, so this query never fires.
 @Observable
-public final class ScanStore {
+public nonisolated final class ScanStore {
     public var systemInfo: SystemInfo? {
         didSet { persistMeta("system_info", value: systemInfo) }
     }
@@ -356,7 +356,7 @@ public final class ScanStore {
     }
 }
 
-private extension ScanItem {
+nonisolated private extension ScanItem {
     func withId(_ newId: UUID) -> ScanItem {
         var copy = self
         copy.id = newId

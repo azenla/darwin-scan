@@ -63,7 +63,14 @@ struct ScanDocumentTests {
 
     @Test func snapshotProducesDirectoryWrapperWithDatabase() throws {
         let document = ScanDocument()
-        let wrapper = try document.snapshot(contentType: .darwinScan)
+        let snapshot = try document.snapshot(contentType: .darwinScan)
+        // The Sendable snapshot must carry checkpointed database bytes —
+        // that's what the off-main `makeFileWrapper(snapshot:)` materializes
+        // into `data.db` inside the saved bundle. `FileDocumentWriteConfiguration`
+        // has no public init, so we exercise the bundle builder directly
+        // rather than the `fileWrapper(snapshot:configuration:)` trampoline.
+        #expect(snapshot.databaseBytes != nil)
+        let wrapper = try ScanPackage.makeFileWrapper(snapshot: snapshot)
         #expect(wrapper.isDirectory)
         #expect(wrapper.fileWrappers?[ScanPackage.databaseFilename] != nil)
     }
@@ -105,7 +112,8 @@ struct ScanDocumentTests {
         }
         document.store.ingest(items)
 
-        let wrapper = try document.snapshot(contentType: .darwinScan)
+        let snapshot = try document.snapshot(contentType: .darwinScan)
+        let wrapper = try ScanPackage.makeFileWrapper(snapshot: snapshot)
         let outURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScanDocumentTests-\(UUID().uuidString).darwinscan")
         defer { try? FileManager.default.removeItem(at: outURL) }

@@ -37,7 +37,13 @@ public final class ScanController {
         let blobStore = store.blobStore
 
         let worker = ScanWorker()
-        workerTask = Task { @MainActor [weak self] in
+        // Pin the scan at `.utility` so the TaskGroup children running on the
+        // worker actor's executor inherit it. Without this, the task adopts
+        // the SwiftUI gesture's `.userInitiated` QoS, and ImageIO's internal
+        // dispatches (`CGImageSourceCreateThumbnailAtIndex` in IconInspector)
+        // run at `.default` — a higher-QoS thread waiting on lower-QoS work
+        // is the textbook priority inversion the runtime warns about.
+        workerTask = Task(priority: .utility) { @MainActor [weak self] in
             await worker.run(
                 options: options,
                 blobWriter: writer,
