@@ -6,9 +6,14 @@ walking the cryptex firmlinks at `/System/Cryptexes/{OS,App,ExclaveOS}`),
 `/bin`, `/sbin`, `/usr` (excluding `/usr/local`).
 
 Stores results in a `.darwinscan` directory package. Each scan is recorded
-as a snapshot row chained off the previous; with `--capture-files` set, the
-original bytes of every classified file are kept in the content-addressed
-blob store so `darwin-scan extract` can rebuild the source tree.
+as a snapshot row chained off the previous; if a re-scan produces no
+content changes (deterministic-id match against parent), the new snapshot
+is discarded so the bundle stays unchanged. `captureFiles` is on by
+default — the original bytes of every classified file land in the
+content-addressed blob store so `darwin-scan extract` can rebuild the
+source tree. Cross-scan diff is content-addressed at the item level: same
+(path, sha256) → same id → dedup; different sha256 at the same path →
+two rows, one per generation.
 
 ## Build
 
@@ -72,6 +77,7 @@ DarwinScanCore/                    # Framework — all non-UI logic. Both app an
 ├── Document/                      # ScanPackage, ScanStore, BlobStore, Database, Extract
 ├── Scanning/                      # Scanner + per-domain Inspectors + FileWalker
 │                                  # + StringsExtractor + SymbolInspector
+│                                  # + CodeSignatureInspector
 ├── Search/                        # SearchQuery (parser + evaluator + FTS resolution)
 ├── Utilities/                     # Hash, ByteFormat, SystemInfoCollector
 └── CommandLineRunner.swift        # Synchronous-style scan driver for the CLI
@@ -228,49 +234,65 @@ pass handles restriction). Add a `SearchHelp.entries` entry either way.
 ## Graph model
 
 `ScanItem.relationships: [Relationship]` carries outgoing edges keyed by
-`targetPath` (paths are stable across scans, UUIDs aren't):
+`targetPath`:
 
-| Kind             | Source                  | Target                         |
-|------------------|-------------------------|--------------------------------|
-| `linksDylib`     | Mach-O LC_LOAD_DYLIB    | linked library path/`@rpath/…` |
-| `ownedByBundle`  | child of any `.app/.framework/.bundle/.kext/.mlpackage/.mlmodelc` | enclosing bundle path |
-| `launchesProgram`| LaunchAgent / LaunchDaemon plist | program executable path |
-| `sameBundle`     | reserved for future     |                                |
+| Kind                  | Source                                                                  | Target                                                       |
+|-----------------------|-------------------------------------------------------------------------|--------------------------------------------------------------|
+| `linksDylib`          | Mach-O LC_LOAD_DYLIB                                                    | linked library path / `@rpath/…`                             |
+| `ownedByBundle`       | child of any `.app/.framework/.bundle/.kext/.mlpackage/.mlmodelc`       | enclosing bundle path                                        |
+| `containsExecutable`  | `.app/.framework/.kext` bundle                                          | the main executable Mach-O (Contents/MacOS/, Versions/A/, …) |
+| `launchesProgram`     | LaunchAgent / LaunchDaemon plist                                        | program executable path                                      |
+| `inDyldCache`         | virtual framework item synthesised from a dyld_shared_cache image entry | the on-disk `dyld_shared_cache_<arch>` file                  |
+| `containsImage`       | reserved (cache file → image, currently emitted by the inverse path)    |                                                              |
+| `sameBundle`          | reserved for future                                                     |                                                              |
 
 `DetailView` renders both outgoing relationships *and* incoming references
-(scans `store.items` for anyone pointing at this item's path).
+(via `store.pathReferencedBy[…]`). The inverse index is the cheap way to
+get "Cached Images" on a dyld cache file's page — virtuals point at the
+cache via `inDyldCache`, so the index gives the cache file its children
+for free.
+
+Item identity is deterministic for hashed regular files:
+`UUID = SHA256("darwinscan-itemid::\(path)::\(sha256)")[0..16]` (UUIDv4-
+stamped). Bundles use `path`-only since they're conceptually identity-
+stable regardless of child changes. Two items at the same path with
+different sha256s get different IDs — that's exactly what makes
+"content X at path P, then Y at path P" represent as two rows in two
+snapshots rather than one row that mutates.
 
 ## `.darwinscan` bundle layout
 
 ```
 MyScan.darwinscan/
-├── data.db           # SQLite (schema v2): see table list below
-├── format.txt        # one-line version stamp: "darwinscan v4"
+├── data.db           # SQLite (schema v3): see table list below
+├── format.txt        # one-line version stamp: "darwinscan v5"
 └── blobs/
     └── <2-char prefix>/
         └── <ref>.bin # content-addressed payload (icon PNG, strings dump,
                       # whole-file capture, etc.)
 ```
 
-(Bundle format version 4. Bundle format v2 — legacy JSON manifest — and
-v3 — earlier denormalised-light SQLite — both fail to open with
-`ScanPackage.LoadError.unsupportedFormat` and instruct the user to
-re-scan. There is no in-place migration; the column surface changed too
-much for a safe one.)
+(Bundle format version 5. Any older bundle — v2 JSON, v3 schema-v1, or
+v4 schema-v2 — fails to open with
+`ScanPackage.LoadError.unsupportedFormat` and instructs the user to
+re-scan. There is no in-place migration. v4→v5 dropped items.path's
+UNIQUE constraint to support multi-version items, added a
+`system_info` column to snapshots, and made item IDs deterministic
+from `(path, sha256)`.)
 
 The SQLite database has these tables — every field a query is likely to
 filter or sort on is its own indexed column:
 
 | Table             | Purpose                                                                |
 |-------------------|------------------------------------------------------------------------|
-| `meta`            | `(key TEXT PK, value BLOB)` — schema_version, system_info JSON, options JSON, timestamps |
-| `snapshots`       | `(id INTEGER PK, parent_id, label, started_at REAL, completed_at REAL)` — append-only scan history; the chain is the diff backbone |
-| `items`           | Items table — 28 columns + a `payload BLOB`. Denormalised: `path`, `name`, `category`, `size`, `modified_at`, `sha256`, `inside_bundle`, `owning_bundle_path`, `context`, `macho_kind`/`macho_platform`/`macho_min_os`/`macho_sdk`/`macho_is_fat`/`macho_is_apple`/`macho_is_xplat`/`macho_usage`, `bundle_identifier`/`bundle_short_version`/`bundle_version`/`bundle_display_name`/`bundle_exec_name`/`is_private_bundle`, `language`, `icon_blob_ref`, `strings_blob_ref`, `file_blob_ref`. The `payload` blob holds the full ScanItem JSON for fields not promoted to columns (per-category structs etc.). Indexes on `path` (UNIQUE), `category`, `owning_bundle_path`, `sha256`, `bundle_identifier`, `language`. |
-| `snapshot_items`  | `(snapshot_id, item_id, PK (snapshot_id, item_id))` — membership |
+| `meta`            | `(key TEXT PK, value BLOB)` — schema_version, options JSON, last-scan timestamps. `system_info` moved out of meta and onto each snapshot row in v3. |
+| `snapshots`       | `(id INTEGER PK, parent_id, label, started_at REAL, completed_at REAL, system_info BLOB)` — append-only scan history; `system_info` is the sw_vers + uname + SIP-state snapshot captured at scan start. The parent_id chain is the diff backbone. |
+| `items`           | Items table — 28 columns + a `payload BLOB`. Denormalised: `path`, `name`, `category`, `size`, `modified_at`, `sha256`, `inside_bundle`, `owning_bundle_path`, `context`, `macho_kind`/`macho_platform`/`macho_min_os`/`macho_sdk`/`macho_is_fat`/`macho_is_apple`/`macho_is_xplat`/`macho_usage`, `bundle_identifier`/`bundle_short_version`/`bundle_version`/`bundle_display_name`/`bundle_exec_name`/`is_private_bundle`, `language`, `icon_blob_ref`, `strings_blob_ref`, `file_blob_ref`. The `payload` blob holds the full ScanItem JSON for fields not promoted to columns (per-category structs etc.). Indexes on `path` (non-unique — multi-version items can share a path), `category`, `owning_bundle_path`, `sha256`, `bundle_identifier`, `language`. |
+| `snapshot_items`  | `(snapshot_id, item_id, PK (snapshot_id, item_id))` — membership. An item belongs to many snapshots when its content hasn't changed since the prior scan; that's how diff works. |
 | `tags`            | `(item_id, tag, PK (item_id, tag))` — chips for UI display + tag-filter |
 | `architectures`   | `(item_id, arch, PK (item_id, arch))` — supports `arch:` filter without JSON decode |
 | `relationships`   | `(source_id, kind, target_path, target_id, note, PK (source_id, kind, target_path))` — `target_id` is reserved for finalize-time path-to-id resolution; today it's always NULL |
-| `symbols`         | `(id INTEGER PK, item_id, name, demangled, kind, library_ordinal)` — populated by `SymbolInspector` |
+| `symbols`         | `(id INTEGER PK, item_id, name, demangled, kind, library_ordinal)` — populated by `SymbolInspector` (LC_SYMTAB walk + `__TEXT,__objc_classname` raw-section read for Obj-C class names) |
 | `symbols_fts`     | FTS5 virtual table, `content='symbols'`, mirrors `symbols.name` + `symbols.demangled` via AFTER INSERT / AFTER DELETE triggers |
 | `strings_fts`     | FTS5 virtual table, **contentless** (`content=''`), holds `(item_id UNINDEXED, item_path UNINDEXED, content)` for the strings-dump tokens of each item |
 | `blobs`           | `(ref PK, sha256, size, kind)` — registry of every blob in `blobs/`; lookup by ref or sha256 |
@@ -410,10 +432,29 @@ symbols, and Obj-C class exports from anything not stripped.
 
 `Scanning/DyldCacheInspector.swift` parses the `dyld_cache_header`. On
 macOS 14+ the image table moved: `imagesCountOld` at offset 0x1C is always
-zero, and the real count is `imagesCount` at offset 0x1C4. Inspector
-prefers the legacy slot when populated and falls back to the modern
-field. Also surfaces `subCacheCount` (offset 0x18C) so the detail view
-can show "Subcaches: N" for a split cache.
+zero, and the real count is `imagesCount` at offset 0x1C4 with the table
+itself at `imagesOffset` (0x1C0). Inspector prefers the legacy slot when
+populated and falls back to the modern field. Also surfaces
+`subCacheCount` (offset 0x18C) so the detail view can show "Subcaches: N"
+for a split cache.
+
+`DyldCacheInspector.enumerateImages(url:)` walks the image array and
+returns each cached dylib's path, unslid load address, modTime, and
+inode. The ScanPipeline emits a virtual `framework` item per image with
+a synthesised path `<cachePath>#<imagePath>` (the `#` makes the same
+dylib distinct across architecture caches — arm64e and x86_64 each get
+their own row). Virtual items carry `.inDyldCache → cachePath`, no
+fileBlobRef (the cache file itself is what gets captured), and a
+`dyld-cache-image` tag. `darwin-scan extract` therefore restores the
+cache file, not the thousands of virtuals — the user's stated
+preference.
+
+Symbol/strings extraction from inside cached images is **not yet
+done**. Doing it requires resolving image addresses through the cache's
+mapping table to file offsets, then parsing each image's Mach-O via the
+shared LC_SYMTAB. Schema and identity are already in place; the work
+lives in DyldCacheInspector + a SymbolInspector-like cached-image
+walker.
 
 `FileWalker` treats `/System/Cryptexes/{OS,App,ExclaveOS}` as cryptex
 firmlinks: it resolves them through `resolvingSymlinksInPath()` and walks
@@ -422,6 +463,67 @@ regardless of `options.followSymlinks`. The `isExcluded()` predicate
 also carves `/System/Volumes/Preboot/Cryptexes/` out of the
 `/System/Volumes` exclude. Without this special-casing the
 dyld_shared_cache wasn't visible on macOS 14+.
+
+## Snapshots and incremental scans
+
+Every scan opens one row in `snapshots`. `parent_id` points at the
+previous scan's row, forming a linked list per bundle.
+`snapshots.system_info` carries sw_vers + uname + hardware + SIP-state
+captured at scan start, so a diff across an OS update is visible even
+when no items moved.
+
+`ScanController.startScan` (GUI) and `CommandLineRunner.runScan` (CLI)
+both:
+
+1. **Capture `SystemInfo` first.** Seeded into `store.systemInfo` for
+   immediate UI surfacing and passed to `beginSnapshot(systemInfo:)`
+   so the snapshot row records it.
+2. **Open the existing bundle** if the destination already exists
+   (CLI only — the GUI is always inside an open document). The
+   previous snapshots + items are loaded; the new scan lands as an
+   additional snapshot.
+3. **Begin a new snapshot row**, with `parent_id` pointing at the
+   previous one.
+4. **Stream items through ingest.** Each item's deterministic id
+   either creates a new row or upserts an existing one (same content
+   = same id). Each id is also added to `snapshot_items(currentID, id)`.
+5. **Finalize.** `ScanStore.finalizeScan` compares
+   `itemsInSnapshot(current)` to `itemsInSnapshot(parent)`. If
+   identical, the new snapshot row is deleted (and the in-memory
+   view is reloaded from the parent so it reflects what's actually
+   on disk). Otherwise, completed_at is stamped and the bundle is
+   written with the new snapshot retained.
+
+The discard-empty path matters because re-scanning is the obvious way
+to update a bundle, and a no-op re-scan shouldn't bloat the snapshot
+chain. Today the GUI surfaces the snapshot list in the sidebar with a
+detail card showing diff stats vs parent; switching the displayed
+items to a historical snapshot is a wired-but-not-exposed
+ScanStore.reloadFromLatestSnapshot()-style call.
+
+### Code signature
+
+`Scanning/CodeSignatureInspector.swift` decodes the LC_CODE_SIGNATURE
+SuperBlob to extract:
+
+  - `signingIdentifier` (the bundle id the binary signed as, from the
+    CodeDirectory.identOffset string)
+  - `teamIdentifier` (the developer team id, when
+    CodeDirectory.version >= 0x20200 has it)
+  - `isHardenedRuntime` (CS_RUNTIME flag = 0x00010000 in
+    CodeDirectory.flags)
+
+MachOInspector records the slice-relative blob offset + size on
+`ExecutableInfo.codeSignatureSliceOffset / codeSignatureSize`.
+Scanner.makeMachOItem converts to a file-absolute offset via
+`machO.sliceFileOffset(for:)` (needed for FAT binaries where the first
+slice sits 16+ KB into the file) and asks CodeSignatureInspector for
+the rest. DetailView surfaces a "Hardened runtime" chip + "Signed as"
++ "Team ID" rows on the Executable section.
+
+Entitlements XML, the Requirements blob, and the CMS signature chain
+are deliberately not parsed — none of them are needed for indexing,
+and an entitlements viewer in DetailView is the natural follow-up.
 
 ## Concurrency
 
@@ -512,35 +614,41 @@ conformance of X to Decodable cannot be used in nonisolated context".
 
 ## Known follow-ups (not yet built)
 
-- **Cross-scan diff command.** Schema and snapshot bookkeeping are done
-  (`snapshots`, `snapshot_items`, `Database.itemsInSnapshot`) but no
-  user-facing command or view walks the chain yet. Needs item-identity
-  changes first to be truly useful — see next bullet.
-- **Multi-version items per path + deterministic IDs.** Today `items`
-  has `path UNIQUE`, so re-scanning replaces the row rather than
-  versioning. For a real diff, drop the unique constraint, key items
-  by `UUID(uuidString: SHA256(path||sha256))`, and make ScanStore.load
-  filter to the latest snapshot's `snapshot_items`.
-- **`__objc_classlist` section walk** for Obj-C class names that aren't
-  exposed as LC_SYMTAB externals (the common case on stripped Apple
-  binaries — see Mach-O parsing section).
-- **Swift symbol demangling.** We store raw mangled names which are
-  substring-searchable; running them through `libswiftDemangle` (or
-  shelling out to `swift demangle`) would make the symbols section
-  much nicer to read.
-- **Code signature parsing** for team identifier extraction (we detect
-  `LC_CODE_SIGNATURE` but don't parse the blob).
-- **DYLD shared cache image list enumeration.** We parse the header
-  (architecture + correct imagesCount + subCacheCount on macOS 14+)
-  but don't enumerate the image table to expose individual cache-
-  resident dylibs as scan items.
-- **Asset catalog (`Assets.car`) extraction.**
-- **Token-pill UI for search** (`.searchable(text:tokens:)`) so typed
-  filters become removable chips inside the search field instead of
-  below it.
-- **Snapshot history UI** for jumping between past scan results in
-  one bundle. The snapshots table is populated; nothing reads it yet
-  beyond the most-recent row.
+- **`darwin-scan diff` command.** Schema and snapshot bookkeeping are
+  ready — `Database.itemsInSnapshot(id)` returns the set-of-ids for
+  any snapshot, so the diff is `current.symmetric-difference(parent)`
+  + a path-keyed join to find "same path, different content" entries.
+  The CLI wrapper + a UI surface are the missing pieces. The
+  SnapshotDetailView already shows added/removed counts inline; a
+  full diff list is the natural next step.
+- **Snapshot switching in the GUI.** Sidebar lists snapshots; clicking
+  one shows its metadata but doesn't swap the displayed items.
+  `ScanStore.reloadFromLatestSnapshot()` already exists — needs a
+  `reloadSnapshot(id:)` variant and a "viewing historical" banner.
+- **Symbol + strings extraction from cached dylibs inside the dyld
+  shared cache.** We enumerate the image table and emit virtual
+  framework items, but each virtual today has zero symbols and no
+  strings. Doing it needs the cache-mapping pointer → file-offset
+  translation, then a SymbolInspector-style walk per image.
+- **`__objc_classlist` pointer chasing.** Today's Obj-C class
+  extraction reads raw bytes from `__TEXT,__objc_classname` — which
+  catches names but mixes them with method/protocol/ivar identifiers
+  in the same string pool. Proper extraction needs walking the
+  `__objc_classlist` pointer array through the objc_class →
+  class_ro_t → name chain (with chained-fixup decoding on modern
+  binaries).
+- **Swift symbol demangling.** Raw mangled names go in
+  `symbols.name`; `symbols.demangled` is always nil. `swift-demangle`
+  ships only inside Xcode's toolchain, so demangling at scan time
+  would force an Xcode dependency. Punted until either: (a) Apple
+  ships a redistributable demangler, or (b) we adopt the
+  swift-demangling crate / fork.
+- **Asset catalog (`Assets.car`) extraction** — Apple's CUICatalog
+  SPI parses these but isn't a public API. We'd need to either
+  embed a `.car` parser or shell out to `assetutil`.
+- **Token-pill UI for search** (`.searchable(text:tokens:)`) so
+  typed filters become removable chips inside the search field
+  instead of below it.
 
 ## Testing
 
