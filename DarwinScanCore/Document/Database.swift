@@ -46,7 +46,7 @@ import os.lock
 /// `SERIALIZED` on Apple platforms; the lock is belt-and-suspenders.
 public nonisolated final class Database: @unchecked Sendable {
     /// Bump when schema changes. Persisted under `meta.schema_version`.
-    public static let currentSchemaVersion: Int = 2
+    public static let currentSchemaVersion: Int = 3
 
     private var db: OpaquePointer?
     private var lock = os_unfair_lock_s()
@@ -115,7 +115,7 @@ public nonisolated final class Database: @unchecked Sendable {
             case .open(let m):           return "Database.open: \(m)"
             case .prepare(let m):        return "Database.prepare: \(m)"
             case .step(let m):           return "Database.step: \(m)"
-            case .schemaTooOld(let v):   return "Database: schema v\(v) is from a prior version of DarwinScan and is not supported. Bundle format v4 (schema v\(Database.currentSchemaVersion)) is required."
+            case .schemaTooOld(let v):   return "Database: schema v\(v) is from a prior version of DarwinScan and is not supported. Bundle format v5 (schema v\(Database.currentSchemaVersion)) is required — re-scan to produce a new bundle."
             case .schemaTooNew(let v):   return "Database: schema v\(v) is from a newer DarwinScan than this build supports."
             }
         }
@@ -530,9 +530,13 @@ public nonisolated final class Database: @unchecked Sendable {
     // MARK: - Snapshots
 
     /// Create a new snapshot row. Pass `parentID` to chain off the previous
-    /// snapshot for incremental scans. Returns the new snapshot's id.
+    /// snapshot for incremental scans. `systemInfo` should be the captured
+    /// sw_vers / hardware / SIP-state blob (encoded JSON); it's stored on the
+    /// snapshot row so a future diff command can show "macOS 26.5.1 →
+    /// 26.5.2" even when no items changed enough to retain the snapshot.
+    /// Returns the new snapshot's id.
     @discardableResult
-    public func insertSnapshot(parentID: Int64?, label: String?, startedAt: Date, completedAt: Date?) throws -> Int64 {
+    public func insertSnapshot(parentID: Int64?, label: String?, startedAt: Date, completedAt: Date?, systemInfo: Data? = nil) throws -> Int64 {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         guard let db else { throw DBError.prepare("db is nil") }
@@ -553,8 +557,49 @@ public nonisolated final class Database: @unchecked Sendable {
             } else {
                 sqlite3_bind_null(stmt, 4)
             }
+            if let systemInfo {
+                _ = systemInfo.withUnsafeBytes { raw -> Int32 in
+                    if let base = raw.baseAddress {
+                        return sqlite3_bind_blob(stmt, 5, base, Int32(systemInfo.count), SQLITE_TRANSIENT)
+                    } else {
+                        return sqlite3_bind_zeroblob(stmt, 5, 0)
+                    }
+                }
+            } else {
+                sqlite3_bind_null(stmt, 5)
+            }
         }
         return sqlite3_last_insert_rowid(db)
+    }
+
+    /// Remove a snapshot row and its membership entries. Used by the
+    /// "scan produced no changes — discard the empty snapshot" path. Items
+    /// shared with other snapshots stay in place; only this snapshot's
+    /// `snapshot_items` rows are dropped.
+    public func deleteSnapshot(id: Int64) throws {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        try beginTransaction()
+        do {
+            guard let db else { throw DBError.prepare("db is nil") }
+            var s1: OpaquePointer?; defer { if let s1 { sqlite3_finalize(s1) } }
+            let rc1 = sqlite3_prepare_v2(db, "DELETE FROM snapshot_items WHERE snapshot_id = ?;", -1, &s1, nil)
+            guard rc1 == SQLITE_OK, let s1 else { throw DBError.prepare("deleteSnapshot.items prepare -> \(rc1)") }
+            sqlite3_bind_int64(s1, 1, id)
+            let r1 = sqlite3_step(s1)
+            guard r1 == SQLITE_DONE else { throw DBError.step("deleteSnapshot.items step -> \(r1)") }
+
+            var s2: OpaquePointer?; defer { if let s2 { sqlite3_finalize(s2) } }
+            let rc2 = sqlite3_prepare_v2(db, "DELETE FROM snapshots WHERE id = ?;", -1, &s2, nil)
+            guard rc2 == SQLITE_OK, let s2 else { throw DBError.prepare("deleteSnapshot.row prepare -> \(rc2)") }
+            sqlite3_bind_int64(s2, 1, id)
+            let r2 = sqlite3_step(s2)
+            guard r2 == SQLITE_DONE else { throw DBError.step("deleteSnapshot.row step -> \(r2)") }
+            try commitTransaction()
+        } catch {
+            try? rollbackTransaction()
+            throw error
+        }
     }
 
     public func addItemToSnapshot(snapshotID: Int64, itemID: UUID) throws {
@@ -631,7 +676,7 @@ public nonisolated final class Database: @unchecked Sendable {
         guard let db else { return [] }
         var stmt: OpaquePointer?
         defer { if let stmt { sqlite3_finalize(stmt) } }
-        let sql = "SELECT id, parent_id, label, started_at, completed_at FROM snapshots ORDER BY id DESC;"
+        let sql = "SELECT id, parent_id, label, started_at, completed_at, system_info FROM snapshots ORDER BY id DESC;"
         let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
         guard rc == SQLITE_OK, let stmt else { return [] }
         var out: [SnapshotRecord] = []
@@ -643,7 +688,43 @@ public nonisolated final class Database: @unchecked Sendable {
             let completed: Date? = (sqlite3_column_type(stmt, 4) == SQLITE_NULL)
                 ? nil
                 : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
-            out.append(SnapshotRecord(id: id, parentID: parent, label: label, startedAt: started, completedAt: completed))
+            var sysInfo: SystemInfo? = nil
+            if sqlite3_column_type(stmt, 5) != SQLITE_NULL,
+               let blob = sqlite3_column_blob(stmt, 5) {
+                let len = Int(sqlite3_column_bytes(stmt, 5))
+                let data = Data(bytes: blob, count: len)
+                sysInfo = try? decoder.decode(SystemInfo.self, from: data)
+            }
+            out.append(SnapshotRecord(id: id, parentID: parent, label: label, startedAt: started, completedAt: completed, systemInfo: sysInfo))
+        }
+        return out
+    }
+
+    /// Items belonging to a snapshot, hydrated from `items.payload` joined
+    /// on `snapshot_items`. Used by `ScanStore.load` to show "the latest
+    /// snapshot" rather than every version ever recorded.
+    public func itemsForSnapshot(_ snapshotID: Int64) throws -> [ScanItem] {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return [] }
+        var stmt: OpaquePointer?
+        defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = """
+            SELECT i.payload FROM items i
+            JOIN snapshot_items si ON si.item_id = i.id
+            WHERE si.snapshot_id = ?;
+            """
+        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        guard rc == SQLITE_OK, let stmt else { return [] }
+        sqlite3_bind_int64(stmt, 1, snapshotID)
+        var out: [ScanItem] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let blob = sqlite3_column_blob(stmt, 0) else { continue }
+            let len = Int(sqlite3_column_bytes(stmt, 0))
+            let data = Data(bytes: blob, count: len)
+            if let item = try? decoder.decode(ScanItem.self, from: data) {
+                out.append(item)
+            }
         }
         return out
     }
@@ -839,6 +920,7 @@ public nonisolated final class Database: @unchecked Sendable {
                 label TEXT,
                 started_at REAL NOT NULL,
                 completed_at REAL,
+                system_info BLOB,
                 FOREIGN KEY (parent_id) REFERENCES snapshots(id)
             );
 
@@ -873,7 +955,11 @@ public nonisolated final class Database: @unchecked Sendable {
                 file_blob_ref TEXT,
                 payload BLOB NOT NULL
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS items_path_unique     ON items(path);
+            -- items.path is NOT UNIQUE: multi-version items live here. Two
+            -- rows can share a path if their content (sha256) differs, with
+            -- a different deterministic id distinguishing them. The current
+            -- snapshot's snapshot_items entry decides which one a UI shows.
+            CREATE INDEX IF NOT EXISTS items_path_idx               ON items(path);
             CREATE INDEX IF NOT EXISTS items_category_idx           ON items(category);
             CREATE INDEX IF NOT EXISTS items_owning_bundle_idx      ON items(owning_bundle_path);
             CREATE INDEX IF NOT EXISTS items_sha256_idx             ON items(sha256);
@@ -1041,7 +1127,7 @@ public nonisolated final class Database: @unchecked Sendable {
         stmts.insertBlob = try prepare("INSERT OR REPLACE INTO blobs (ref, sha256, size, kind) VALUES (?, ?, ?, ?)")
         stmts.clearBlobs = try prepare("DELETE FROM blobs")
 
-        stmts.insertSnapshot = try prepare("INSERT INTO snapshots (parent_id, label, started_at, completed_at) VALUES (?, ?, ?, ?)")
+        stmts.insertSnapshot = try prepare("INSERT INTO snapshots (parent_id, label, started_at, completed_at, system_info) VALUES (?, ?, ?, ?, ?)")
         stmts.insertSnapshotItem = try prepare("INSERT OR IGNORE INTO snapshot_items (snapshot_id, item_id) VALUES (?, ?)")
         stmts.clearSnapshots = try prepare("DELETE FROM snapshots")
         stmts.clearSnapshotItems = try prepare("DELETE FROM snapshot_items")
@@ -1180,6 +1266,9 @@ public nonisolated struct SnapshotRecord: Sendable, Hashable, Identifiable {
     public var label: String?
     public var startedAt: Date
     public var completedAt: Date?
+    /// sw_vers + uname + hardware info captured at scan start. Nil for
+    /// pre-v3 snapshot rows.
+    public var systemInfo: SystemInfo?
 }
 
 // SQLite's SQLITE_TRANSIENT macro isn't bridged to Swift — declare the

@@ -81,6 +81,11 @@ public nonisolated final class ScanStore {
     /// when this is set so the new snapshot's membership is recorded.
     public private(set) var currentSnapshotID: Int64?
 
+    /// Snapshot ID of the previous scan (the parent of `currentSnapshotID`),
+    /// if any. Used by `diffAgainstParent()` to decide whether the
+    /// in-progress scan actually changed anything.
+    public private(set) var parentSnapshotID: Int64?
+
     /// Read-only snapshot history, newest-first. Loaded lazily by the
     /// `snapshotHistory()` call and cached until `beginSnapshot` invalidates.
     private var cachedHistory: [SnapshotRecord]?
@@ -110,6 +115,13 @@ public nonisolated final class ScanStore {
 
     // MARK: - Mutation
 
+    /// Clear the in-memory state so a new scan starts from a clean slate.
+    /// Does NOT clear the SQLite database — items from previous snapshots
+    /// stay around so the diff against parent can run, and so deterministic
+    /// upserts (same id → same row) reuse existing storage.
+    ///
+    /// For the "user wants to truly wipe this document" gesture, delete the
+    /// `.darwinscan` bundle on disk and start over.
     public func reset() {
         items.removeAll()
         itemsByPath.removeAll()
@@ -120,14 +132,46 @@ public nonisolated final class ScanStore {
         lastScanStarted = nil
         lastScanCompleted = nil
         currentSnapshotID = nil
+        parentSnapshotID = nil
         cachedHistory = nil
-        // Mirror the wipe to the persistent layer so reopening the doc
-        // doesn't resurrect stale rows.
-        if let database {
-            do { try database.clearItems() } catch {
-                print("[ScanStore] database.clearItems failed: \(error)")
-            }
+    }
+
+    /// Repopulate the in-memory view from the latest snapshot's items.
+    /// Used by `ScanController` after `discardCurrentSnapshot()` so the
+    /// view returns to the parent snapshot's state instead of remaining
+    /// half-populated by the just-cancelled scan.
+    public func reloadFromLatestSnapshot() {
+        guard let database else {
+            reset()
+            return
         }
+        let latest = (try? database.latestSnapshotID()) ?? nil
+        let loadedItems: [ScanItem]
+        if let id = latest {
+            loadedItems = (try? database.itemsForSnapshot(id)) ?? []
+        } else {
+            loadedItems = []
+        }
+        // Take the snapshot's recorded system_info too, so toolbar /
+        // SystemInfoView reflect the snapshot we're viewing.
+        let snapshot = (try? database.allSnapshots())?.first
+        let attached = self.database
+        self.database = nil
+        items.removeAll()
+        itemsByPath.removeAll()
+        categoryCounts.removeAll()
+        pathReferencedBy.removeAll()
+        itemsByOwningBundle.removeAll()
+        for item in loadedItems {
+            let header = ItemHeader(from: item)
+            self.items[item.id] = header
+            self.itemsByPath[item.path] = item.id
+            addIndexes(forID: item.id, header: header, relationships: item.relationships)
+        }
+        self.systemInfo = snapshot?.systemInfo
+        self.lastScanStarted = snapshot?.startedAt
+        self.lastScanCompleted = snapshot?.completedAt
+        self.database = attached
     }
 
     // MARK: - Snapshot lifecycle
@@ -136,22 +180,83 @@ public nonisolated final class ScanStore {
     /// The next `ingest` will record per-item membership in this snapshot.
     ///
     /// Chains off the previous snapshot via `parent_id` so the history is a
-    /// single linked list — that's what a future diff command will walk.
-    public func beginSnapshot(at startedAt: Date = Date(), label: String? = nil) {
+    /// single linked list. Captures `SystemInfo` (sw_vers, hardware, SIP
+    /// state) into the snapshot row so a future diff command can show OS-
+    /// level changes even when no scan items moved.
+    public func beginSnapshot(at startedAt: Date = Date(), label: String? = nil, systemInfo: SystemInfo? = nil) {
         guard let database else { return }
         do {
             let parent = try database.latestSnapshotID()
+            let infoBytes: Data? = systemInfo.flatMap {
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                return try? encoder.encode($0)
+            }
             let id = try database.insertSnapshot(
                 parentID: parent,
                 label: label,
                 startedAt: startedAt,
-                completedAt: nil
+                completedAt: nil,
+                systemInfo: infoBytes
             )
             currentSnapshotID = id
+            parentSnapshotID = parent
             cachedHistory = nil
         } catch {
             print("[ScanStore] beginSnapshot failed: \(error)")
         }
+    }
+
+    /// Discard the in-progress snapshot — delete its `snapshots` row and
+    /// `snapshot_items` membership. Used by the "no changes since previous
+    /// snapshot" finalization path. Items themselves stay in `items` (other
+    /// snapshots may reference them); only the membership and the snapshot
+    /// row are removed.
+    public func discardCurrentSnapshot() {
+        guard let database, let id = currentSnapshotID else { return }
+        do {
+            try database.deleteSnapshot(id: id)
+        } catch {
+            print("[ScanStore] discardCurrentSnapshot failed: \(error)")
+        }
+        currentSnapshotID = nil
+        cachedHistory = nil
+    }
+
+    /// Snapshot diff: returns the (added, removed, changed) sets between
+    /// the current snapshot and its parent. "Changed" means same path, but
+    /// different content (deterministic id differs). Called by the scan
+    /// finalize path to decide whether to keep the new snapshot.
+    public func diffAgainstParent() -> (added: Set<UUID>, removed: Set<UUID>, changed: Set<String>)? {
+        guard let database,
+              let currentID = currentSnapshotID else { return nil }
+        let current = (try? database.itemsInSnapshot(currentID)) ?? []
+        guard let parentID = parentSnapshotID else {
+            // First snapshot in the bundle — everything is "added".
+            return (added: current, removed: [], changed: [])
+        }
+        let parent = (try? database.itemsInSnapshot(parentID)) ?? []
+        let added = current.subtracting(parent)
+        let removed = parent.subtracting(current)
+        // Walk added+removed and look for path collisions — those are
+        // content changes at the same path.
+        var addedByPath: [String: UUID] = [:]
+        for id in added {
+            if let h = items[id] { addedByPath[h.path] = id }
+        }
+        var removedByPath: [String: UUID] = [:]
+        for id in removed {
+            // Removed IDs are no longer in the in-memory store. Look them
+            // up by joining `items` directly.
+            if let item = try? database.item(id: id) {
+                removedByPath[item.path] = id
+            }
+        }
+        var changed: Set<String> = []
+        for (path, _) in addedByPath where removedByPath[path] != nil {
+            changed.insert(path)
+        }
+        return (added, removed, changed)
     }
 
     /// Mark the current snapshot as finished. No-op if no snapshot is open.
@@ -214,6 +319,20 @@ public nonisolated final class ScanStore {
     /// for any UUID being overwritten — symbol rows are keyed by item_id,
     /// and stale rows from the prior scan would otherwise accumulate.
     public func ingest(_ produced: [ScanItem]) {
+        // The production scan pipelines call `beginSnapshot()` explicitly
+        // before `ingest()` so the new snapshot's `system_info` is captured
+        // and the parent chain is set. Direct-API callers (tests, future
+        // tooling) might forget, so we lazily start a snapshot here — the
+        // alternative is silently dropping items on the floor when no
+        // snapshot is open.
+        if currentSnapshotID == nil, database != nil {
+            // Carry the pre-set `systemInfo` (if any) into the snapshot row
+            // so direct-API callers who do `store.systemInfo = ...` followed
+            // by `store.ingest(...)` get their sw_vers preserved across
+            // save/load. Production paths set systemInfo via their own
+            // beginSnapshot(systemInfo:) call before ingest is reached.
+            beginSnapshot(systemInfo: self.systemInfo)
+        }
         // Apply to memory first, capturing the actually-stored rows so the
         // database mirrors the same UUIDs.
         var persisted: [ScanItem] = []

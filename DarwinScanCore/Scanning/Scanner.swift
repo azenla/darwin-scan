@@ -356,7 +356,8 @@ public nonisolated struct ScanPipeline: Sendable {
                 if options.inspectLocalizations,
                    let info = LocalizationInspector.inspectLprojDirectory(url) {
                     return (ScanItem(
-                        id: UUID(), path: path, name: filename, category: .localization,
+                        id: ItemIdentity.uuid(path: path, sha256: nil, bundlePathOnly: true),
+                        path: path, name: filename, category: .localization,
                         size: size, modifiedAt: mtime, sha256: nil,
                         insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
                         localization: info,
@@ -375,10 +376,11 @@ public nonisolated struct ScanPipeline: Sendable {
            let info = DyldCacheInspector.inspect(url: url) {
             var tags: [String] = ["dyld-cache"]
             if let arch = info.architecture { tags.append(arch) }
+            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
             return (ScanItem(
-                id: UUID(), path: path, name: filename, category: .dyldCache,
-                size: size, modifiedAt: mtime,
-                sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
+                id: ItemIdentity.uuid(path: path, sha256: sha),
+                path: path, name: filename, category: .dyldCache,
+                size: size, modifiedAt: mtime, sha256: sha,
                 insideBundle: false, owningBundlePath: nil,
                 dyldCache: info,
                 tags: tags
@@ -391,10 +393,11 @@ public nonisolated struct ScanPipeline: Sendable {
             var tags = [info.kind == .daemon ? "daemon" : "agent"]
             if info.runAtLoad { tags.append("RunAtLoad") }
             if info.keepAlive { tags.append("KeepAlive") }
+            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
             return (ScanItem(
-                id: UUID(), path: path, name: info.label ?? filename, category: .launchService,
-                size: size, modifiedAt: mtime,
-                sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
+                id: ItemIdentity.uuid(path: path, sha256: sha),
+                path: path, name: info.label ?? filename, category: .launchService,
+                size: size, modifiedAt: mtime, sha256: sha,
                 insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
                 launchService: info,
                 tags: tags
@@ -409,10 +412,11 @@ public nonisolated struct ScanPipeline: Sendable {
             var tags: [String] = ["plist", info.format.rawValue]
             if info.kind != .other { tags.append(info.kind.rawValue) }
             if info.looksLikeInfoPlist { tags.append("Info.plist") }
+            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
             return (ScanItem(
-                id: UUID(), path: path, name: filename, category: .plist,
-                size: size, modifiedAt: mtime,
-                sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
+                id: ItemIdentity.uuid(path: path, sha256: sha),
+                path: path, name: filename, category: .plist,
+                size: size, modifiedAt: mtime, sha256: sha,
                 insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
                 plist: info,
                 tags: tags
@@ -424,10 +428,11 @@ public nonisolated struct ScanPipeline: Sendable {
            let info = LocalizationInspector.inspect(url: url) {
             var tags: [String] = [ext]
             if let lang = info.language { tags.append(lang) }
+            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
             return (ScanItem(
-                id: UUID(), path: path, name: filename, category: .localization,
-                size: size, modifiedAt: mtime,
-                sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
+                id: ItemIdentity.uuid(path: path, sha256: sha),
+                path: path, name: filename, category: .localization,
+                size: size, modifiedAt: mtime, sha256: sha,
                 insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
                 localization: info,
                 tags: tags
@@ -438,10 +443,11 @@ public nonisolated struct ScanPipeline: Sendable {
             if let (info, _) = ManPageInspector.inspect(url: url) {
                 var tags: [String] = ["man"]
                 if let section = info.section { tags.append("\(section)") }
+                let sha = options.hashFiles ? Hash.sha256(of: url) : nil
                 return (ScanItem(
-                    id: UUID(), path: path, name: info.title ?? filename, category: .manPage,
-                    size: size, modifiedAt: mtime,
-                    sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
+                    id: ItemIdentity.uuid(path: path, sha256: sha),
+                    path: path, name: info.title ?? filename, category: .manPage,
+                    size: size, modifiedAt: mtime, sha256: sha,
                     insideBundle: false, owningBundlePath: nil,
                     manPage: info,
                     tags: tags
@@ -451,10 +457,11 @@ public nonisolated struct ScanPipeline: Sendable {
 
         if options.inspectMLModels, isMLModelExtension(ext),
            let info = MLModelInspector.inspect(url: url) {
+            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
             return (ScanItem(
-                id: UUID(), path: path, name: filename, category: .mlModel,
-                size: size, modifiedAt: mtime,
-                sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
+                id: ItemIdentity.uuid(path: path, sha256: sha),
+                path: path, name: filename, category: .mlModel,
+                size: size, modifiedAt: mtime, sha256: sha,
                 insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
                 mlModel: info,
                 tags: ["ml", info.container.rawValue]
@@ -469,10 +476,11 @@ public nonisolated struct ScanPipeline: Sendable {
                 blobs[ref] = preview
                 infoCopy.previewBlobRef = ref
             }
+            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
             return (ScanItem(
-                id: UUID(), path: path, name: filename, category: .icon,
-                size: size, modifiedAt: mtime,
-                sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
+                id: ItemIdentity.uuid(path: path, sha256: sha),
+                path: path, name: filename, category: .icon,
+                size: size, modifiedAt: mtime, sha256: sha,
                 insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
                 icon: infoCopy,
                 tags: [info.kind.rawValue]
@@ -480,10 +488,11 @@ public nonisolated struct ScanPipeline: Sendable {
         }
 
         if let scriptInfo = readShebang(url) {
+            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
             return (ScanItem(
-                id: UUID(), path: path, name: filename, category: .script,
-                size: size, modifiedAt: mtime,
-                sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
+                id: ItemIdentity.uuid(path: path, sha256: sha),
+                path: path, name: filename, category: .script,
+                size: size, modifiedAt: mtime, sha256: sha,
                 insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
                 script: scriptInfo,
                 tags: [scriptInfo.language ?? "script"]
@@ -513,7 +522,7 @@ public nonisolated struct ScanPipeline: Sendable {
         if info.isAgentApp  { tags.append("background-only") }
         if let category = info.category { tags.append(category) }
         return (ScanItem(
-            id: UUID(),
+            id: ItemIdentity.uuid(path: url.path, sha256: nil, bundlePathOnly: true),
             path: url.path,
             name: info.displayName ?? url.deletingPathExtension().lastPathComponent,
             category: .application,
@@ -532,7 +541,8 @@ public nonisolated struct ScanPipeline: Sendable {
                 isPrivate: url.path.contains("/PrivateFrameworks/")
             )
             return (ScanItem(
-                id: UUID(), path: url.path, name: url.deletingPathExtension().lastPathComponent,
+                id: ItemIdentity.uuid(path: url.path, sha256: nil, bundlePathOnly: true),
+                path: url.path, name: url.deletingPathExtension().lastPathComponent,
                 category: .framework, size: size, modifiedAt: mtime, sha256: nil,
                 insideBundle: false, owningBundlePath: nil,
                 framework: bare,
@@ -542,7 +552,8 @@ public nonisolated struct ScanPipeline: Sendable {
         var tags: [String] = ["framework"]
         if info.isPrivate { tags.append("private") }
         return (ScanItem(
-            id: UUID(), path: url.path, name: url.deletingPathExtension().lastPathComponent,
+            id: ItemIdentity.uuid(path: url.path, sha256: nil, bundlePathOnly: true),
+            path: url.path, name: url.deletingPathExtension().lastPathComponent,
             category: .framework, size: size, modifiedAt: mtime, sha256: nil,
             insideBundle: false, owningBundlePath: nil,
             framework: info,
@@ -557,7 +568,8 @@ public nonisolated struct ScanPipeline: Sendable {
                 executableName: nil, headerCount: 0, isPrivate: false
             )
         return (ScanItem(
-            id: UUID(), path: url.path, name: url.deletingPathExtension().lastPathComponent,
+            id: ItemIdentity.uuid(path: url.path, sha256: nil, bundlePathOnly: true),
+            path: url.path, name: url.deletingPathExtension().lastPathComponent,
             category: .kext, size: size, modifiedAt: mtime, sha256: nil,
             insideBundle: false, owningBundlePath: nil,
             framework: info,
@@ -568,7 +580,8 @@ public nonisolated struct ScanPipeline: Sendable {
     private func makeMLModelItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
         guard let info = MLModelInspector.inspect(url: url) else { return nil }
         return (ScanItem(
-            id: UUID(), path: url.path, name: url.deletingPathExtension().lastPathComponent,
+            id: ItemIdentity.uuid(path: url.path, sha256: nil, bundlePathOnly: true),
+            path: url.path, name: url.deletingPathExtension().lastPathComponent,
             category: .mlModel, size: size, modifiedAt: mtime, sha256: nil,
             insideBundle: false, owningBundlePath: nil,
             mlModel: info,
@@ -586,9 +599,13 @@ public nonisolated struct ScanPipeline: Sendable {
         let filename = url.lastPathComponent
         let inside = isInsideBundle(path)
         let owning = owningBundle(path)
-        // Allocate the item ID early — strings_fts ingestion needs to write
-        // a row keyed by it before the ScanItem is constructed.
-        let itemID = UUID()
+        // Compute sha256 once up-front so the deterministic item ID can be
+        // derived from (path, sha256) and strings_fts can be indexed under
+        // the same id before the ScanItem is constructed. When hashing is
+        // off the id falls back to a random UUID — re-scans of unhashed
+        // binaries won't dedup, which is the documented tradeoff.
+        let sha = options.hashFiles ? Hash.sha256(of: url) : nil
+        let itemID = ItemIdentity.uuid(path: path, sha256: sha)
 
         enriched.isApple = isApplePath(path)
         enriched.isCrossPlatformTool = WellKnownCrossPlatformTools.contains(filename.lowercased())
@@ -662,7 +679,7 @@ public nonisolated struct ScanPipeline: Sendable {
         return (ScanItem(
             id: itemID, path: path, name: filename, category: category,
             size: size, modifiedAt: mtime,
-            sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
+            sha256: sha,
             insideBundle: inside, owningBundlePath: owning,
             executable: enriched,
             tags: tags

@@ -22,8 +22,8 @@ public enum ScanPackage {
     public nonisolated static let databaseFilename = "data.db"
     public nonisolated static let blobsDirectory   = "blobs"
     public nonisolated static let formatStampFilename = "format.txt"
-    public nonisolated static let packageVersion   = 4
-    public nonisolated static let formatStampLine  = "darwinscan v4"
+    public nonisolated static let packageVersion   = 5
+    public nonisolated static let formatStampLine  = "darwinscan v5"
 
     public enum LoadError: Error, CustomStringConvertible {
         case notADirectory
@@ -33,7 +33,7 @@ public enum ScanPackage {
         public var description: String {
             switch self {
             case .notADirectory:                return "ScanPackage.load: file is not a .darwinscan directory bundle"
-            case .unsupportedFormat(let s):     return "ScanPackage.load: bundle is in an unsupported format (\(s)). DarwinScan now requires bundles in format v4; re-scan to produce a new bundle."
+            case .unsupportedFormat(let s):     return "ScanPackage.load: bundle is in an unsupported format (\(s)). DarwinScan now requires bundles in format v5; re-scan to produce a new bundle."
             case .missingDatabase:              return "ScanPackage.load: bundle has no data.db"
             }
         }
@@ -155,7 +155,7 @@ public enum ScanPackage {
         } catch let err as Database.DBError {
             switch err {
             case .schemaTooOld(let v):
-                throw LoadError.unsupportedFormat(detected: "v3 (sqlite schema v\(v))")
+                throw LoadError.unsupportedFormat(detected: "older (sqlite schema v\(v))")
             case .schemaTooNew(let v):
                 throw LoadError.unsupportedFormat(detected: "newer (sqlite schema v\(v))")
             default:
@@ -191,18 +191,27 @@ public enum ScanPackage {
 
     private static func loadFromAttachedDatabase(store: ScanStore) throws {
         guard let db = store.database else { return }
-        let items = try db.allItems()
-        let systemInfo: SystemInfo? = (try? db.meta("system_info", as: SystemInfo.self)) ?? nil
-        let options:    ScanOptions? = (try? db.meta("options", as: ScanOptions.self)) ?? nil
-        let started:    Date?        = (try? db.meta("last_scan_started", as: Date.self)) ?? nil
-        let completed:  Date?        = (try? db.meta("last_scan_completed", as: Date.self)) ?? nil
+        // Show the latest snapshot only. Earlier snapshots stay in the
+        // database for diff / history but aren't surfaced in the default
+        // in-memory view. A future snapshot-switcher UI will be able to
+        // call `Database.itemsForSnapshot(id)` for any historical id.
+        let items: [ScanItem]
+        let latestSnapshot: SnapshotRecord?
+        if let latestID = try db.latestSnapshotID() {
+            items = try db.itemsForSnapshot(latestID)
+            latestSnapshot = (try db.allSnapshots()).first(where: { $0.id == latestID })
+        } else {
+            items = []
+            latestSnapshot = nil
+        }
+        let options: ScanOptions? = (try? db.meta("options", as: ScanOptions.self)) ?? nil
 
         store.load(
             items: items,
-            systemInfo: systemInfo,
+            systemInfo: latestSnapshot?.systemInfo,
             options: options,
-            lastScanStarted: started,
-            lastScanCompleted: completed,
+            lastScanStarted: latestSnapshot?.startedAt,
+            lastScanCompleted: latestSnapshot?.completedAt,
             mirrorToDatabase: false
         )
     }
