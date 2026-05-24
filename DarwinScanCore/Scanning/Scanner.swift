@@ -710,6 +710,21 @@ public nonisolated struct ScanPipeline: Sendable {
         enriched.isApple = isApplePath(path)
         enriched.isCrossPlatformTool = WellKnownCrossPlatformTools.contains(filename.lowercased())
 
+        // Code signature: convert the slice-relative blob offset that
+        // MachOInspector recorded into a file-absolute one (the slice
+        // itself may live deep inside a FAT binary), then parse the
+        // CodeDirectory for team / signing id / hardened-runtime.
+        if let csSliceOff = info.codeSignatureSliceOffset,
+           let csSize = info.codeSignatureSize {
+            let sliceFile = machO.sliceFileOffset(for: url)
+            let absolute = sliceFile + csSliceOff
+            if let csInfo = CodeSignatureInspector.parse(url: url, fileOffset: absolute, size: csSize) {
+                enriched.signingIdentifier = csInfo.signingIdentifier
+                enriched.teamIdentifier = csInfo.teamIdentifier
+                enriched.isHardenedRuntime = csInfo.isHardenedRuntime
+            }
+        }
+
         if info.kind == .executable, let usage = StringsExtractor.grepInBinary(url: url, needle: "usage:") {
             enriched.usageLine = usage
         } else if info.kind == .executable, let usage = StringsExtractor.grepInBinary(url: url, needle: "Usage:") {

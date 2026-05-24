@@ -243,6 +243,11 @@ public nonisolated struct ExecutableInfo: Codable, Hashable, Sendable {
     public var usageLine: String?
     public var looksLikeDaemonByStrings: Bool = false
     public var stringsBlobRef: String?
+    /// Offset of the LC_CODE_SIGNATURE blob relative to the slice's start.
+    /// `Scanner` combines this with `MachOInspector.sliceFileOffset(for:)`
+    /// to get a file-absolute offset and hand it to `CodeSignatureInspector`.
+    public var codeSignatureSliceOffset: UInt64?
+    public var codeSignatureSize: UInt64?
 
     public init(
         kind: Kind,
@@ -262,7 +267,9 @@ public nonisolated struct ExecutableInfo: Codable, Hashable, Sendable {
         isCrossPlatformTool: Bool,
         usageLine: String? = nil,
         looksLikeDaemonByStrings: Bool = false,
-        stringsBlobRef: String? = nil
+        stringsBlobRef: String? = nil,
+        codeSignatureSliceOffset: UInt64? = nil,
+        codeSignatureSize: UInt64? = nil
     ) {
         self.kind = kind
         self.roles = roles
@@ -282,6 +289,8 @@ public nonisolated struct ExecutableInfo: Codable, Hashable, Sendable {
         self.usageLine = usageLine
         self.looksLikeDaemonByStrings = looksLikeDaemonByStrings
         self.stringsBlobRef = stringsBlobRef
+        self.codeSignatureSliceOffset = codeSignatureSliceOffset
+        self.codeSignatureSize = codeSignatureSize
     }
 }
 

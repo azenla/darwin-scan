@@ -129,6 +129,35 @@ public nonisolated struct MachOInspector: Sendable {
         }
     }
 
+    /// File offset of the first FAT slice (or 0 for single-arch). Set as a
+    /// side effect of `parseFat` so the caller can map slice-relative
+    /// offsets (LC_CODE_SIGNATURE.dataoff, LC_SYMTAB.symoff, …) to actual
+    /// file offsets. We can't return this in the `ExecutableInfo` struct
+    /// because it's purely an inspector-internal detail, not a property
+    /// of the binary itself.
+    public func sliceFileOffset(for url: URL) -> UInt64 {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return 0 }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 8), head.count >= 8 else { return 0 }
+        let magic = head.readUInt32(at: 0, bigEndian: false)
+        switch magic {
+        case FAT_MAGIC, FAT_CIGAM, FAT_MAGIC_64, FAT_CIGAM_64:
+            let isBig = (magic == FAT_CIGAM || magic == FAT_CIGAM_64)
+            let is64  = (magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64)
+            do { try handle.seek(toOffset: 0) } catch { return 0 }
+            let entrySize = is64 ? 32 : 20
+            let needed = 8 + entrySize
+            guard let buf = try? handle.read(upToCount: needed), buf.count >= needed else { return 0 }
+            if is64 {
+                return buf.readUInt64(at: 8 + 8, bigEndian: isBig)
+            } else {
+                return UInt64(buf.readUInt32(at: 8 + 8, bigEndian: isBig))
+            }
+        default:
+            return 0
+        }
+    }
+
     // MARK: FAT
 
     private nonisolated func parseFat(handle: FileHandle, leadingBytes: Data, magic: UInt32) -> ExecutableInfo? {
@@ -201,6 +230,8 @@ public nonisolated struct MachOInspector: Sendable {
         var platform: String? = nil
         var sdkVersion: String? = nil
         var hasCodeSig = false
+        var csBlobOffset: UInt64 = 0
+        var csBlobSize: UInt64 = 0
 
         for _ in 0..<Int(ncmds) {
             guard cursor + 8 <= data.count else { break }
@@ -240,12 +271,19 @@ public nonisolated struct MachOInspector: Sendable {
                 sdkVersion = decodeMachOVersion(data.readUInt32(at: cursor + 16, bigEndian: isBig))
             case LC_CODE_SIGNATURE:
                 hasCodeSig = true
+                // The blob's file offset is relative to the slice — for a
+                // single-arch Mach-O the slice is at offset 0 so it's the
+                // file offset directly. For a FAT slice the caller would
+                // need to know the slice's file offset, which we'd need to
+                // thread in. The parse is best-effort; failures just leave
+                // identifier fields nil.
+                csBlobOffset = UInt64(data.readUInt32(at: cursor + 8, bigEndian: isBig))
+                csBlobSize   = UInt64(data.readUInt32(at: cursor + 12, bigEndian: isBig))
             default:
                 break
             }
             cursor += Int(cmdsize)
         }
-        _ = hasCodeSig  // future: parse code signature blob for team id
 
         let kind: ExecutableInfo.Kind = {
             switch filetype {
@@ -283,7 +321,9 @@ public nonisolated struct MachOInspector: Sendable {
             isCrossPlatformTool: false,
             usageLine: nil,
             looksLikeDaemonByStrings: false,
-            stringsBlobRef: nil
+            stringsBlobRef: nil,
+            codeSignatureSliceOffset: hasCodeSig ? csBlobOffset : nil,
+            codeSignatureSize: hasCodeSig ? csBlobSize : nil
         )
     }
 

@@ -446,6 +446,15 @@ private struct ExecutableSection: View {
                     if info.isCrossPlatformTool {
                         ColoredChip(text: "Cross-platform", color: .yellow)
                     }
+                    if info.isHardenedRuntime {
+                        ColoredChip(text: "Hardened runtime", color: .indigo)
+                    }
+                }
+                if let signing = info.signingIdentifier {
+                    InfoRow(label: "Signed as", value: signing, monospaced: true)
+                }
+                if let team = info.teamIdentifier {
+                    InfoRow(label: "Team ID", value: team, monospaced: true)
                 }
             }
         }
