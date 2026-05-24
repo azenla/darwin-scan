@@ -33,6 +33,23 @@ public nonisolated struct ScanOptions: Codable, Hashable, Sendable {
     public var inspectDyldCache: Bool = true
     public var maxInspectFileSize: Int64 = 256 * 1024 * 1024
 
+    /// When on, the raw bytes of every classified file are written into the
+    /// content-addressed blob store and the resulting ref is recorded on the
+    /// item (`ScanItem.fileBlobRef`). Lets `darwin-scan extract` rebuild a
+    /// directory tree from a `.darwinscan` bundle. Off by default because it
+    /// can multiply bundle size by ~5× for a /System scan.
+    public var captureFiles: Bool = false
+
+    /// Hard cap on the size of a file that `captureFiles` will pull into the
+    /// blob store. Files above this are skipped (no ref is recorded).
+    public var maxCaptureFileSize: Int64 = 256 * 1024 * 1024
+
+    /// Extract symbols, Obj-C/Swift class names, and undefined imports from
+    /// every Mach-O binary. Slows scans by ~30% on a /System but produces a
+    /// fully searchable symbol index. On by default since the cost is small
+    /// relative to the strings extractor.
+    public var extractSymbols: Bool = true
+
     public init(
         roots: [String]? = nil,
         excludedPrefixes: [String]? = nil,
@@ -45,7 +62,10 @@ public nonisolated struct ScanOptions: Codable, Hashable, Sendable {
         inspectAppBundles: Bool = true,
         inspectMLModels: Bool = true,
         inspectDyldCache: Bool = true,
-        maxInspectFileSize: Int64 = 256 * 1024 * 1024
+        maxInspectFileSize: Int64 = 256 * 1024 * 1024,
+        captureFiles: Bool = false,
+        maxCaptureFileSize: Int64 = 256 * 1024 * 1024,
+        extractSymbols: Bool = true
     ) {
         if let roots { self.roots = roots }
         if let excludedPrefixes { self.excludedPrefixes = excludedPrefixes }
@@ -59,5 +79,8 @@ public nonisolated struct ScanOptions: Codable, Hashable, Sendable {
         self.inspectMLModels = inspectMLModels
         self.inspectDyldCache = inspectDyldCache
         self.maxInspectFileSize = maxInspectFileSize
+        self.captureFiles = captureFiles
+        self.maxCaptureFileSize = maxCaptureFileSize
+        self.extractSymbols = extractSymbols
     }
 }

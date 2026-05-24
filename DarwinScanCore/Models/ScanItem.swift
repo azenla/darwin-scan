@@ -83,6 +83,12 @@ public nonisolated struct ScanItem: Codable, Identifiable, Hashable, Sendable {
     /// Owning bundle path, if `insideBundle` is true.
     public var owningBundlePath: String?
 
+    /// Optional content-addressed reference to the original file bytes, copied
+    /// verbatim into the blob store. Populated when `ScanOptions.captureFiles`
+    /// is on. Lets a future `darwin-scan extract` reconstruct the source tree
+    /// from a `.darwinscan` bundle.
+    public var fileBlobRef: String?
+
     // Discriminated payload — exactly one is populated to match `category`.
     public var executable: ExecutableInfo?
     public var application: AppBundleInfo?
@@ -115,6 +121,7 @@ public nonisolated struct ScanItem: Codable, Identifiable, Hashable, Sendable {
         sha256: String? = nil,
         insideBundle: Bool,
         owningBundlePath: String?,
+        fileBlobRef: String? = nil,
         executable: ExecutableInfo? = nil,
         application: AppBundleInfo? = nil,
         launchService: LaunchServiceInfo? = nil,
@@ -139,6 +146,7 @@ public nonisolated struct ScanItem: Codable, Identifiable, Hashable, Sendable {
         self.sha256 = sha256
         self.insideBundle = insideBundle
         self.owningBundlePath = owningBundlePath
+        self.fileBlobRef = fileBlobRef
         self.executable = executable
         self.application = application
         self.launchService = launchService
