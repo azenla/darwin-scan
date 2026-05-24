@@ -421,12 +421,14 @@ LC_SYMTAB wasn't the first command.
 
 Modern Apple binaries on disk rarely expose Obj-C class names as
 LC_SYMTAB externals — the toolchain ships them as section data
-referenced from `__objc_classlist`, and the bulk of system Obj-C lives
-inside the dyld_shared_cache. SymbolInspector's name-pattern path will
-correctly return zero `objcClass` rows on those binaries; the
-`__objc_classlist` section walk is a deferred follow-up. The
-LC_SYMTAB path still picks up imports, function exports, Swift mangled
-symbols, and Obj-C class exports from anything not stripped.
+referenced from `__objc_classlist`. As a partial workaround,
+SymbolInspector also reads the raw bytes of the `__TEXT,__objc_classname`
+and `__TEXT,__objc_methname` string pools and emits one row per
+null-terminated string (tagged `.objcClass` and `.function`
+respectively). Strict pointer-chasing through
+`__objc_classlist → objc_class → class_ro_t → name` — which would
+correctly distinguish classes from method/ivar/protocol names — is
+still deferred; it needs chained-fixup decoding on modern binaries.
 
 ## DYLD shared cache + cryptex firmlinks
 
@@ -443,7 +445,13 @@ returns each cached dylib's path, unslid load address, modTime, and
 inode. The ScanPipeline emits a virtual `framework` item per image with
 a synthesised path `<cachePath>#<imagePath>` (the `#` makes the same
 dylib distinct across architecture caches — arm64e and x86_64 each get
-their own row). Virtual items carry `.inDyldCache → cachePath`, no
+their own row). Image enumeration is **gated on
+`DyldCacheInspector.isSubcache(filename:)`**: each numbered
+`.NN` subcache shard still classifies as `.dyldCache`, but only the
+main cache file (no numeric suffix) emits virtual children — otherwise
+every cached dylib reappears once per shard (the x86_64 shards
+replicate the main cache's `imagesCount` in their headers). Virtual
+items carry `.inDyldCache → cachePath`, no
 fileBlobRef (the cache file itself is what gets captured), and a
 `dyld-cache-image` tag. `darwin-scan extract` therefore restores the
 cache file, not the thousands of virtuals — the user's stated
