@@ -1,8 +1,8 @@
 import Foundation
 import Darwin
 
-nonisolated enum SystemInfoCollector {
-    static func capture() -> SystemInfo {
+public nonisolated enum SystemInfoCollector {
+    public static func capture() -> SystemInfo {
         let plistURL = URL(fileURLWithPath: "/System/Library/CoreServices/SystemVersion.plist")
         var productName: String?
         var productVersion: String?

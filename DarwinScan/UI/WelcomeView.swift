@@ -1,4 +1,5 @@
 import SwiftUI
+import DarwinScanCore
 
 /// Empty-state view shown when a fresh document is created and no scan has
 /// run yet. Big "Start Scan" button.

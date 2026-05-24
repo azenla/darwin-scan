@@ -1,4 +1,5 @@
 import SwiftUI
+import DarwinScanCore
 
 /// Bottom toolbar shown while a scan is running.
 ///

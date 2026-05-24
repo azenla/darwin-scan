@@ -1,4 +1,5 @@
 import SwiftUI
+import DarwinScanCore
 
 /// Middle column. Shows items filtered by the sidebar selection and a rich
 /// search field at the top. Selection drives the detail column.

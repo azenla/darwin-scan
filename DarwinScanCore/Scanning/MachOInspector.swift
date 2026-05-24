@@ -106,9 +106,11 @@ nonisolated private func decodeMachOVersion(_ raw: UInt32) -> String {
 
 /// Parses Mach-O / FAT Mach-O headers from disk to produce `ExecutableInfo`.
 /// Returns nil if the file isn't Mach-O.
-nonisolated struct MachOInspector: Sendable {
+public nonisolated struct MachOInspector: Sendable {
 
-    nonisolated func inspect(url: URL) -> ExecutableInfo? {
+    public init() {}
+
+    public nonisolated func inspect(url: URL) -> ExecutableInfo? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
 

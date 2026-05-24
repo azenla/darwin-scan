@@ -51,9 +51,9 @@ import os.lock
 /// `MainActor` only. SQLite is compiled with serialized threading mode by
 /// default on Apple platforms, but we still gate writes through the lock so
 /// transactions don't interleave.
-nonisolated final class Database: @unchecked Sendable {
+public nonisolated final class Database: @unchecked Sendable {
     /// Bump when schema changes. Persisted under `meta.schema_version`.
-    static let currentSchemaVersion: Int = 1
+    public static let currentSchemaVersion: Int = 1
 
     private var db: OpaquePointer?
     private var lock = os_unfair_lock_s()
@@ -83,13 +83,13 @@ nonisolated final class Database: @unchecked Sendable {
         return d
     }()
 
-    enum DBError: Error, CustomStringConvertible {
+    public enum DBError: Error, CustomStringConvertible {
         case open(String)
         case prepare(String)
         case step(String)
         case bind(String)
 
-        var description: String {
+        public var description: String {
             switch self {
             case .open(let m):    return "Database.open: \(m)"
             case .prepare(let m): return "Database.prepare: \(m)"
@@ -99,7 +99,7 @@ nonisolated final class Database: @unchecked Sendable {
         }
     }
 
-    init(at url: URL) throws {
+    public init(at url: URL) throws {
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         let rc = sqlite3_open_v2(url.path, &handle, flags, nil)
@@ -129,7 +129,7 @@ nonisolated final class Database: @unchecked Sendable {
         }
     }
 
-    func close() {
+    public func close() {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         finalizeAllStatements()
@@ -141,7 +141,7 @@ nonisolated final class Database: @unchecked Sendable {
 
     // MARK: - Items
 
-    func upsertItem(_ item: ScanItem) throws {
+    public func upsertItem(_ item: ScanItem) throws {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         try beginTransaction()
@@ -157,7 +157,7 @@ nonisolated final class Database: @unchecked Sendable {
     /// Bulk insert/update in a single transaction. Cheap when N is small (one
     /// scan batch is ~256 items) and crucial when N is large (initial seed
     /// from a legacy JSON manifest).
-    func upsertItems(_ items: [ScanItem]) throws {
+    public func upsertItems(_ items: [ScanItem]) throws {
         guard !items.isEmpty else { return }
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
@@ -173,7 +173,7 @@ nonisolated final class Database: @unchecked Sendable {
         }
     }
 
-    func deleteItem(id: UUID) throws {
+    public func deleteItem(id: UUID) throws {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         let key = id.uuidString.lowercased()
@@ -192,7 +192,7 @@ nonisolated final class Database: @unchecked Sendable {
         }
     }
 
-    func clearItems() throws {
+    public func clearItems() throws {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         try beginTransaction()
@@ -211,7 +211,7 @@ nonisolated final class Database: @unchecked Sendable {
     /// info, etc.) that the in-memory `ItemHeader` deliberately doesn't
     /// carry. Called from `MainActor`; the lock makes the read safe
     /// against concurrent writes from the scan worker.
-    func item(id: UUID) throws -> ScanItem? {
+    public func item(id: UUID) throws -> ScanItem? {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         guard let stmt = itemByIdStmt else {
@@ -237,7 +237,7 @@ nonisolated final class Database: @unchecked Sendable {
     /// during a path-collision upsert — the in-memory `ItemHeader` doesn't
     /// carry relationships, so we fetch the old list from SQLite right
     /// before overwriting it.
-    func outgoingTargets(sourceID: UUID) throws -> [String] {
+    public func outgoingTargets(sourceID: UUID) throws -> [String] {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         guard let stmt = outgoingTargetsStmt else {
@@ -263,7 +263,7 @@ nonisolated final class Database: @unchecked Sendable {
 
     /// Read every row back as a `ScanItem`. Called once on document open; in
     /// the future we'd swap this for streamed / paginated reads.
-    func allItems() throws -> [ScanItem] {
+    public func allItems() throws -> [ScanItem] {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         guard let stmt = allItemsStmt else {
@@ -296,13 +296,13 @@ nonisolated final class Database: @unchecked Sendable {
 
     // MARK: - Meta
 
-    func setMeta(_ key: String, json: Data) throws {
+    public func setMeta(_ key: String, json: Data) throws {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         try setMetaLocked(key: key, blob: json)
     }
 
-    func meta(_ key: String) throws -> Data? {
+    public func meta(_ key: String) throws -> Data? {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         guard let stmt = getMetaStmt else { return nil }
@@ -319,13 +319,13 @@ nonisolated final class Database: @unchecked Sendable {
     }
 
     /// Encode a Codable value and stash it under `key`. Convenience wrapper.
-    func setMeta<T: Encodable>(_ key: String, value: T) throws {
+    public func setMeta<T: Encodable>(_ key: String, value: T) throws {
         let data = try encoder.encode(value)
         try setMeta(key, json: data)
     }
 
     /// Decode the value stored under `key` if present.
-    func meta<T: Decodable>(_ key: String, as: T.Type) throws -> T? {
+    public func meta<T: Decodable>(_ key: String, as: T.Type) throws -> T? {
         guard let data = try meta(key) else { return nil }
         return try decoder.decode(T.self, from: data)
     }
@@ -335,7 +335,7 @@ nonisolated final class Database: @unchecked Sendable {
     /// Force WAL contents into the main database file. Called before the save
     /// FileWrapper is built so the bytes the OS hands to the document writer
     /// include every committed write.
-    func checkpoint() throws {
+    public func checkpoint() throws {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         guard let db else { return }

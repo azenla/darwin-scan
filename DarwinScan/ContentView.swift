@@ -1,4 +1,5 @@
 import SwiftUI
+import DarwinScanCore
 
 struct ContentView: View {
     let document: ScanDocument

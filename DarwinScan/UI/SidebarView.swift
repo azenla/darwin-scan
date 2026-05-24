@@ -1,4 +1,5 @@
 import SwiftUI
+import DarwinScanCore
 
 /// Sidebar — fixed list of categories plus a "System Info" overview entry.
 /// Selection is bound through to the parent's `NavigationSplitView`.

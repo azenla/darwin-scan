@@ -1,9 +1,9 @@
 import Foundation
 
-nonisolated enum MLModelInspector {
+public nonisolated enum MLModelInspector {
     /// Detect ML model containers by extension and, where possible, peek inside
     /// to extract author / description / IO shapes.
-    static func inspect(url: URL) -> MLModelInfo? {
+    public static func inspect(url: URL) -> MLModelInfo? {
         let ext = url.pathExtension.lowercased()
         switch ext {
         case "mlmodel":     return inspectMLModelFile(url)

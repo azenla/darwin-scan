@@ -1,8 +1,8 @@
 import Foundation
 
-nonisolated enum PlistInspector {
+public nonisolated enum PlistInspector {
     /// Reads any plist (xml or binary). Returns nil on error.
-    static func read(_ url: URL) -> [String: Any]? {
+    public static func read(_ url: URL) -> [String: Any]? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
     }
@@ -10,7 +10,7 @@ nonisolated enum PlistInspector {
     /// Classify a `.plist` file without parsing its full contents. We peek
     /// the first ~64 KB which is enough to detect format, top-level kind,
     /// CFBundle keys, and capture a preview snippet for the detail view.
-    static func decodePlistInfo(at url: URL) -> (PlistInfo, previewBlob: Data?)? {
+    public static func decodePlistInfo(at url: URL) -> (PlistInfo, previewBlob: Data?)? {
         let head: Data
         do {
             let handle = try FileHandle(forReadingFrom: url)
@@ -108,7 +108,7 @@ nonisolated enum PlistInspector {
 
     /// Decode a launchd plist into a `LaunchServiceInfo`. Returns nil if
     /// the plist isn't recognizable as a launchd descriptor (no `Label`).
-    static func decodeLaunchService(at url: URL) -> LaunchServiceInfo? {
+    public static func decodeLaunchService(at url: URL) -> LaunchServiceInfo? {
         guard let dict = read(url) else { return nil }
         guard let label = dict["Label"] as? String else { return nil }
         let kind: LaunchServiceInfo.Kind = url.path.contains("/LaunchDaemons/") ? .daemon : .agent
@@ -143,7 +143,7 @@ nonisolated enum PlistInspector {
     }
 
     /// Decode an `Info.plist` from an `.app`/`.framework`/`.bundle` directory.
-    static func decodeAppBundle(at bundleURL: URL) -> AppBundleInfo? {
+    public static func decodeAppBundle(at bundleURL: URL) -> AppBundleInfo? {
         let infoURL = bundleURL
             .appendingPathComponent("Contents", isDirectory: true)
             .appendingPathComponent("Info.plist")
@@ -172,7 +172,7 @@ nonisolated enum PlistInspector {
 
     /// Decode a `.framework`'s versioned Info.plist. Frameworks store their
     /// Info.plist inside `Versions/Current/Resources/Info.plist`.
-    static func decodeFrameworkBundle(at bundleURL: URL) -> FrameworkInfo? {
+    public static func decodeFrameworkBundle(at bundleURL: URL) -> FrameworkInfo? {
         let candidates = [
             bundleURL.appendingPathComponent("Versions/Current/Resources/Info.plist"),
             bundleURL.appendingPathComponent("Resources/Info.plist"),

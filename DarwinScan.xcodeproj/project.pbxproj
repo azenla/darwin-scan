@@ -6,6 +6,14 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		FA0606C52FC2721D00582663 /* ArgumentParser in Frameworks */ = {isa = PBXBuildFile; productRef = FA0606C42FC2721D00582663 /* ArgumentParser */; };
+		FA0606D62FC272C200582663 /* DarwinScanCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FA0606CB2FC272C200582663 /* DarwinScanCore.framework */; };
+		FA0606E02FC272C200582663 /* DarwinScanCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FA0606CB2FC272C200582663 /* DarwinScanCore.framework */; };
+		FA0606E12FC272C200582663 /* DarwinScanCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = FA0606CB2FC272C200582663 /* DarwinScanCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		FA0606F12FC272C300582663 /* DarwinScanCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FA0606CB2FC272C200582663 /* DarwinScanCore.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		FA0603D32FC17CB900582663 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -21,12 +29,59 @@
 			remoteGlobalIDString = FA0603C42FC17CB800582663;
 			remoteInfo = DarwinScan;
 		};
+		FA0606D72FC272C200582663 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FA0603BD2FC17CB800582663 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FA0606CA2FC272C200582663;
+			remoteInfo = DarwinScanCore;
+		};
+		FA0606DE2FC272C200582663 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FA0603BD2FC17CB800582663 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FA0606CA2FC272C200582663;
+			remoteInfo = DarwinScanCore;
+		};
+		FA0606EF2FC272C300582663 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FA0603BD2FC17CB800582663 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FA0606CA2FC272C200582663;
+			remoteInfo = DarwinScanCore;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		FA0606BA2FC271F000582663 /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = /usr/share/man/man1/;
+			dstSubfolderSpec = 0;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 1;
+		};
+		FA0606E52FC272C200582663 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				FA0606E12FC272C200582663 /* DarwinScanCore.framework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		FA0603C52FC17CB800582663 /* DarwinScan.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DarwinScan.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		FA0603D22FC17CB900582663 /* DarwinScanTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DarwinScanTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		FA0603DC2FC17CB900582663 /* DarwinScanUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DarwinScanUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		FA0606BC2FC271F000582663 /* darwin-scan */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "darwin-scan"; sourceTree = BUILT_PRODUCTS_DIR; };
+		FA0606CB2FC272C200582663 /* DarwinScanCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = DarwinScanCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		FA0606D52FC272C200582663 /* DarwinScanCoreTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DarwinScanCoreTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -58,6 +113,21 @@
 			path = DarwinScanUITests;
 			sourceTree = "<group>";
 		};
+		FA0606BD2FC271F000582663 /* DarwinScanCommand */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = DarwinScanCommand;
+			sourceTree = "<group>";
+		};
+		FA0606CC2FC272C200582663 /* DarwinScanCore */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = DarwinScanCore;
+			sourceTree = "<group>";
+		};
+		FA0606DB2FC272C200582663 /* DarwinScanCoreTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = DarwinScanCoreTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -65,6 +135,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				FA0606E02FC272C200582663 /* DarwinScanCore.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -82,6 +153,30 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		FA0606B92FC271F000582663 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FA0606F12FC272C300582663 /* DarwinScanCore.framework in Frameworks */,
+				FA0606C52FC2721D00582663 /* ArgumentParser in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FA0606C82FC272C200582663 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FA0606D22FC272C200582663 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FA0606D62FC272C200582663 /* DarwinScanCore.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -91,6 +186,10 @@
 				FA0603C72FC17CB800582663 /* DarwinScan */,
 				FA0603D52FC17CB900582663 /* DarwinScanTests */,
 				FA0603DF2FC17CB900582663 /* DarwinScanUITests */,
+				FA0606BD2FC271F000582663 /* DarwinScanCommand */,
+				FA0606CC2FC272C200582663 /* DarwinScanCore */,
+				FA0606DB2FC272C200582663 /* DarwinScanCoreTests */,
+				FA0606C32FC2721D00582663 /* Frameworks */,
 				FA0603C62FC17CB800582663 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -101,11 +200,31 @@
 				FA0603C52FC17CB800582663 /* DarwinScan.app */,
 				FA0603D22FC17CB900582663 /* DarwinScanTests.xctest */,
 				FA0603DC2FC17CB900582663 /* DarwinScanUITests.xctest */,
+				FA0606BC2FC271F000582663 /* darwin-scan */,
+				FA0606CB2FC272C200582663 /* DarwinScanCore.framework */,
+				FA0606D52FC272C200582663 /* DarwinScanCoreTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
+		FA0606C32FC2721D00582663 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
+
+/* Begin PBXHeadersBuildPhase section */
+		FA0606C62FC272C200582663 /* Headers */ = {
+			isa = PBXHeadersBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXHeadersBuildPhase section */
 
 /* Begin PBXNativeTarget section */
 		FA0603C42FC17CB800582663 /* DarwinScan */ = {
@@ -115,10 +234,12 @@
 				FA0603C12FC17CB800582663 /* Sources */,
 				FA0603C22FC17CB800582663 /* Frameworks */,
 				FA0603C32FC17CB800582663 /* Resources */,
+				FA0606E52FC272C200582663 /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				FA0606DF2FC272C200582663 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				FA0603C72FC17CB800582663 /* DarwinScan */,
@@ -176,6 +297,76 @@
 			productReference = FA0603DC2FC17CB900582663 /* DarwinScanUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
+		FA0606BB2FC271F000582663 /* darwin-scan */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FA0606C02FC271F000582663 /* Build configuration list for PBXNativeTarget "darwin-scan" */;
+			buildPhases = (
+				FA0606B82FC271F000582663 /* Sources */,
+				FA0606B92FC271F000582663 /* Frameworks */,
+				FA0606BA2FC271F000582663 /* CopyFiles */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				FA0606F02FC272C300582663 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				FA0606BD2FC271F000582663 /* DarwinScanCommand */,
+			);
+			name = "darwin-scan";
+			packageProductDependencies = (
+				FA0606C42FC2721D00582663 /* ArgumentParser */,
+			);
+			productName = "darwin-scan";
+			productReference = FA0606BC2FC271F000582663 /* darwin-scan */;
+			productType = "com.apple.product-type.tool";
+		};
+		FA0606CA2FC272C200582663 /* DarwinScanCore */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FA0606E22FC272C200582663 /* Build configuration list for PBXNativeTarget "DarwinScanCore" */;
+			buildPhases = (
+				FA0606C62FC272C200582663 /* Headers */,
+				FA0606C72FC272C200582663 /* Sources */,
+				FA0606C82FC272C200582663 /* Frameworks */,
+				FA0606C92FC272C200582663 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				FA0606CC2FC272C200582663 /* DarwinScanCore */,
+			);
+			name = DarwinScanCore;
+			packageProductDependencies = (
+			);
+			productName = DarwinScanCore;
+			productReference = FA0606CB2FC272C200582663 /* DarwinScanCore.framework */;
+			productType = "com.apple.product-type.framework";
+		};
+		FA0606D42FC272C200582663 /* DarwinScanCoreTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FA0606E62FC272C200582663 /* Build configuration list for PBXNativeTarget "DarwinScanCoreTests" */;
+			buildPhases = (
+				FA0606D12FC272C200582663 /* Sources */,
+				FA0606D22FC272C200582663 /* Frameworks */,
+				FA0606D32FC272C200582663 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				FA0606D82FC272C200582663 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				FA0606DB2FC272C200582663 /* DarwinScanCoreTests */,
+			);
+			name = DarwinScanCoreTests;
+			packageProductDependencies = (
+			);
+			productName = DarwinScanCoreTests;
+			productReference = FA0606D52FC272C200582663 /* DarwinScanCoreTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -197,6 +388,16 @@
 						CreatedOnToolsVersion = 26.5;
 						TestTargetID = FA0603C42FC17CB800582663;
 					};
+					FA0606BB2FC271F000582663 = {
+						CreatedOnToolsVersion = 26.5;
+					};
+					FA0606CA2FC272C200582663 = {
+						CreatedOnToolsVersion = 26.5;
+					};
+					FA0606D42FC272C200582663 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = FA0603C42FC17CB800582663;
+					};
 				};
 			};
 			buildConfigurationList = FA0603C02FC17CB800582663 /* Build configuration list for PBXProject "DarwinScan" */;
@@ -208,6 +409,9 @@
 			);
 			mainGroup = FA0603BC2FC17CB800582663;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				FA0606B72FC271DD00582663 /* XCRemoteSwiftPackageReference "swift-argument-parser" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = FA0603C62FC17CB800582663 /* Products */;
 			projectDirPath = "";
@@ -216,6 +420,9 @@
 				FA0603C42FC17CB800582663 /* DarwinScan */,
 				FA0603D12FC17CB900582663 /* DarwinScanTests */,
 				FA0603DB2FC17CB900582663 /* DarwinScanUITests */,
+				FA0606BB2FC271F000582663 /* darwin-scan */,
+				FA0606CA2FC272C200582663 /* DarwinScanCore */,
+				FA0606D42FC272C200582663 /* DarwinScanCoreTests */,
 			);
 		};
 /* End PBXProject section */
@@ -236,6 +443,20 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		FA0603DA2FC17CB900582663 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FA0606C92FC272C200582663 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FA0606D32FC272C200582663 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -266,6 +487,27 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		FA0606B82FC271F000582663 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FA0606C72FC272C200582663 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FA0606D12FC272C200582663 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -278,6 +520,21 @@
 			isa = PBXTargetDependency;
 			target = FA0603C42FC17CB800582663 /* DarwinScan */;
 			targetProxy = FA0603DD2FC17CB900582663 /* PBXContainerItemProxy */;
+		};
+		FA0606D82FC272C200582663 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FA0606CA2FC272C200582663 /* DarwinScanCore */;
+			targetProxy = FA0606D72FC272C200582663 /* PBXContainerItemProxy */;
+		};
+		FA0606DF2FC272C200582663 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FA0606CA2FC272C200582663 /* DarwinScanCore */;
+			targetProxy = FA0606DE2FC272C200582663 /* PBXContainerItemProxy */;
+		};
+		FA0606F02FC272C300582663 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FA0606CA2FC272C200582663 /* DarwinScanCore */;
+			targetProxy = FA0606EF2FC272C300582663 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -540,6 +797,172 @@
 			};
 			name = Release;
 		};
+		FA0606C12FC271F000582663 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 3FQW5YTQR8;
+				ENABLE_HARDENED_RUNTIME = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/",
+					"@executable_path/../Frameworks/",
+					"@loader_path/",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		FA0606C22FC271F000582663 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 3FQW5YTQR8;
+				ENABLE_HARDENED_RUNTIME = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/",
+					"@executable_path/../Frameworks/",
+					"@loader_path/",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		FA0606E32FC272C200582663 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUILD_LIBRARY_FOR_DISTRIBUTION = NO;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 3FQW5YTQR8;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				ENABLE_MODULE_VERIFIER = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"@executable_path/../Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				MODULE_VERIFIER_SUPPORTED_LANGUAGES = "objective-c objective-c++";
+				MODULE_VERIFIER_SUPPORTED_LANGUAGE_STANDARDS = "gnu17 gnu++20";
+				PRODUCT_BUNDLE_IDENTIFIER = io.zenla.DarwinScanCore;
+				PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_INSTALL_MODULE = YES;
+				SWIFT_INSTALL_OBJC_HEADER = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				VERSIONING_SYSTEM = "apple-generic";
+				VERSION_INFO_PREFIX = "";
+			};
+			name = Debug;
+		};
+		FA0606E42FC272C200582663 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUILD_LIBRARY_FOR_DISTRIBUTION = NO;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 3FQW5YTQR8;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				ENABLE_MODULE_VERIFIER = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"@executable_path/../Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				MODULE_VERIFIER_SUPPORTED_LANGUAGES = "objective-c objective-c++";
+				MODULE_VERIFIER_SUPPORTED_LANGUAGE_STANDARDS = "gnu17 gnu++20";
+				PRODUCT_BUNDLE_IDENTIFIER = io.zenla.DarwinScanCore;
+				PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_INSTALL_MODULE = YES;
+				SWIFT_INSTALL_OBJC_HEADER = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				VERSIONING_SYSTEM = "apple-generic";
+				VERSION_INFO_PREFIX = "";
+			};
+			name = Release;
+		};
+		FA0606E72FC272C200582663 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 3FQW5YTQR8;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.zenla.DarwinScanCoreTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		FA0606E82FC272C200582663 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 3FQW5YTQR8;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.zenla.DarwinScanCoreTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -579,7 +1002,53 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		FA0606C02FC271F000582663 /* Build configuration list for PBXNativeTarget "darwin-scan" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FA0606C12FC271F000582663 /* Debug */,
+				FA0606C22FC271F000582663 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FA0606E22FC272C200582663 /* Build configuration list for PBXNativeTarget "DarwinScanCore" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FA0606E32FC272C200582663 /* Debug */,
+				FA0606E42FC272C200582663 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FA0606E62FC272C200582663 /* Build configuration list for PBXNativeTarget "DarwinScanCoreTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FA0606E72FC272C200582663 /* Debug */,
+				FA0606E82FC272C200582663 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		FA0606B72FC271DD00582663 /* XCRemoteSwiftPackageReference "swift-argument-parser" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-argument-parser.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.7.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		FA0606C42FC2721D00582663 /* ArgumentParser */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = FA0606B72FC271DD00582663 /* XCRemoteSwiftPackageReference "swift-argument-parser" */;
+			productName = ArgumentParser;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = FA0603BD2FC17CB800582663 /* Project object */;
 }

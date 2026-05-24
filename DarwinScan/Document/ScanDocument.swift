@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 import UniformTypeIdentifiers
+import DarwinScanCore
 
 extension UTType {
     /// Custom directory-package type for `.darwinscan` documents. Conforms to
@@ -34,22 +35,32 @@ final class ScanDocument: ReferenceFileDocument {
 
     let store: ScanStore
 
+    @MainActor
     init() {
         self.store = ScanStore()
         attachFreshDatabase()
     }
 
     required init(configuration: ReadConfiguration) throws {
-        self.store = ScanStore()
-        // ScanPackage.load opens (or migrates from legacy JSON) the database
-        // inside the BlobStore cache dir and attaches it to the store.
-        try ScanPackage.load(into: store, from: configuration.file)
+        // `ReferenceFileDocument.init(configuration:)` is declared
+        // nonisolated by the protocol even though SwiftUI always invokes it
+        // on the main thread during document open. Drop into a MainActor
+        // isolation domain explicitly so we can touch the @MainActor types
+        // (ScanStore, ScanPackage.load, …) without async ceremony.
+        let configuredStore: ScanStore = try MainActor.assumeIsolated {
+            let store = ScanStore()
+            try ScanPackage.load(into: store, from: configuration.file)
+            return store
+        }
+        self.store = configuredStore
     }
 
     func snapshot(contentType: UTType) throws -> FileWrapper {
-        // Force WAL → main file before we hand the bytes to FileWrapper.
-        try store.database?.checkpoint()
-        return try ScanPackage.makeFileWrapper(from: store)
+        try MainActor.assumeIsolated {
+            // Force WAL → main file before we hand the bytes to FileWrapper.
+            try store.database?.checkpoint()
+            return try ScanPackage.makeFileWrapper(from: store)
+        }
     }
 
     func fileWrapper(snapshot: FileWrapper, configuration: WriteConfiguration) throws -> FileWrapper {
@@ -62,6 +73,7 @@ final class ScanDocument: ReferenceFileDocument {
     /// and attach it to the store. Failures are logged but non-fatal — the
     /// store still works in memory; we'd just lose the persistent backing
     /// until the next reopen.
+    @MainActor
     private func attachFreshDatabase() {
         let cacheDir = store.blobStore.cacheDirectory
         do {

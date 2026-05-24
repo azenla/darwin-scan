@@ -31,13 +31,18 @@ import Foundation
 /// `nonisolated` so off-main work (e.g. `ItemListView`'s background filter
 /// pass) can call `matches(_:)` without an actor hop. The struct is a pure
 /// value type — no MainActor state — so this is a no-op semantically.
-nonisolated struct SearchQuery: Equatable, Sendable {
-    var freeText: String = ""
-    var filters: [Filter] = []
+public nonisolated struct SearchQuery: Equatable, Sendable {
+    public var freeText: String = ""
+    public var filters: [Filter] = []
 
-    var isEmpty: Bool { freeText.isEmpty && filters.isEmpty }
+    public init(freeText: String = "", filters: [Filter] = []) {
+        self.freeText = freeText
+        self.filters = filters
+    }
 
-    enum Filter: Equatable, Sendable, Hashable {
+    public var isEmpty: Bool { freeText.isEmpty && filters.isEmpty }
+
+    public enum Filter: Equatable, Sendable, Hashable {
         case architecture(String)
         case bundle(String)
         case app(String)
@@ -55,7 +60,7 @@ nonisolated struct SearchQuery: Equatable, Sendable {
         case minOS(String)
 
         /// User-facing label for the filter chip shown under the search box.
-        var displayLabel: String {
+        public var displayLabel: String {
             switch self {
             case .architecture(let v):  return "Arch: \(v)"
             case .bundle(let v):        return "Bundle: \(v)"
@@ -75,7 +80,7 @@ nonisolated struct SearchQuery: Equatable, Sendable {
             }
         }
 
-        var systemImage: String {
+        public var systemImage: String {
             switch self {
             case .architecture: return "cpu"
             case .bundle:       return "shippingbox"
@@ -98,7 +103,7 @@ nonisolated struct SearchQuery: Equatable, Sendable {
 
     // MARK: - Parsing
 
-    static func parse(_ input: String) -> SearchQuery {
+    public static func parse(_ input: String) -> SearchQuery {
         var query = SearchQuery()
         let tokens = tokenize(input)
         var freeTextParts: [String] = []
@@ -206,7 +211,7 @@ nonisolated struct SearchQuery: Equatable, Sendable {
     ///
     /// Uses `lowercasedName` (cached on the header) and lowercases other
     /// fields lazily — typical items don't have all of them set.
-    func matches(_ header: ItemHeader) -> Bool {
+    public func matches(_ header: ItemHeader) -> Bool {
         for filter in filters {
             if !evaluate(filter, against: header) { return false }
         }
@@ -308,15 +313,21 @@ nonisolated struct SearchQuery: Equatable, Sendable {
 }
 
 /// Static reference list shown in the search help popover.
-enum SearchHelp {
-    struct Entry: Identifiable {
-        var id: String { field }
-        let field: String
-        let example: String
-        let description: String
+public enum SearchHelp {
+    public struct Entry: Identifiable, Sendable {
+        public var id: String { field }
+        public let field: String
+        public let example: String
+        public let description: String
+
+        public init(field: String, example: String, description: String) {
+            self.field = field
+            self.example = example
+            self.description = description
+        }
     }
 
-    static let entries: [Entry] = [
+    public static let entries: [Entry] = [
         Entry(field: "arch",       example: "arch:x86_64",        description: "Mach-O architecture (arm64, arm64e, x86_64, …)"),
         Entry(field: "app",        example: "app:Time Machine",   description: "Items inside an .app bundle whose name contains this"),
         Entry(field: "bundle",     example: "bundle:CoreFoundation", description: "Items inside any kind of bundle (.app/.framework/.kext/…)"),

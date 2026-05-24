@@ -1,4 +1,5 @@
 import SwiftUI
+import DarwinScanCore
 
 @main
 struct DarwinScanApp: App {

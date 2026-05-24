@@ -41,49 +41,47 @@ import Observation
 /// the upsert to know which paths to scrub from `pathReferencedBy`. For
 /// initial scans nothing collides, so this query never fires.
 @Observable
-final class ScanStore {
-    var systemInfo: SystemInfo? {
+public final class ScanStore {
+    public var systemInfo: SystemInfo? {
         didSet { persistMeta("system_info", value: systemInfo) }
     }
-    var options: ScanOptions = ScanOptions() {
+    public var options: ScanOptions = ScanOptions() {
         didSet { persistMeta("options", value: options) }
     }
-    var lastScanStarted: Date? {
+    public var lastScanStarted: Date? {
         didSet { persistMeta("last_scan_started", value: lastScanStarted) }
     }
-    var lastScanCompleted: Date? {
+    public var lastScanCompleted: Date? {
         didSet { persistMeta("last_scan_completed", value: lastScanCompleted) }
     }
 
     /// In-memory map of all items, slim form. Full payloads come from SQLite
-    /// via `fullItem(id:)`. The name stays `items` so the rest of the app
-    /// keeps reading `store.items[id]` / `store.items.count` unchanged — the
-    /// type just narrowed from `ScanItem` to `ItemHeader`.
-    private(set) var items: [UUID: ItemHeader] = [:]
-    private(set) var itemsByPath: [String: UUID] = [:]
+    /// via `fullItem(id:)`.
+    public private(set) var items: [UUID: ItemHeader] = [:]
+    public private(set) var itemsByPath: [String: UUID] = [:]
 
     // Derived indexes — invariants enforced by upsert/remove.
-    private(set) var categoryCounts: [ItemCategory: Int] = [:]
-    private(set) var pathReferencedBy: [String: [UUID]] = [:]
-    private(set) var itemsByOwningBundle: [String: [UUID]] = [:]
+    public private(set) var categoryCounts: [ItemCategory: Int] = [:]
+    public private(set) var pathReferencedBy: [String: [UUID]] = [:]
+    public private(set) var itemsByOwningBundle: [String: [UUID]] = [:]
 
-    let blobStore: BlobStore = BlobStore()
+    public let blobStore: BlobStore = BlobStore()
 
     /// Optional persistent backing. When attached, every mutation is mirrored
-    /// to SQLite so the on-disk `data.db` stays current. The in-memory store
-    /// remains the source of truth — the database is for crash safety and a
-    /// foundation for future lazy-loading paths.
-    private(set) var database: Database?
+    /// to SQLite so the on-disk `data.db` stays current.
+    public private(set) var database: Database?
 
     /// Where the attached `data.db` lives on disk. `ScanPackage.makeFileWrapper`
     /// needs this to stream the file into the saved bundle. Set alongside
     /// `attachDatabase`.
-    var databaseURL: URL?
+    public var databaseURL: URL?
+
+    public init() {}
 
     /// Attach (or detach) the persistent database. Called by `ScanDocument`
     /// once it has decided where on disk to keep `data.db`. Subsequent
     /// `upsert`/`ingest`/`reset` calls write through.
-    func attachDatabase(_ db: Database?) {
+    public func attachDatabase(_ db: Database?) {
         self.database = db
     }
 
@@ -103,7 +101,7 @@ final class ScanStore {
 
     // MARK: - Mutation
 
-    func reset() {
+    public func reset() {
         items.removeAll()
         itemsByPath.removeAll()
         categoryCounts.removeAll()
@@ -121,7 +119,7 @@ final class ScanStore {
         }
     }
 
-    func upsert(_ item: ScanItem) {
+    public func upsert(_ item: ScanItem) {
         let written: ScanItem
         if let existingID = itemsByPath[item.path], let existing = items[existingID] {
             // Update path: tear down derived edges of the old item, then add
@@ -155,7 +153,7 @@ final class ScanStore {
     /// Persists the batch in a single SQLite transaction. We collect the
     /// post-merge items separately so the database always sees the same UUIDs
     /// the in-memory store uses (path collisions reuse the existing id).
-    func ingest(_ produced: [ScanItem]) {
+    public func ingest(_ produced: [ScanItem]) {
         // Apply to memory first, capturing the actually-stored rows so the
         // database mirrors the same UUIDs.
         var persisted: [ScanItem] = []
@@ -220,17 +218,17 @@ final class ScanStore {
 
     // MARK: - Blob access
 
-    func blob(forRef ref: String) -> Data? {
+    public func blob(forRef ref: String) -> Data? {
         blobStore.data(forRef: ref)
     }
 
     // MARK: - Queries
 
-    func items(in category: ItemCategory) -> [ItemHeader] {
+    public func items(in category: ItemCategory) -> [ItemHeader] {
         items.values.filter { $0.category == category }
     }
 
-    func item(atPath path: String) -> ItemHeader? {
+    public func item(atPath path: String) -> ItemHeader? {
         guard let id = itemsByPath[path] else { return nil }
         return items[id]
     }
@@ -242,14 +240,14 @@ final class ScanStore {
     ///
     /// Detail views use this in a `.task(id:)` so the load happens as the
     /// selection changes, not on every body re-render.
-    func fullItem(id: UUID) -> ScanItem? {
+    public func fullItem(id: UUID) -> ScanItem? {
         guard let database else { return nil }
         return try? database.item(id: id)
     }
 
     /// Headers that reference this path via outgoing relationships.
     /// O(1) lookup + O(K) materialization where K is the incoming degree.
-    func incomingReferences(toPath path: String) -> [ItemHeader] {
+    public func incomingReferences(toPath path: String) -> [ItemHeader] {
         guard let ids = pathReferencedBy[path] else { return [] }
         return ids.compactMap { items[$0] }
     }
@@ -259,21 +257,21 @@ final class ScanStore {
     /// renders the first 64; without this, viewing a popular dylib (libSystem,
     /// CoreFoundation, …) allocated a header for every binary that linked it
     /// just to slice it down to 64 rows.
-    func incomingReferencesPrefix(toPath path: String, limit: Int) -> (total: Int, items: [ItemHeader]) {
+    public func incomingReferencesPrefix(toPath path: String, limit: Int) -> (total: Int, items: [ItemHeader]) {
         guard let ids = pathReferencedBy[path] else { return (0, []) }
         let prefix = ids.prefix(limit).compactMap { items[$0] }
         return (ids.count, prefix)
     }
 
     /// Headers whose `owningBundlePath` is this path. O(1) + O(K).
-    func contents(ofBundleAtPath bundlePath: String) -> [ItemHeader] {
+    public func contents(ofBundleAtPath bundlePath: String) -> [ItemHeader] {
         guard let ids = itemsByOwningBundle[bundlePath] else { return [] }
         return ids.compactMap { items[$0] }
     }
 
     /// Legacy plain-text search retained for the simple-search code path.
     /// The richer `SearchQuery`-based filter lives in `Search/SearchQuery.swift`.
-    func search(_ query: String, scope: ItemCategory? = nil) -> [ItemHeader] {
+    public func search(_ query: String, scope: ItemCategory? = nil) -> [ItemHeader] {
         let q = query.lowercased()
         guard !q.isEmpty else {
             if let s = scope { return items(in: s) }
@@ -293,7 +291,7 @@ final class ScanStore {
     }
 
     /// Index-backed counts — drives sidebar without recomputation.
-    func counts() -> [ItemCategory: Int] {
+    public func counts() -> [ItemCategory: Int] {
         var counts: [ItemCategory: Int] = [:]
         for category in ItemCategory.allCases {
             counts[category] = categoryCounts[category] ?? 0
@@ -308,7 +306,7 @@ final class ScanStore {
     /// attached, so we suppress mirror-writes here) and historically by the
     /// legacy JSON loader. Pass `mirrorToDatabase: true` to also seed an
     /// attached database — useful when migrating a legacy JSON bundle on open.
-    func load(
+    public func load(
         items: [ScanItem],
         systemInfo: SystemInfo?,
         options: ScanOptions?,

@@ -5,7 +5,7 @@ import Foundation
 /// cache directory — we deliberately do NOT hold the bytes in worker memory
 /// (a single dyld_shared_cache strings dump can be 100+ MB; multiplied by
 /// concurrent workers that's GB-scale and a likely OOM).
-nonisolated enum StringsExtractor {
+public nonisolated enum StringsExtractor {
     /// Run `strings -n <minLen> <path>`, piping stdout straight into a file
     /// in `cacheDirectory`. The result file is hashed after writing and
     /// renamed to the content-addressed `strings-<sha>.bin` form so it
@@ -13,7 +13,7 @@ nonisolated enum StringsExtractor {
     ///
     /// Returns the blob ref on success, nil on failure. Memory cost per call
     /// is ~zero — Process pipes bytes directly through a FileHandle.
-    static func streamStrings(
+    public static func streamStrings(
         from url: URL,
         minLength: Int,
         into cacheDirectory: URL
@@ -69,7 +69,7 @@ nonisolated enum StringsExtractor {
     /// without keeping the full strings output. Reads at most 4 MB of the
     /// binary's slice; this avoids spawning `strings` and is good enough for
     /// CLI-vs-daemon classification.
-    static func grepInBinary(url: URL, needle: String, maxBytes: Int = 4 * 1024 * 1024) -> String? {
+    public static func grepInBinary(url: URL, needle: String, maxBytes: Int = 4 * 1024 * 1024) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         guard let chunk = try? handle.read(upToCount: maxBytes), !chunk.isEmpty else { return nil }

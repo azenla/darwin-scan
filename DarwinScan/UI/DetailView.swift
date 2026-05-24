@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import DarwinScanCore
 
 /// Trailing column. Renders the appropriate detail subview based on the
 /// selected item's category. Heavy on stat tiles + pill chips + clickable

@@ -1,9 +1,9 @@
 import Foundation
 
-nonisolated enum LocalizationInspector {
+public nonisolated enum LocalizationInspector {
     /// Parse a `.strings` or `.stringsdict` file. Returns the parsed key count
     /// and the language inferred from the parent `.lproj` directory name.
-    static func inspect(url: URL) -> LocalizationInfo? {
+    public static func inspect(url: URL) -> LocalizationInfo? {
         let ext = url.pathExtension.lowercased()
         switch ext {
         case "strings":     return inspectStrings(url)
@@ -14,7 +14,7 @@ nonisolated enum LocalizationInspector {
 
     /// `.lproj` directories — we list them as their own items so users can see
     /// "this bundle ships 32 languages".
-    static func inspectLprojDirectory(_ url: URL) -> LocalizationInfo? {
+    public static func inspectLprojDirectory(_ url: URL) -> LocalizationInfo? {
         let lang = languageFromLproj(url)
         return LocalizationInfo(
             kind: .lproj,

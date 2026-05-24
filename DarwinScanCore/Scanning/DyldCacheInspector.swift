@@ -18,7 +18,7 @@ import Foundation
 /// `dyld_cache_header` and starts with the `dyld_v1` magic, so they all
 /// classify here. Sidecars like `.symbols`, `.dylddata`, `.atlas`, and
 /// `.development` are NOT full caches and are filtered out by name.
-nonisolated enum DyldCacheInspector {
+public nonisolated enum DyldCacheInspector {
     /// Returns true when `filename` looks like a real cache file we can parse.
     ///
     /// Accepts:
@@ -31,7 +31,7 @@ nonisolated enum DyldCacheInspector {
     ///   - `.dylddata`    (dyld closure data)
     ///   - `.atlas`       (debugger atlas)
     ///   - `.map`, `.json`, `.txt`, `.aside`, `.t8112`, etc.
-    static func looksLikeDyldCache(filename: String) -> Bool {
+    public static func looksLikeDyldCache(filename: String) -> Bool {
         guard filename.hasPrefix("dyld_shared_cache_") else { return false }
         // Reject known non-cache sidecars by suffix.
         let rejectedSuffixes = [
@@ -48,7 +48,7 @@ nonisolated enum DyldCacheInspector {
     /// (e.g. `dyld_shared_cache_arm64e.01` -> `"arm64e"`).
     /// Used as a fallback when the in-file magic doesn't contain a clean
     /// arch token (some subcaches pad differently).
-    static func archFromFilename(_ filename: String) -> String? {
+    public static func archFromFilename(_ filename: String) -> String? {
         let prefix = "dyld_shared_cache_"
         guard filename.hasPrefix(prefix) else { return nil }
         let tail = filename.dropFirst(prefix.count)
@@ -57,7 +57,7 @@ nonisolated enum DyldCacheInspector {
         return archPart.isEmpty ? nil : archPart
     }
 
-    static func inspect(url: URL) -> DyldCacheInfo? {
+    public static func inspect(url: URL) -> DyldCacheInfo? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         guard let header = try? handle.read(upToCount: 0x200), header.count >= 0x20 else { return nil }

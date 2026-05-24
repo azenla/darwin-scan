@@ -6,11 +6,15 @@ import Foundation
 ///
 /// The walker is `nonisolated` and safe to drive from a background actor.
 /// We use `AsyncStream` so callers can iterate with `for await`.
-nonisolated struct FileWalker: Sendable {
-    let options: ScanOptions
+public nonisolated struct FileWalker: Sendable {
+    public let options: ScanOptions
+
+    public init(options: ScanOptions) {
+        self.options = options
+    }
 
     /// True if `path` (or one of its prefix segments) is in the excludes list.
-    nonisolated func isExcluded(_ path: String) -> Bool {
+    public nonisolated func isExcluded(_ path: String) -> Bool {
         for prefix in options.excludedPrefixes {
             if path == prefix || path.hasPrefix(prefix + "/") {
                 return true
@@ -21,7 +25,7 @@ nonisolated struct FileWalker: Sendable {
 
     /// Yields URLs. The returned stream completes when all roots have been
     /// fully walked or when the consumer cancels the task.
-    nonisolated func makeStream() -> AsyncStream<URL> {
+    public nonisolated func makeStream() -> AsyncStream<URL> {
         let walker = self
         return AsyncStream { continuation in
             Task.detached(priority: .userInitiated) {

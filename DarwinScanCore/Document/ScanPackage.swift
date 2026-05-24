@@ -20,15 +20,15 @@ import Foundation
 /// we parse the JSON, seed a fresh `data.db` inside the BlobStore cache, and
 /// surface the store as if it had been opened from a v3 bundle. The next save
 /// writes a v3 bundle — there's no roundtrip back to v2.
-enum ScanPackage {
+public enum ScanPackage {
     // v3 names
-    static let databaseFilename = "data.db"
-    static let blobsDirectory   = "blobs"
-    static let packageVersion   = 3
+    public static let databaseFilename = "data.db"
+    public static let blobsDirectory   = "blobs"
+    public static let packageVersion   = 3
 
     // v2 legacy names — read only.
-    static let legacyMetadataFilename = "metadata.json"
-    static let legacyItemsFilename    = "items.json"
+    public static let legacyMetadataFilename = "metadata.json"
+    public static let legacyItemsFilename    = "items.json"
 
     struct LegacyMetadata: Codable {
         var version: Int
@@ -48,7 +48,8 @@ enum ScanPackage {
     /// Caller is responsible for calling `database.checkpoint()` first so the
     /// WAL is folded into the main DB file before we read it back through
     /// `FileWrapper`.
-    static func makeFileWrapper(from store: ScanStore) throws -> FileWrapper {
+    @MainActor
+    public static func makeFileWrapper(from store: ScanStore) throws -> FileWrapper {
         var contents: [String: FileWrapper] = [:]
 
         if let db = store.database, let dbURL = store.databaseURL {
@@ -83,7 +84,8 @@ enum ScanPackage {
     /// Reads a directory FileWrapper back into the supplied store. Opens (or
     /// creates from legacy JSON) the persistent `data.db`, then attaches it to
     /// the store so subsequent scans write through.
-    static func load(into store: ScanStore, from wrapper: FileWrapper) throws {
+    @MainActor
+    public static func load(into store: ScanStore, from wrapper: FileWrapper) throws {
         guard wrapper.isDirectory, let children = wrapper.fileWrappers else {
             throw NSError(domain: "ScanPackage", code: 1, userInfo: [NSLocalizedDescriptionKey: "Not a package"])
         }

@@ -1,7 +1,7 @@
 import Foundation
 import AppKit
 
-nonisolated enum AppBundleInspector {
+public nonisolated enum AppBundleInspector {
     /// Best-effort PNG render of a bundle's primary icon. Returns the bytes
     /// for storage as a blob.
     ///
@@ -11,7 +11,7 @@ nonisolated enum AppBundleInspector {
     /// `NSBitmapImageRep` → PNG) only touches data buffers and works fine
     /// from many concurrent worker tasks. The output is the icon's natural
     /// representation rather than a forced resize, so users see crisp icons.
-    static func renderIconPNG(forBundle url: URL) -> Data? {
+    public static func renderIconPNG(forBundle url: URL) -> Data? {
         let image = NSWorkspace.shared.icon(forFile: url.path)
         guard let tiff = image.tiffRepresentation,
               let rep = NSBitmapImageRep(data: tiff) else { return nil }

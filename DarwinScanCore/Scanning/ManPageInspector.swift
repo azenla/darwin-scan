@@ -1,11 +1,11 @@
 import Foundation
 import Compression
 
-nonisolated enum ManPageInspector {
+public nonisolated enum ManPageInspector {
     /// Best-effort parse of a man page header to extract NAME and a one-line
     /// description. Handles gzipped (`.gz`) man pages, which is the dominant
     /// form on macOS — `/usr/share/man/man1/ls.1.gz`, etc.
-    static func inspect(url: URL) -> (ManPageInfo, plainTextHead: String?)? {
+    public static func inspect(url: URL) -> (ManPageInfo, plainTextHead: String?)? {
         let filename = url.lastPathComponent
         let compressed = filename.hasSuffix(".gz")
         guard let section = sectionFromPath(url.path) else { return nil }

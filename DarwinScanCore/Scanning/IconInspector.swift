@@ -2,10 +2,10 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-nonisolated enum IconInspector {
+public nonisolated enum IconInspector {
     /// Detect an icon-bearing file and produce an IconInfo + a rendered PNG
     /// preview blob. Recognises `.icns`, standalone images, and `Assets.car`.
-    static func inspect(url: URL) -> (IconInfo, previewPNG: Data?)? {
+    public static func inspect(url: URL) -> (IconInfo, previewPNG: Data?)? {
         let ext = url.pathExtension.lowercased()
         switch ext {
         case "icns":
@@ -63,7 +63,7 @@ nonisolated enum IconInspector {
     /// Render an image at `size` and return PNG bytes. Uses ImageIO
     /// (`CGImageSource`) which is fully thread-safe — safe to call from many
     /// concurrent worker tasks without any locking.
-    static func renderImagePNG(url: URL, size: CGFloat) -> Data? {
+    public static func renderImagePNG(url: URL, size: CGFloat) -> Data? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let thumbOptions: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,

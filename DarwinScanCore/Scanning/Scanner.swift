@@ -12,18 +12,20 @@ import Observation
 /// snapshots.
 @Observable
 @MainActor
-final class ScanController {
-    var progress: ScanProgress = ScanProgress()
-    var isRunning: Bool = false
-    var lastResult: ScanResult?
+public final class ScanController {
+    public var progress: ScanProgress = ScanProgress()
+    public var isRunning: Bool = false
+    public var lastResult: ScanResult?
 
     private var workerTask: Task<Void, Never>?
 
-    func cancel() {
+    public init() {}
+
+    public func cancel() {
         workerTask?.cancel()
     }
 
-    func startScan(options: ScanOptions, ingestInto store: ScanStore) {
+    public func startScan(options: ScanOptions, ingestInto store: ScanStore) {
         guard !isRunning else { return }
         isRunning = true
         progress = ScanProgress(phase: .enumerating, startedAt: Date())
@@ -68,20 +70,29 @@ final class ScanController {
     }
 }
 
-struct ScanResult: Sendable {
-    var itemCount: Int
+public nonisolated struct ScanResult: Sendable {
+    public var itemCount: Int
+
+    public init(itemCount: Int) { self.itemCount = itemCount }
 }
 
 /// Output of one inspector run, with any blob bytes already persisted to disk
 /// by the worker before this struct crosses an actor boundary.
-struct InspectResult: Sendable {
-    let item: ScanItem
-    let blobRefs: [String]
+public nonisolated struct InspectResult: Sendable {
+    public let item: ScanItem
+    public let blobRefs: [String]
+
+    public init(item: ScanItem, blobRefs: [String]) {
+        self.item = item
+        self.blobRefs = blobRefs
+    }
 }
 
 // MARK: - Worker
 
-private actor ScanWorker {
+public actor ScanWorker {
+    public init() {}
+
     /// Run a scan. Architecture: a sliding-window `TaskGroup` keeps N
     /// inspector tasks in flight at any time, where N = (activeCPUs - 1).
     /// The walker is a single producer; its iterator is pumped from this
@@ -93,7 +104,7 @@ private actor ScanWorker {
     /// `InspectResult?` so we can identify which URL just completed and
     /// remove it from the in-flight set — that's what powers the live queue
     /// view in the UI.
-    func run(
+    public func run(
         options: ScanOptions,
         blobWriter: BlobWriter,
         progressSink: @escaping @Sendable @MainActor (ScanProgress) -> Void,
@@ -207,14 +218,19 @@ private actor ScanWorker {
 /// Stateless inspector dispatcher. `Sendable` so it can be captured by the
 /// concurrent child tasks. The `BlobWriter` it carries writes to disk without
 /// any actor hops — bytes never cross thread boundaries.
-nonisolated struct ScanPipeline: Sendable {
-    let options: ScanOptions
-    let blobWriter: BlobWriter
-    let machO = MachOInspector()
+public nonisolated struct ScanPipeline: Sendable {
+    public let options: ScanOptions
+    public let blobWriter: BlobWriter
+    public let machO = MachOInspector()
+
+    public init(options: ScanOptions, blobWriter: BlobWriter) {
+        self.options = options
+        self.blobWriter = blobWriter
+    }
 
     /// Routes a URL to the appropriate inspector and returns the resulting
     /// item plus the set of blob refs we wrote to disk for it.
-    func inspect(url: URL) -> InspectResult? {
+    public func inspect(url: URL) -> InspectResult? {
         guard let (item, blobs) = classify(url: url) else { return nil }
         // Write the in-memory blobs to disk on this worker thread before
         // crossing back to MainActor — keeps peak memory low and keeps the
