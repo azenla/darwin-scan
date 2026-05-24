@@ -120,6 +120,12 @@ struct ItemListView: View {
         let query = SearchQuery.parse(rawSearchText)
         let scopeFilter = scope
 
+        // Resolve FTS-backed filters (`symbol:` / `strings:`) into a Set of
+        // allowed item IDs before the per-header filter pass runs. This
+        // does the SQLite work once per query change instead of N times
+        // per row.
+        let allowedFTS: Set<UUID>? = query.resolveFTSItemIDs(against: store)
+
         let ids = Array(store.items.keys)
         let estimated = scopeFilter.map { store.categoryCounts[$0] ?? 0 } ?? ids.count
         var keyed: [(UUID, String, String)] = []
@@ -133,6 +139,7 @@ struct ItemListView: View {
             for j in i..<end {
                 guard let header = store.items[ids[j]] else { continue }
                 if let s = scopeFilter, header.category != s { continue }
+                if let allowed = allowedFTS, !allowed.contains(header.id) { continue }
                 if !query.isEmpty && !query.matches(header) { continue }
                 // `lowercasedName` was pre-computed at header-build time, so
                 // we don't pay a `String.lowercased()` allocation here.

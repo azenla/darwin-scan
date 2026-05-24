@@ -58,6 +58,14 @@ public nonisolated struct SearchQuery: Equatable, Sendable {
         case fat(Bool)
         case privateBundle(Bool)
         case minOS(String)
+        /// FTS5-backed: matches items whose symbol table contains `value`.
+        /// Resolved via `symbols_fts` and turned into a Set<UUID> of allowed
+        /// items by `resolveFTSItemIDs(against:)` before the per-item filter
+        /// pass runs.
+        case symbol(String)
+        /// FTS5-backed: matches items whose strings dump (when extracted)
+        /// contains `value`. Same resolution path as `.symbol`.
+        case strings(String)
 
         /// User-facing label for the filter chip shown under the search box.
         public var displayLabel: String {
@@ -77,6 +85,8 @@ public nonisolated struct SearchQuery: Equatable, Sendable {
             case .fat(let b):           return b ? "Fat" : "Single-arch"
             case .privateBundle(let b): return b ? "Private" : "Public"
             case .minOS(let v):         return "minOS: \(v)"
+            case .symbol(let v):        return "Symbol: \(v)"
+            case .strings(let v):       return "Strings: \(v)"
             }
         }
 
@@ -97,6 +107,8 @@ public nonisolated struct SearchQuery: Equatable, Sendable {
             case .fat:          return "rectangle.split.2x1"
             case .privateBundle: return "lock"
             case .minOS:        return "circle.dashed"
+            case .symbol:       return "function"
+            case .strings:      return "text.magnifyingglass"
             }
         }
     }
@@ -193,6 +205,10 @@ public nonisolated struct SearchQuery: Equatable, Sendable {
             return .privateBundle(parseBool(value))
         case "min", "minos":
             return .minOS(value)
+        case "symbol", "sym":
+            return .symbol(value)
+        case "strings", "str":
+            return .strings(value)
         default:
             return nil
         }
@@ -308,7 +324,75 @@ public nonisolated struct SearchQuery: Equatable, Sendable {
 
         case .minOS(let val):
             return header.minOS?.contains(val) ?? false
+
+        case .symbol, .strings:
+            // FTS-backed filters are answered by `resolveFTSItemIDs` before
+            // this per-item pass runs. By the time we get here, the caller
+            // has already restricted the input set to items whose IDs
+            // appear in the resolved set — so any item we evaluate has
+            // already passed the filter. (We could also assert here but
+            // SearchQuery is used in performance-sensitive paths, and
+            // accepting the row is correct given the precondition.)
+            return true
         }
+    }
+
+    // MARK: - FTS resolution
+
+    /// True if the query contains any FTS-backed filter (`symbol:` /
+    /// `strings:`). Callers use this to decide whether to do the FTS
+    /// resolution pass at all.
+    public var hasFTSFilters: Bool {
+        for f in filters {
+            switch f {
+            case .symbol, .strings: return true
+            default: continue
+            }
+        }
+        return false
+    }
+
+    /// Resolve every FTS-backed filter in this query into a `Set<UUID>` of
+    /// allowed item IDs. Returns `nil` if there are no FTS filters at all
+    /// (the caller should then skip the restriction). When multiple FTS
+    /// filters are present (e.g. `symbol:foo strings:bar`), the returned
+    /// set is the **intersection** — same AND semantics as the rest of the
+    /// filter pipeline.
+    public func resolveFTSItemIDs(against store: ScanStore) -> Set<UUID>? {
+        guard let database = store.database, hasFTSFilters else { return nil }
+        var accumulated: Set<UUID>? = nil
+        for f in filters {
+            let hits: [UUID]
+            switch f {
+            case .symbol(let v):
+                let escaped = escapeFTSQuery(v) + "*"
+                let rows = (try? database.searchSymbols(query: escaped, limit: 5000)) ?? []
+                hits = rows.map(\.itemID)
+            case .strings(let v):
+                let escaped = escapeFTSQuery(v) + "*"
+                let rows = (try? database.searchStrings(query: escaped, limit: 5000)) ?? []
+                hits = rows.map(\.itemID)
+            default:
+                continue
+            }
+            let asSet = Set(hits)
+            if let prev = accumulated {
+                accumulated = prev.intersection(asSet)
+            } else {
+                accumulated = asSet
+            }
+        }
+        return accumulated
+    }
+
+    /// Wrap a user-supplied value in FTS5 quoted-phrase syntax so reserved
+    /// characters (`AND`, `OR`, `NOT`, `:`, `^`, `"`, parens) are treated
+    /// as literal text rather than operators. Anything containing double
+    /// quotes has them stripped — FTS5 has no escape syntax for them
+    /// inside a phrase.
+    private func escapeFTSQuery(_ value: String) -> String {
+        let cleaned = value.replacingOccurrences(of: "\"", with: "")
+        return "\"\(cleaned)\""
     }
 }
 
@@ -343,5 +427,7 @@ public enum SearchHelp {
         Entry(field: "fat",        example: "fat:true",           description: "Universal Mach-O binaries"),
         Entry(field: "private",    example: "private:true",       description: "Private framework"),
         Entry(field: "min",        example: "min:14.0",           description: "Minimum OS version contains this string"),
+        Entry(field: "symbol",     example: "symbol:NSURL",       description: "FTS5: items whose symbol table contains the given term (prefix match)"),
+        Entry(field: "strings",    example: "strings:libcurl",    description: "FTS5: items whose extracted strings dump contains the given term"),
     ]
 }

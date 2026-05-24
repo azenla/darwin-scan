@@ -52,6 +52,7 @@ public enum CommandLineRunner {
         await worker.run(
             options: options,
             blobWriter: writer,
+            database: store.database,
             progressSink: { snapshot in
                 progressHandler(ProgressUpdate(from: snapshot))
             },

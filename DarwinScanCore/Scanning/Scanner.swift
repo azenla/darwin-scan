@@ -47,6 +47,7 @@ public final class ScanController {
             await worker.run(
                 options: options,
                 blobWriter: writer,
+                database: store.database,
                 progressSink: { [weak self] snapshot in
                     self?.progress = snapshot
                 },
@@ -133,6 +134,7 @@ public actor ScanWorker {
     public func run(
         options: ScanOptions,
         blobWriter: BlobWriter,
+        database: Database? = nil,
         progressSink: @escaping @Sendable @MainActor (ScanProgress) -> Void,
         batchSink: @escaping @Sendable @MainActor ([InspectResult]) -> Void,
         systemInfoSink: @escaping @Sendable @MainActor (SystemInfo) -> Void
@@ -140,7 +142,7 @@ public actor ScanWorker {
         let info = SystemInfoCollector.capture()
         await systemInfoSink(info)
 
-        let pipeline = ScanPipeline(options: options, blobWriter: blobWriter)
+        let pipeline = ScanPipeline(options: options, blobWriter: blobWriter, database: database)
         let walker = FileWalker(options: options)
 
         let maxConcurrent = max(2, ProcessInfo.processInfo.activeProcessorCount - 1)
@@ -244,14 +246,23 @@ public actor ScanWorker {
 /// Stateless inspector dispatcher. `Sendable` so it can be captured by the
 /// concurrent child tasks. The `BlobWriter` it carries writes to disk without
 /// any actor hops — bytes never cross thread boundaries.
+///
+/// `database` is an optional handle the pipeline uses to push large per-item
+/// data straight into SQLite from the worker thread, bypassing the main-
+/// actor batchSink for payloads that would dominate UI thread time. Today
+/// that's used for `strings_fts` ingestion: a 10 MB strings dump tokenises
+/// in ~200 ms, and doing that on MainActor would stall every frame during
+/// the scan. The `Database` class is itself thread-safe (internal lock).
 public nonisolated struct ScanPipeline: Sendable {
     public let options: ScanOptions
     public let blobWriter: BlobWriter
+    public let database: Database?
     public let machO = MachOInspector()
 
-    public init(options: ScanOptions, blobWriter: BlobWriter) {
+    public init(options: ScanOptions, blobWriter: BlobWriter, database: Database? = nil) {
         self.options = options
         self.blobWriter = blobWriter
+        self.database = database
     }
 
     /// Routes a URL to the appropriate inspector and returns the resulting
@@ -569,6 +580,9 @@ public nonisolated struct ScanPipeline: Sendable {
         let filename = url.lastPathComponent
         let inside = isInsideBundle(path)
         let owning = owningBundle(path)
+        // Allocate the item ID early — strings_fts ingestion needs to write
+        // a row keyed by it before the ScanItem is constructed.
+        let itemID = UUID()
 
         enriched.isApple = isApplePath(path)
         enriched.isCrossPlatformTool = WellKnownCrossPlatformTools.contains(filename.lowercased())
@@ -609,6 +623,14 @@ public nonisolated struct ScanPipeline: Sendable {
                 into: blobWriter.directory
             ) {
                 enriched.stringsBlobRef = ref
+                // Tokenize the blob into FTS5 on this worker thread. Loading
+                // a multi-MB strings dump as String + calling MainActor
+                // tokenization would stall the UI; doing it inline here
+                // keeps everything off-main. The Database lock serializes
+                // FTS inserts across worker tasks.
+                if let database {
+                    indexStringsBlob(database: database, itemID: itemID, itemPath: path, ref: ref)
+                }
             }
         }
 
@@ -632,7 +654,7 @@ public nonisolated struct ScanPipeline: Sendable {
         if enriched.usageLine != nil { tags.append("cli") }
 
         return (ScanItem(
-            id: UUID(), path: path, name: filename, category: category,
+            id: itemID, path: path, name: filename, category: category,
             size: size, modifiedAt: mtime,
             sha256: options.hashFiles ? Hash.sha256(of: url) : nil,
             insideBundle: inside, owningBundlePath: owning,
@@ -699,6 +721,22 @@ public nonisolated struct ScanPipeline: Sendable {
             rels.append(Relationship(kind: .launchesProgram, targetPath: program, note: "Program"))
         }
         item.relationships = rels
+    }
+
+    // MARK: Strings FTS
+
+    /// Load a strings-dump blob from disk and ingest it into the database's
+    /// `strings_fts` virtual table. Called from the worker pipeline so the
+    /// tokenisation doesn't run on the main actor. The string content can
+    /// be tens of MB for a large dylib; we load it as Data and convert to
+    /// String once. Failures are silent — we shouldn't abort a scan for a
+    /// missing FTS row.
+    private func indexStringsBlob(database: Database, itemID: UUID, itemPath: String, ref: String) {
+        let blobURL = blobWriter.directory.appendingPathComponent("\(ref).bin")
+        guard let data = try? Data(contentsOf: blobURL, options: [.mappedIfSafe]),
+              !data.isEmpty,
+              let text = String(data: data, encoding: .utf8) else { return }
+        try? database.indexStrings(itemID: itemID, itemPath: itemPath, content: text)
     }
 
     // MARK: Heuristics
