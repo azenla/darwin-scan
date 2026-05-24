@@ -484,12 +484,23 @@ public nonisolated struct DyldCacheInfo: Codable, Hashable, Sendable {
     public var formatVersion: String?
     public var imageCount: Int?
     public var mappingCount: Int?
+    /// Number of `dyld_subcache_entry` records in this cache. For a split
+    /// cache, this counts the subcaches; for a single-file cache it's 0.
+    /// Nil if the inspector couldn't read deep enough into the header.
+    public var subCacheCount: Int?
 
-    public init(architecture: String?, formatVersion: String?, imageCount: Int?, mappingCount: Int?) {
+    public init(
+        architecture: String?,
+        formatVersion: String?,
+        imageCount: Int?,
+        mappingCount: Int?,
+        subCacheCount: Int? = nil
+    ) {
         self.architecture = architecture
         self.formatVersion = formatVersion
         self.imageCount = imageCount
         self.mappingCount = mappingCount
+        self.subCacheCount = subCacheCount
     }
 }
 

@@ -1,23 +1,33 @@
 import Foundation
 
-/// Parses the `dyld_cache_header` (just the first ~0x200 bytes) to extract
-/// architecture, mapping count, and image count.
+/// Parses the `dyld_cache_header` to extract architecture, mapping count,
+/// and image count.
 ///
-/// Cache layout reference: dyld_cache_format.h in dyld's source. Fields used
-/// here (offsets are stable across all supported macOS versions):
-///   0x00  char[16]    magic        e.g. "dyld_v1   arm64e"
-///   0x10  uint32_t    mappingOffset
-///   0x14  uint32_t    mappingCount
-///   0x18  uint32_t    imagesOffsetOld (zero on macOS 14+; image table moved)
-///   0x1C  uint32_t    imagesCountOld  (zero on macOS 14+; image table moved)
-///   ...
+/// Cache layout reference: dyld_cache_format.h in dyld's source (this code
+/// matches the dyld-1280 layout used by macOS 26):
 ///
-/// macOS 14+ split-cache notes: the on-disk layout now consists of a main
-/// cache file plus N subcache files named `dyld_shared_cache_<arch>.<NN>`
-/// (e.g. `.01`, `.02`). Each subcache file is itself a full
-/// `dyld_cache_header` and starts with the `dyld_v1` magic, so they all
-/// classify here. Sidecars like `.symbols`, `.dylddata`, `.atlas`, and
-/// `.development` are NOT full caches and are filtered out by name.
+///   0x000  char[16]    magic            e.g. "dyld_v1   arm64e"
+///   0x010  uint32_t    mappingOffset
+///   0x014  uint32_t    mappingCount
+///   0x018  uint32_t    imagesOffsetOld  (zero on macOS 14+; image table moved)
+///   0x01C  uint32_t    imagesCountOld   (zero on macOS 14+; image table moved)
+///   0x138  uint32_t    mappingWithSlideOffset
+///   0x13C  uint32_t    mappingWithSlideCount
+///   0x1C0  uint32_t    imagesOffset     (the actual image table on macOS 14+)
+///   0x1C4  uint32_t    imagesCount      (the actual image count on macOS 14+)
+///
+/// macOS 14+ split-cache notes: the on-disk layout consists of a main cache
+/// file plus N subcache files (`dyld_shared_cache_<arch>.<NN>`, e.g. `.01`,
+/// `.02`). Each subcache file is itself a full `dyld_cache_header` and
+/// starts with the `dyld_v1` magic, so they all classify here. Sidecars like
+/// `.symbols`, `.dylddata`, `.dyldreadonly`, `.dyldlinkedit`, `.atlas`,
+/// `.map`, and `.development` are NOT full caches and are filtered out by
+/// name.
+///
+/// Pre-fix bug: only `imagesCountOld` was read, which is zero on every
+/// modern cache, so the inspector reported "0 images" for every cache file
+/// it visited. The walker side of the bug — Cryptex firmlinks were treated
+/// as plain symlinks and not descended into — is fixed in FileWalker.swift.
 public nonisolated enum DyldCacheInspector {
     /// Returns true when `filename` looks like a real cache file we can parse.
     ///
@@ -33,9 +43,13 @@ public nonisolated enum DyldCacheInspector {
     ///   - `.map`, `.json`, `.txt`, `.aside`, `.t8112`, etc.
     public static func looksLikeDyldCache(filename: String) -> Bool {
         guard filename.hasPrefix("dyld_shared_cache_") else { return false }
-        // Reject known non-cache sidecars by suffix.
+        // Reject known non-cache sidecars by suffix. The dyld team has added
+        // several new sidecars over macOS releases; keep the list current or
+        // we'll waste time trying to parse them as caches and then logging a
+        // bogus rejection.
         let rejectedSuffixes = [
-            ".symbols", ".dylddata", ".atlas", ".map", ".json",
+            ".symbols", ".dylddata", ".dyldreadonly", ".dyldlinkedit",
+            ".atlas", ".map", ".json",
             ".txt", ".aside", ".dSYM"
         ]
         for suffix in rejectedSuffixes where filename.hasSuffix(suffix) {
@@ -60,7 +74,9 @@ public nonisolated enum DyldCacheInspector {
     public static func inspect(url: URL) -> DyldCacheInfo? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
-        guard let header = try? handle.read(upToCount: 0x200), header.count >= 0x20 else { return nil }
+        // Need at least through 0x1C8 to read the modern imagesCount field.
+        // Reading 1024 bytes gives us comfortable headroom for future fields.
+        guard let header = try? handle.read(upToCount: 1024), header.count >= 0x20 else { return nil }
 
         // Byte-level magic check. Avoids `String(data:encoding:.ascii)` which
         // is finicky around padding bytes and was the suspect for "0 items"
@@ -97,13 +113,30 @@ public nonisolated enum DyldCacheInspector {
         }
 
         let mappingCount = Int(header.readUInt32LE(at: 0x14))
-        let imagesCount  = Int(header.readUInt32LE(at: 0x1C))
+
+        // Prefer `imagesCountOld` (offset 0x1C) — pre-macOS-14 caches keep
+        // the count there. Fall back to the modern `imagesCount` (offset
+        // 0x1C4) for caches built by macOS 14+ where the image table was
+        // moved to support >0xFFFF images.
+        let imagesCountOld = Int(header.readUInt32LE(at: 0x1C))
+        let imagesCountNew = header.count >= 0x1C8
+            ? Int(header.readUInt32LE(at: 0x1C4))
+            : 0
+        let imagesCount = imagesCountOld != 0 ? imagesCountOld : imagesCountNew
+
+        // Subcaches: the count of dyld_subcache_entry records sitting beyond
+        // the main header (each ~0x100 bytes). Surface this so the UI can
+        // show "Subcaches: 11" for a split cache.
+        let subCacheCount: Int? = header.count >= 0x190
+            ? Int(header.readUInt32LE(at: 0x18C))
+            : nil
 
         return DyldCacheInfo(
             architecture: arch,
             formatVersion: magicText,
             imageCount: imagesCount,
-            mappingCount: mappingCount
+            mappingCount: mappingCount,
+            subCacheCount: subCacheCount
         )
     }
 }

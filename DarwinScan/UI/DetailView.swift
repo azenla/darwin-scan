@@ -753,6 +753,9 @@ private struct DyldCacheSection: View {
                 if let v = info.formatVersion { InfoRow(label: "Format Magic", value: v, monospaced: true) }
                 if let n = info.imageCount { InfoRow(label: "Images", value: "\(n)") }
                 if let m = info.mappingCount { InfoRow(label: "Mappings", value: "\(m)") }
+                if let s = info.subCacheCount, s > 0 {
+                    InfoRow(label: "Subcaches", value: "\(s)")
+                }
             }
         }
     }

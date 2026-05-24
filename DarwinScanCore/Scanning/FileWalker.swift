@@ -14,7 +14,19 @@ public nonisolated struct FileWalker: Sendable {
     }
 
     /// True if `path` (or one of its prefix segments) is in the excludes list.
+    ///
+    /// The default excludes list contains `/System/Volumes` — that's where
+    /// firmlinks point to user data — but the OS cryptex content lives at
+    /// `/System/Volumes/Preboot/Cryptexes/`, exposed via firmlinks at
+    /// `/System/Cryptexes/{OS,App,ExclaveOS}`. We carve out the cryptex
+    /// preboot subtree unconditionally so the dyld_shared_cache et al. are
+    /// scannable. Bug repro before this fix: `inspectDyldCache=true` but zero
+    /// dyldCache items appeared in the manifest, because the walker yielded
+    /// the symlink at `/System/Cryptexes/OS` without descending.
     public nonisolated func isExcluded(_ path: String) -> Bool {
+        if path.hasPrefix("/System/Volumes/Preboot/Cryptexes/") || path == "/System/Volumes/Preboot/Cryptexes" {
+            return false
+        }
         for prefix in options.excludedPrefixes {
             if path == prefix || path.hasPrefix(prefix + "/") {
                 return true
@@ -60,9 +72,23 @@ public nonisolated struct FileWalker: Sendable {
 
             guard let values = try? current.resourceValues(forKeys: keys) else { continue }
             let isSymlink = values.isSymbolicLink ?? false
-            if isSymlink && !options.followSymlinks {
-                // Still report the symlink itself — useful as evidence that, say,
-                // `/etc -> /private/etc` exists — but don't descend.
+            if isSymlink {
+                // Cryptex firmlinks (`/System/Cryptexes/{OS,App,ExclaveOS}`)
+                // are how the OS exposes the immutable cryptex partitions —
+                // they look like symlinks but point at content that's part of
+                // the system image. Always descend through them regardless of
+                // `options.followSymlinks`, since they're the only way to
+                // reach the dyld_shared_cache et al.
+                let isCryptexLink = path == "/System/Cryptexes/OS"
+                    || path == "/System/Cryptexes/App"
+                    || path == "/System/Cryptexes/ExclaveOS"
+                if isCryptexLink || options.followSymlinks {
+                    let resolved = current.resolvingSymlinksInPath()
+                    stack.append(resolved)
+                    yield(current)
+                    continue
+                }
+                // Plain old symlink — yield it as evidence but don't descend.
                 yield(current)
                 continue
             }
