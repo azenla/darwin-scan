@@ -115,8 +115,10 @@ public nonisolated final class Database: @unchecked Sendable {
         try execRaw("PRAGMA foreign_keys=OFF;")
 
         try runDDL()
-        try writeSchemaVersionIfAbsent()
+        // Prepared statements must be available before any setMeta/meta call —
+        // writeSchemaVersionIfAbsent uses them.
         try prepareStatements()
+        try writeSchemaVersionIfAbsent()
     }
 
     deinit {

@@ -74,9 +74,11 @@ public enum ScanPackage {
             contents[blobsDirectory] = FileWrapper(directoryWithFileWrappers: subdirs)
         }
 
-        let root = FileWrapper(directoryWithFileWrappers: contents)
-        root.preferredFilename = nil
-        return root
+        // Don't set `preferredFilename` on the root — modern AppKit raises
+        // an Objective-C exception when assigning nil here, and the caller
+        // (DocumentGroup, write(to:), etc.) supplies the destination path
+        // anyway.
+        return FileWrapper(directoryWithFileWrappers: contents)
     }
 
     // MARK: - Load
