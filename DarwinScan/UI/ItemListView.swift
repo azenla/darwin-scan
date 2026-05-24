@@ -29,6 +29,7 @@ struct ItemListView: View {
         case .systemInfo:        return nil
         case .allItems:          return nil
         case .category(let c):   return c
+        case .snapshot:          return nil
         }
     }
 
@@ -37,6 +38,8 @@ struct ItemListView: View {
             switch selection {
             case .systemInfo:
                 ScrollView { SystemInfoView(store: store) }
+            case .snapshot(let id):
+                ScrollView { SnapshotDetailView(store: store, snapshotID: id) }
             default:
                 VStack(spacing: 0) {
                     if !displayedFilters.isEmpty {
@@ -90,6 +93,7 @@ struct ItemListView: View {
         case .systemInfo:        return "System Info"
         case .allItems:          return "All Items"
         case .category(let c):   return c.displayName
+        case .snapshot(let id):  return "Snapshot #\(id)"
         }
     }
 
@@ -283,5 +287,170 @@ struct TagChips: View {
                     .background(Capsule().fill(.secondary.opacity(0.18)))
             }
         }
+    }
+}
+
+/// Detail view for a single snapshot row — what was captured, when, and how
+/// it differs from its parent. Reached via the Snapshots sidebar section.
+/// Read-only for now; switching the displayed snapshot to a historical row
+/// is a follow-up that needs ScanStore.loadSnapshot wired through.
+struct SnapshotDetailView: View {
+    @Bindable var store: ScanStore
+    let snapshotID: Int64
+
+    var body: some View {
+        let history = store.snapshotHistory()
+        let record = history.first(where: { $0.id == snapshotID })
+        let parent = record?.parentID.flatMap { pid in history.first(where: { $0.id == pid }) }
+
+        VStack(alignment: .leading, spacing: 16) {
+            if let record {
+                snapshotCard(record: record, parent: parent)
+                if let info = record.systemInfo {
+                    osCard(info: info)
+                }
+                if let parent {
+                    diffCard(current: record, parent: parent)
+                }
+            } else {
+                ContentUnavailableView(
+                    "Snapshot not found",
+                    systemImage: "clock.badge.questionmark",
+                    description: Text("Snapshot #\(snapshotID) is no longer in this bundle.")
+                )
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func snapshotCard(record: SnapshotRecord, parent: SnapshotRecord?) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12).fill(.tint.opacity(0.15))
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.tint)
+                }
+                .frame(width: 56, height: 56)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Snapshot #\(record.id)").font(.title2).bold()
+                    Text(record.startedAt, format: .dateTime)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    if record.completedAt == nil {
+                        Text("In progress").font(.caption).foregroundStyle(.orange)
+                    } else if let completed = record.completedAt {
+                        Text("Completed \(completed, format: .dateTime)")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                Spacer()
+                if let parent {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("Parent")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text("#\(parent.id)")
+                            .font(.callout.monospacedDigit())
+                    }
+                } else {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("Root").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.separator, lineWidth: 0.5))
+        )
+    }
+
+    private func osCard(info: SystemInfo) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "macpro.gen3").foregroundStyle(.tint)
+                Text("System").font(.headline)
+                Spacer()
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                if let p = info.productName, let v = info.productVersion {
+                    LabeledContent("OS", value: "\(p) \(v)")
+                }
+                if let b = info.productBuildVersion { LabeledContent("Build", value: b) }
+                if let h = info.hardwareModel { LabeledContent("Model", value: h) }
+                if let cpu = info.cpuBrand { LabeledContent("CPU", value: cpu) }
+                if !info.architectures.isEmpty {
+                    LabeledContent("Arch", value: info.architectures.joined(separator: ", "))
+                }
+                if let sip = info.sipStatus { LabeledContent("SIP", value: sip) }
+            }
+            .font(.callout)
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
+        )
+    }
+
+    private func diffCard(current: SnapshotRecord, parent: SnapshotRecord) -> some View {
+        // Compute the diff between this snapshot and its parent. Done at
+        // view-render time rather than precomputed because the user may
+        // never visit this card.
+        let added: Int
+        let removed: Int
+        if let db = store.database,
+           let currentSet = try? db.itemsInSnapshot(current.id),
+           let parentSet = try? db.itemsInSnapshot(parent.id) {
+            added = currentSet.subtracting(parentSet).count
+            removed = parentSet.subtracting(currentSet).count
+        } else {
+            added = 0
+            removed = 0
+        }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.branch").foregroundStyle(.tint)
+                Text("Diff vs Snapshot #\(parent.id)").font(.headline)
+                Spacer()
+            }
+            HStack(spacing: 12) {
+                statBadge("Added", count: added, color: .green, system: "plus.circle.fill")
+                statBadge("Removed", count: removed, color: .red, system: "minus.circle.fill")
+            }
+            if let parentInfo = parent.systemInfo, let curInfo = current.systemInfo,
+               let pV = parentInfo.productVersion, let cV = curInfo.productVersion,
+               pV != cV {
+                Text("OS version changed: \(pV) → \(cV)")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
+        )
+    }
+
+    private func statBadge(_ label: String, count: Int, color: Color, system: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: system).foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("\(count)").font(.title3.monospacedDigit()).bold()
+                Text(label).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 8).fill(color.opacity(0.08)))
     }
 }

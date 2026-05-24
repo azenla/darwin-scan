@@ -40,6 +40,17 @@ struct SidebarView: View {
                 }
             }
 
+            let history = store.snapshotHistory()
+            if !history.isEmpty {
+                Section("Snapshots") {
+                    ForEach(history) { snap in
+                        NavigationLink(value: SidebarSelection.snapshot(snap.id)) {
+                            SnapshotRow(record: snap, isLatest: snap.id == history.first?.id)
+                        }
+                    }
+                }
+            }
+
             if let info = store.systemInfo {
                 Section("Captured") {
                     if let v = info.productVersion {
@@ -60,8 +71,52 @@ struct SidebarView: View {
     }
 }
 
+/// One row in the Snapshots sidebar section. Shows timestamp + OS
+/// version + a "latest" tag when applicable. The full diff against
+/// the parent snapshot isn't computed here (would require N queries
+/// at render time); the user gets that view inside the snapshot's
+/// detail page.
+private struct SnapshotRow: View {
+    let record: SnapshotRecord
+    let isLatest: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: 6) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .foregroundStyle(isLatest ? Color.accentColor : Color.secondary)
+                    .imageScale(.small)
+                Text(formatTimestamp(record.startedAt))
+                    .font(.callout)
+                Spacer()
+                if isLatest {
+                    Text("latest")
+                        .font(.caption2)
+                        .foregroundStyle(.tint)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(.tint.opacity(0.18)))
+                }
+            }
+            if let v = record.systemInfo?.productVersion {
+                Text("macOS \(v)\(record.systemInfo?.productBuildVersion.map { " (\($0))" } ?? "")")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func formatTimestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+}
+
 enum SidebarSelection: Hashable {
     case systemInfo
     case allItems
     case category(ItemCategory)
+    case snapshot(Int64)
 }
