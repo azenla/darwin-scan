@@ -36,9 +36,14 @@ public nonisolated struct ScanOptions: Codable, Hashable, Sendable {
     /// When on, the raw bytes of every classified file are written into the
     /// content-addressed blob store and the resulting ref is recorded on the
     /// item (`ScanItem.fileBlobRef`). Lets `darwin-scan extract` rebuild a
-    /// directory tree from a `.darwinscan` bundle. Off by default because it
-    /// can multiply bundle size by ~5× for a /System scan.
-    public var captureFiles: Bool = false
+    /// directory tree from a `.darwinscan` bundle.
+    ///
+    /// Defaults to **true** — the user-facing pitch of DarwinScan is "capture
+    /// the system image", which is meaningless if the bytes aren't actually
+    /// captured. Content-addressing deduplicates within the scan (and across
+    /// snapshots in the same bundle), so the size cost is bounded by the
+    /// distinct content visited.
+    public var captureFiles: Bool = true
 
     /// Hard cap on the size of a file that `captureFiles` will pull into the
     /// blob store. Files above this are skipped (no ref is recorded).
@@ -63,7 +68,7 @@ public nonisolated struct ScanOptions: Codable, Hashable, Sendable {
         inspectMLModels: Bool = true,
         inspectDyldCache: Bool = true,
         maxInspectFileSize: Int64 = 256 * 1024 * 1024,
-        captureFiles: Bool = false,
+        captureFiles: Bool = true,
         maxCaptureFileSize: Int64 = 256 * 1024 * 1024,
         extractSymbols: Bool = true
     ) {

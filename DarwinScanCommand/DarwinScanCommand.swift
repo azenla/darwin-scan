@@ -153,8 +153,8 @@ struct Generate: AsyncParsableCommand {
     var extractSymbols: Bool = true
 
     @Flag(name: .long, inversion: .prefixedNo,
-          help: "Copy the bytes of every classified file into the bundle's content-addressed blob store. Required by `darwin-scan extract`.")
-    var captureFiles: Bool = false
+          help: "Copy the bytes of every classified file into the bundle's content-addressed blob store. Required by `darwin-scan extract`. (Default on.)")
+    var captureFiles: Bool = true
 
     @Option(name: .long, help: "Maximum file size (bytes) that --capture-files will pull into the blob store.")
     var maxCaptureFileSize: Int64 = 256 * 1024 * 1024
