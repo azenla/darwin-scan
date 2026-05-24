@@ -155,6 +155,37 @@ public nonisolated enum SymbolInspector {
         var out: [SymbolRow] = []
         out.reserveCapacity(min(symtab.nsyms, limits.maxSymbols))
 
+        // Pre-collect every section across all LC_SEGMENT_64s so we can
+        // (a) find the __objc_classname string pool and (b) read its
+        // bytes by file offset. This is the cheap path to Obj-C class
+        // names that don't show up in LC_SYMTAB (modern stripped Apple
+        // binaries hide their `_OBJC_CLASS_$_*` exports). We deliberately
+        // do NOT walk __objc_classlist + chase pointers through the
+        // objc_class -> class_ro_t -> name chain — that needs fixup-
+        // chain handling and per-binary slide arithmetic. Reading the
+        // raw string pool is partial: it captures every name the
+        // compiler emitted, including some method/protocol/IVAR names,
+        // not just classes. But it's strictly additive: the user can
+        // search for "FoundationXPCSomething" and find it whether it
+        // was a class, method, or protocol name.
+        let objcNames = readObjCNameSections(
+            sliceBytes: sliceBytes,
+            sliceMagic: sliceMagic,
+            isBig: isBig,
+            sliceOffset: sliceOffset,
+            handle: handle,
+            limits: limits
+        )
+        for (name, kind) in objcNames {
+            if out.count >= limits.maxSymbols { break }
+            out.append(SymbolRow(
+                itemID: itemID,
+                name: name,
+                demangled: nil,
+                kind: kind
+            ))
+        }
+
         for i in 0..<symtab.nsyms {
             if out.count >= limits.maxSymbols { break }
             let base = i * 16
@@ -297,6 +328,112 @@ public nonisolated enum SymbolInspector {
         let nsyms: Int
         let stroff: UInt64
         let strsize: Int
+    }
+
+    // MARK: - ObjC section extraction
+
+    /// Read the contents of any `__objc_classname` / `__objc_methname` /
+    /// `__objc_methtype` section in the slice's `__TEXT` segment and
+    /// split the bytes into null-terminated strings. Each string is
+    /// returned alongside the SymbolRow.Kind we'll tag it with.
+    ///
+    /// Classification heuristic: bytes inside `__objc_classname` are
+    /// Obj-C class names (also used for category targets and protocol
+    /// names — close enough). `__objc_methname` is method selectors —
+    /// we tag those as `.function`. `__objc_methtype` is type
+    /// encodings ("v@:") and we skip them.
+    private static func readObjCNameSections(
+        sliceBytes: Data,
+        sliceMagic: UInt32,
+        isBig: Bool,
+        sliceOffset: UInt64,
+        handle: FileHandle,
+        limits: Limits
+    ) -> [(String, SymbolRow.Kind)] {
+        let ncmds = sliceBytes.readUInt32(at: 16, bigEndian: isBig)
+        var cursor = 32
+        var found: [(String, SymbolRow.Kind)] = []
+        var totalReadBytes = 0
+        let perSectionCap = 4 * 1024 * 1024 // 4 MB cap per section.
+
+        for _ in 0..<Int(ncmds) {
+            guard cursor + 8 <= sliceBytes.count else { break }
+            let cmd     = sliceBytes.readUInt32(at: cursor + 0, bigEndian: isBig)
+            let cmdsize = sliceBytes.readUInt32(at: cursor + 4, bigEndian: isBig)
+            guard cmdsize >= 8, cursor + Int(cmdsize) <= sliceBytes.count else { break }
+            // LC_SEGMENT_64 = 0x19. The struct layout: cmd(4), cmdsize(4),
+            // segname[16], vmaddr(8), vmsize(8), fileoff(8), filesize(8),
+            // maxprot(4), initprot(4), nsects(4), flags(4) = 72 bytes,
+            // then nsects × 80-byte section_64 records.
+            if cmd == 0x19 {
+                let segNameStart = cursor + 8
+                let segName = readFixedCString(sliceBytes, at: segNameStart, length: 16)
+                let nsects = Int(sliceBytes.readUInt32(at: cursor + 64, bigEndian: isBig))
+                // Only scan __TEXT for ObjC string pools — that's where
+                // the toolchain puts them. Looking at every segment
+                // would also catch __DATA_CONST/__objc_classlist but
+                // those are pointer arrays, not strings.
+                if segName == "__TEXT" {
+                    var sectCursor = cursor + 72
+                    for _ in 0..<nsects {
+                        guard sectCursor + 80 <= cursor + Int(cmdsize) else { break }
+                        let sectName = readFixedCString(sliceBytes, at: sectCursor, length: 16)
+                        let _ = readFixedCString(sliceBytes, at: sectCursor + 16, length: 16) // segname
+                        let _ = sliceBytes.readUInt64(at: sectCursor + 32, bigEndian: isBig) // addr
+                        let size = sliceBytes.readUInt64(at: sectCursor + 40, bigEndian: isBig)
+                        let offset = UInt64(sliceBytes.readUInt32(at: sectCursor + 48, bigEndian: isBig))
+                        sectCursor += 80
+                        let kind: SymbolRow.Kind?
+                        switch sectName {
+                        case "__objc_classname": kind = .objcClass
+                        case "__objc_methname":  kind = .function
+                        default:                 kind = nil
+                        }
+                        guard let kind else { continue }
+                        guard size > 0, size <= UInt64(perSectionCap) else { continue }
+                        let absOffset = sliceOffset + offset
+                        do {
+                            try handle.seek(toOffset: absOffset)
+                        } catch { continue }
+                        guard let bytes = try? handle.read(upToCount: Int(size)),
+                              bytes.count == Int(size) else { continue }
+                        totalReadBytes += bytes.count
+
+                        // Split null-terminated strings; tag each by `kind`.
+                        var start = bytes.startIndex
+                        for i in bytes.indices {
+                            if bytes[i] == 0 {
+                                if i > start {
+                                    let raw = bytes[start..<i]
+                                    if let s = String(data: raw, encoding: .utf8),
+                                       !s.isEmpty {
+                                        found.append((s, kind))
+                                        if found.count >= limits.maxSymbols { break }
+                                    }
+                                }
+                                start = bytes.index(after: i)
+                            }
+                        }
+                    }
+                }
+            }
+            cursor += Int(cmdsize)
+        }
+        return found
+    }
+
+    /// Read a fixed-width name field (segname / sectname). The field is
+    /// space-or-null padded; trailing zeros are dropped.
+    private static func readFixedCString(_ data: Data, at offset: Int, length: Int) -> String {
+        guard offset + length <= data.count else { return "" }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(length)
+        for i in 0..<length {
+            let b = data[data.startIndex.advanced(by: offset + i)]
+            if b == 0 { break }
+            bytes.append(b)
+        }
+        return String(bytes: bytes, encoding: .utf8) ?? ""
     }
 }
 
