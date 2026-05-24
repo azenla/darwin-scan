@@ -2,10 +2,13 @@
 
 A macOS app that catalogues everything interesting in the **system image** —
 NOT user data. Default roots: `/System` (excluding `/System/Volumes` but
-including cryptexes), `/bin`, `/sbin`, `/usr` (excluding `/usr/local`).
+walking the cryptex firmlinks at `/System/Cryptexes/{OS,App,ExclaveOS}`),
+`/bin`, `/sbin`, `/usr` (excluding `/usr/local`).
 
-Stores results in a `.darwinscan` directory package so multiple scans can be
-diffed by SHA-256.
+Stores results in a `.darwinscan` directory package. Each scan is recorded
+as a snapshot row chained off the previous; with `--capture-files` set, the
+original bytes of every classified file are kept in the content-addressed
+blob store so `darwin-scan extract` can rebuild the source tree.
 
 ## Build
 
@@ -22,17 +25,28 @@ The top-level **Run** group in the project navigator surfaces the built
 
 ## CLI
 
-`darwin-scan` ships next to the app target as a separate scheme.
+`darwin-scan` ships next to the app target as a separate scheme. Two
+subcommands:
 
 ```sh
-# Generate a scan bundle the GUI can open
+# generate (default) — produce a .darwinscan bundle
 darwin-scan generate LocalSystem.darwinscan
 
 # Restrict scope, skip hashing for a fast structural scan
 darwin-scan generate --roots /usr/bin --no-hash-files --no-index-man-pages out.darwinscan
 
+# Capture file bytes so the bundle is self-contained for later extraction
+darwin-scan generate --capture-files --extract-strings full.darwinscan
+
+# Extract symbols (default on); off for a much faster scan if you don't care
+darwin-scan generate --no-extract-symbols quick.darwinscan
+
+# extract — rebuild the captured directory tree from a bundle
+darwin-scan extract full.darwinscan /tmp/recreated
+
 # Every ScanOptions toggle is exposed; see --help.
 darwin-scan generate --help
+darwin-scan extract --help
 ```
 
 When run from `BUILT_PRODUCTS_DIR` the framework is loaded via the
@@ -55,14 +69,15 @@ DarwinScan/                        # App target (SwiftUI)
 
 DarwinScanCore/                    # Framework — all non-UI logic. Both app and CLI link this.
 ├── Models/                        # ScanItem, ScanOptions, ScanProgress, SystemInfo
-├── Document/                      # ScanPackage, ScanStore, BlobStore, Database
-├── Scanning/                      # Scanner + per-domain Inspectors + FileWalker + StringsExtractor
-├── Search/                        # SearchQuery (parser + evaluator)
+├── Document/                      # ScanPackage, ScanStore, BlobStore, Database, Extract
+├── Scanning/                      # Scanner + per-domain Inspectors + FileWalker
+│                                  # + StringsExtractor + SymbolInspector
+├── Search/                        # SearchQuery (parser + evaluator + FTS resolution)
 ├── Utilities/                     # Hash, ByteFormat, SystemInfoCollector
 └── CommandLineRunner.swift        # Synchronous-style scan driver for the CLI
 
 DarwinScanCommand/                 # CLI target (ArgumentParser)
-└── DarwinScanCommand.swift        # `darwin-scan generate <output>.darwinscan`
+└── DarwinScanCommand.swift        # `darwin-scan generate` + `darwin-scan extract`
 
 DarwinScanCoreTests/               # Swift Testing — framework unit tests (no app dependency)
 DarwinScanTests/                   # Swift Testing — app-level integration tests (hosted in DarwinScan.app)
@@ -101,28 +116,31 @@ MainActor default actor isolation.
 ┌─────────────────────────┐         ┌──────────────────────────────────────┐
 │ ScanDocument            │         │ ScanPipeline (Sendable struct)       │
 │  ReferenceFileDocument  │         │  - classifies one URL → ScanItem     │
-│  ObservableObject       │         │  - populates context + relationships │
+│  ObservableObject       │         │  - extracts symbols / strings        │
 │   └─ store (ScanStore)  │         │  - writes blob bytes to disk via     │
-└─────────────────────────┘         │    BlobWriter before returning       │
-            │                       └──────────────────────────────────────┘
-            ▼                                    │
-┌─────────────────────────┐                      ▼
-│ ScanStore               │         ┌──────────────────────────┐
-│  @Observable @MainActor │         │ Inspectors               │
-│  items: [UUID:ScanItem] │         │  MachOInspector          │
-│  itemsByPath            │         │  PlistInspector          │
-│  blobStore: BlobStore   │ ──────▶ │  AppBundleInspector      │
+└─────────────────────────┘         │    BlobWriter                        │
+            │                       │  - tokenises strings → strings_fts   │
+            ▼                       │    directly on the worker thread     │
+┌─────────────────────────┐         └──────────────────────────────────────┘
+│ ScanStore               │                      │
+│  @Observable nonisolated│         ┌──────────────────────────┐
+│  items: [UUID:ItemHdr]  │         │ Inspectors (nonisolated) │
+│  itemsByPath            │ ──────▶ │  MachOInspector          │
+│  currentSnapshotID      │         │  SymbolInspector         │
+│  blobStore: BlobStore   │         │  PlistInspector          │
+│  database: Database     │         │  AppBundleInspector      │
 └─────────────────────────┘         │  MLModelInspector / etc. │
-            │                       │  (all `nonisolated`)     │
-            ▼                       └──────────────────────────┘
-┌─────────────────────────┐
-│ BlobStore               │
-│  @Observable @MainActor │
-│  refs: Set<String>      │  ← lightweight registry; bytes live on disk
-│  cacheDirectory: URL    │
-│  loadedWrappers (after  │
-│   document open)        │
-└─────────────────────────┘
+            │                       └──────────────────────────┘
+            ▼
+┌─────────────────────────┐         ┌──────────────────────────┐
+│ BlobStore (nonisolated) │         │ Database (nonisolated,   │
+│  refs: Set<String>      │         │   thread-safe via lock)  │
+│  cacheDirectory: URL    │         │  items + 28 hot columns  │
+│  + copy(from:ref:) for  │ ◀─────▶ │  symbols + symbols_fts   │
+│  whole-file capture     │         │  strings_fts (contentless│
+└─────────────────────────┘         │  snapshots / snapshot_   │
+                                    │  items / blobs / tags    │
+                                    └──────────────────────────┘
 ```
 
 `ScanItem` is a single discriminated record (one row per discovered thing).
@@ -173,26 +191,39 @@ arch:x86_64 app:"Time Machine" tag:cli       # AND across filters
 foo arch:arm64                                # filters + free text
 bundle:CoreFoundation                         # any kind of bundle
 private:true lang:en                          # boolean + value filters
+symbol:NSURL                                  # FTS5: name in symbol table
+strings:libcurl                               # FTS5: term in strings dump
 ```
 
 Tokenizer respects `"quoted strings"` so values can contain spaces. Unknown
 `field:value` pairs fall through to free text (no silent zeroing out of
 results). Field aliases are intentional (`arch` / `architecture` /
 `abi`; `framework` / `fw`; `kext` / `extension`; `lang` / `language` /
-`locale`; …).
+`locale`; `symbol` / `sym`; `strings` / `str`; …).
 
 Free text matches across `name`, `path`, `context`, `tags`,
 `executable.usageLine`, `application.bundleIdentifier`, and
 `launchService.label`. Lowercased once per call to keep the per-item cost
 near-zero — every filter is a substring test on already-lowered fields.
 
+**FTS-backed filters** (`symbol:` / `strings:`) can't be answered from the
+in-memory `ItemHeader`. `SearchQuery.resolveFTSItemIDs(against:)` runs a
+SQLite FTS5 MATCH query for each FTS filter, intersects the resulting
+item-id sets, and returns a `Set<UUID>` of allowed items. `ItemListView`
+calls this once per query change and uses the set as a pre-filter before
+the per-row `matches()` pass. Values are wrapped in FTS5 phrase syntax
+(`"…"`) so reserved tokens like `AND` / `OR` / `:` in user input are
+treated as literal text.
+
 **Wired into `ItemListView`** via `.searchable`. The list shows recognized
 filters as pill chips above the table; the `?` toolbar button opens a help
 popover (driven by `SearchHelp.entries`) listing every field and example.
 
 **Adding a new filter:** extend `SearchQuery.Filter`, add a case to
-`filter(field:value:)`, `displayLabel`, `systemImage`, and `evaluate`. If it
-needs an index to be fast, add the index to `ScanStore`.
+`filter(field:value:)`, `displayLabel`, `systemImage`, and `evaluate`. For
+substring-on-header filters that's all. For an FTS-backed filter, add a
+case to `resolveFTSItemIDs` and have `evaluate` return `true` (the FTS
+pass handles restriction). Add a `SearchHelp.entries` entry either way.
 
 ## Graph model
 
@@ -213,25 +244,42 @@ needs an index to be fast, add the index to `ScanStore`.
 
 ```
 MyScan.darwinscan/
-├── data.db           # SQLite (schema v1): items + relationships + meta
+├── data.db           # SQLite (schema v2): see table list below
+├── format.txt        # one-line version stamp: "darwinscan v4"
 └── blobs/
     └── <2-char prefix>/
-        └── <ref>.bin # content-addressed payload (icon PNG, strings dump…)
+        └── <ref>.bin # content-addressed payload (icon PNG, strings dump,
+                      # whole-file capture, etc.)
 ```
 
-(Bundle format version 3.)
+(Bundle format version 4. Bundle format v2 — legacy JSON manifest — and
+v3 — earlier denormalised-light SQLite — both fail to open with
+`ScanPackage.LoadError.unsupportedFormat` and instruct the user to
+re-scan. There is no in-place migration; the column surface changed too
+much for a safe one.)
 
-The SQLite database has three tables:
+The SQLite database has these tables — every field a query is likely to
+filter or sort on is its own indexed column:
 
-| Table          | Shape                                                                 |
-|----------------|-----------------------------------------------------------------------|
-| `meta`         | `(key TEXT PK, value BLOB)` — schema_version, system_info JSON, options JSON, timestamps |
-| `items`        | `(id TEXT PK, path UNIQUE, category, owning_bundle_path, payload BLOB)` — payload is the full ScanItem JSON; denormalised columns exist only to support `category` and `owning_bundle_path` indexes |
-| `relationships`| `(source_id, kind, target_path, note, PRIMARY KEY (source_id, kind, target_path))` — indexed on both `source_id` and `target_path` |
+| Table             | Purpose                                                                |
+|-------------------|------------------------------------------------------------------------|
+| `meta`            | `(key TEXT PK, value BLOB)` — schema_version, system_info JSON, options JSON, timestamps |
+| `snapshots`       | `(id INTEGER PK, parent_id, label, started_at REAL, completed_at REAL)` — append-only scan history; the chain is the diff backbone |
+| `items`           | Items table — 28 columns + a `payload BLOB`. Denormalised: `path`, `name`, `category`, `size`, `modified_at`, `sha256`, `inside_bundle`, `owning_bundle_path`, `context`, `macho_kind`/`macho_platform`/`macho_min_os`/`macho_sdk`/`macho_is_fat`/`macho_is_apple`/`macho_is_xplat`/`macho_usage`, `bundle_identifier`/`bundle_short_version`/`bundle_version`/`bundle_display_name`/`bundle_exec_name`/`is_private_bundle`, `language`, `icon_blob_ref`, `strings_blob_ref`, `file_blob_ref`. The `payload` blob holds the full ScanItem JSON for fields not promoted to columns (per-category structs etc.). Indexes on `path` (UNIQUE), `category`, `owning_bundle_path`, `sha256`, `bundle_identifier`, `language`. |
+| `snapshot_items`  | `(snapshot_id, item_id, PK (snapshot_id, item_id))` — membership |
+| `tags`            | `(item_id, tag, PK (item_id, tag))` — chips for UI display + tag-filter |
+| `architectures`   | `(item_id, arch, PK (item_id, arch))` — supports `arch:` filter without JSON decode |
+| `relationships`   | `(source_id, kind, target_path, target_id, note, PK (source_id, kind, target_path))` — `target_id` is reserved for finalize-time path-to-id resolution; today it's always NULL |
+| `symbols`         | `(id INTEGER PK, item_id, name, demangled, kind, library_ordinal)` — populated by `SymbolInspector` |
+| `symbols_fts`     | FTS5 virtual table, `content='symbols'`, mirrors `symbols.name` + `symbols.demangled` via AFTER INSERT / AFTER DELETE triggers |
+| `strings_fts`     | FTS5 virtual table, **contentless** (`content=''`), holds `(item_id UNINDEXED, item_path UNINDEXED, content)` for the strings-dump tokens of each item |
+| `blobs`           | `(ref PK, sha256, size, kind)` — registry of every blob in `blobs/`; lookup by ref or sha256 |
 
 WAL mode + `synchronous=NORMAL`. Writes are transactional: `ScanStore.ingest`
-batches one transaction per ~250 ms flush. Reads only happen at document
-open (`Database.allItems` populates the in-memory dictionary).
+batches one transaction per ~250 ms flush (items + tags + architectures +
+relationships + snapshot_items, all together). Reads happen at document
+open (`Database.allItems` populates the in-memory `ItemHeader` map) and
+on-demand for the heavy `ScanItem` payload via `Database.item(id:)`.
 
 When a document is **open**, the live `data.db` lives in
 `~/Library/Caches/io.zenla.DarwinScan/session-<uuid>/data.db` alongside the
@@ -241,13 +289,20 @@ bundle. On open we copy `data.db` out of the bundle into a fresh session
 cache dir and attach it — that way the saved bundle stays untouched while
 the user works.
 
-**Legacy v2 bundles** (with `items.json` + `metadata.json`) still open:
-`ScanPackage.load` detects them, parses the JSON, seeds a fresh `data.db`
-in the session cache, and prints `[ScanPackage] Migrated legacy v2 bundle
-to SQLite`. The next save writes a v3 bundle — there's no roundtrip back.
+`<ref>` is `<hint>-<sha256-hex>`, e.g. `icon-3a4f...`, `strings-9b21...`,
+`file-a97c...` (whole-file capture), `appicon-5d0e...`. Sharding by 2-char
+prefix mirrors git's loose-object scheme.
 
-`<ref>` is `<hint>-<sha256-hex>`, e.g. `icon-3a4f...`, `strings-9b21...`.
-Sharding by 2-char prefix mirrors git's loose-object scheme.
+### FTS5 maintenance gotcha
+
+`clearItems()` can't use `INSERT INTO strings_fts(strings_fts) VALUES
+('delete-all')` because that command isn't supported on contentless FTS5
+tables. The implementation does `DROP TABLE strings_fts; CREATE VIRTUAL
+TABLE strings_fts ...;` inside the transaction, then re-prepares the
+`insertStringsFTS` and `deleteStringsFTSForItem` statements — they point
+at the now-invalidated virtual table. The `symbols_fts` side uses the
+external-content `content='symbols'` mode so the per-row triggers handle
+the bookkeeping on DELETE FROM symbols.
 
 ## Default scan scope
 
@@ -291,9 +346,26 @@ thumbnail).
 
 ## Recipe — adding a new field to an existing payload
 
-Just add the field with a sensible default (`var newField: T? = nil`). Old
-`.darwinscan` bundles continue to decode because JSONDecoder tolerates
-missing keys when the property has a default.
+Two cases:
+
+1. **The field rides in `payload`** (most fields). Add it to the struct
+   with a sensible default (`var newField: T? = nil`). Existing
+   `.darwinscan` bundles continue to decode because JSONDecoder tolerates
+   missing keys when the property has a default. No schema change.
+
+2. **The field needs to be queryable / filterable**. Promote it to a
+   real column on `items`:
+   - Add the field to the struct (same as case 1) so it round-trips
+     through `payload`.
+   - Add a column in `Database.runDDL()` and a bind in
+     `Database.upsertItemLocked` (these two must stay in lockstep).
+   - Decide if it needs an index — anything that's the LHS of a `WHERE`
+     in a hot query path probably does.
+   - Bump `Database.currentSchemaVersion` and `ScanPackage.packageVersion`
+     / `formatStampLine` if the change is incompatible. There is no
+     in-place migration today (bundle v4 dropped legacy v2/v3 readers
+     entirely); a future migration framework would handle this, but
+     until then a schema bump means "old bundles fail to open."
 
 ## Mach-O parsing
 
@@ -306,20 +378,77 @@ FAT binaries: parses the fat header, then descends into the first slice for
 load-command data. The extra arch names are recorded for the architecture
 list but not re-parsed (load commands repeat).
 
+`Scanning/SymbolInspector.swift` does a separate Mach-O parse on
+`.executable` / `.framework` items when `options.extractSymbols` is on.
+Reads up to 64 KB of slice header, walks load commands looking for
+LC_SYMTAB, then reads the nlist_64 table + string table from the file
+(both can be tens of MB — bounded by `Limits.maxStringTableBytes`). Each
+external symbol is classified by name pattern:
+
+- `_OBJC_CLASS_$_…` → `.objcClass`, `_OBJC_METACLASS_$_…` → `.objcMetaClass`
+- `_$s…` / `_$S…` (Swift mangled) → `.swiftClass` / `.swiftStruct`
+- N_UNDF symbols → `.undefined` (imports)
+- everything else → `.function`
+
+LC walk gotcha: the load-command iterator must accept `cmdsize >= 8`, not
+`cmdsize >= 24` — a too-strict minimum would skip past LC_BUILD_VERSION /
+LC_UUID / LC_VERSION_MIN_* (all 24-byte commands that often precede
+LC_SYMTAB) and break out of the loop without finding the symtab. The bug
+that motivated this comment returned 0 symbols from every binary whose
+LC_SYMTAB wasn't the first command.
+
+Modern Apple binaries on disk rarely expose Obj-C class names as
+LC_SYMTAB externals — the toolchain ships them as section data
+referenced from `__objc_classlist`, and the bulk of system Obj-C lives
+inside the dyld_shared_cache. SymbolInspector's name-pattern path will
+correctly return zero `objcClass` rows on those binaries; the
+`__objc_classlist` section walk is a deferred follow-up. The
+LC_SYMTAB path still picks up imports, function exports, Swift mangled
+symbols, and Obj-C class exports from anything not stripped.
+
+## DYLD shared cache + cryptex firmlinks
+
+`Scanning/DyldCacheInspector.swift` parses the `dyld_cache_header`. On
+macOS 14+ the image table moved: `imagesCountOld` at offset 0x1C is always
+zero, and the real count is `imagesCount` at offset 0x1C4. Inspector
+prefers the legacy slot when populated and falls back to the modern
+field. Also surfaces `subCacheCount` (offset 0x18C) so the detail view
+can show "Subcaches: N" for a split cache.
+
+`FileWalker` treats `/System/Cryptexes/{OS,App,ExclaveOS}` as cryptex
+firmlinks: it resolves them through `resolvingSymlinksInPath()` and walks
+the target subtree under `/System/Volumes/Preboot/Cryptexes/`,
+regardless of `options.followSymlinks`. The `isExcluded()` predicate
+also carves `/System/Volumes/Preboot/Cryptexes/` out of the
+`/System/Volumes` exclude. Without this special-casing the
+dyld_shared_cache wasn't visible on macOS 14+.
+
 ## Concurrency
 
-- `ScanStore`, `ScanDocument`, `ScanController`, `BlobStore` are
-  `@MainActor`-isolated.
+- `ScanController` is `@Observable @MainActor` — drives the SwiftUI scan
+  state binding (`isRunning`, `progress`).
+- `ScanStore`, `ScanDocument`, `BlobStore` are explicitly `nonisolated`
+  (overriding the project's `@MainActor` default), because SwiftUI's
+  `ReferenceFileDocument` invokes `init(configuration:)` / `snapshot` /
+  `fileWrapper` from background threads — making the document MainActor-
+  isolated would trap in `assumeIsolated`. Mutations to the store happen
+  through `@Sendable @MainActor` sinks from the worker, so the
+  observable invariants still hold.
 - `ScanWorker` is an `actor` with its own isolation domain.
 - `ScanPipeline` is a `nonisolated struct: Sendable` — child tasks of the
   worker's TaskGroup execute its methods directly, without any actor hops.
 - `BlobWriter` is `nonisolated struct: Sendable` and just carries a directory
   URL. Concurrent writes to distinct files are safe on APFS.
+- `Database` is `nonisolated final class @unchecked Sendable` with an
+  internal `os_unfair_lock` — passable through to the worker pipeline so
+  that strings tokenisation, symbol inserts, and snapshot bookkeeping
+  can all happen off the main actor.
 - Inspectors and `FileWalker` are `nonisolated` so the pipeline can call
   them synchronously.
 - Progress and batch ingestion cross actor boundaries via
   `@Sendable @MainActor` closures (`progressSink`, `batchSink`,
-  `systemInfoSink`).
+  `systemInfoSink`). FTS5 strings-index writes deliberately do NOT —
+  they go through the `Database` handle directly from the worker.
 
 If you see a "main actor-isolated X in a synchronous nonisolated context"
 warning when adding a helper, the fix is almost always: add `nonisolated`
@@ -327,36 +456,50 @@ to the declaration (type, extension, or `let`).
 
 ## Storage decisions
 
-- **JSON for the manifest** because it's diff-friendly, human-inspectable, and
-  fine up to tens of thousands of items. SQLite would scale further but adds
-  complexity; defer it until a real scan blows past JSON's comfort zone.
-- **Content-addressed blobs** so identical icons across 50 apps occupy one
-  blob. Hashing twice is cheaper than storing duplicates.
-- **`sha256` field on every ScanItem** so cross-scan diff is a simple set
-  comparison.
+- **Denormalised SQLite (schema v2)** for the manifest. Every field a
+  query is likely to filter or sort on is its own column with an index;
+  the residual fields (per-category discriminated payloads, plus the
+  full relationship list) live in a `payload BLOB` per item that's only
+  decoded on detail-view open. The old "JSON-first" framing was retired
+  in bundle format v4 — substring filters on architecture, bundle id,
+  platform, language, etc. all paid an O(N) JSON decode pass under it.
+- **Content-addressed blobs** so identical icons across 50 apps occupy
+  one blob. Hashing twice is cheaper than storing duplicates. With
+  `--capture-files`, the whole file bytes (`file-<sha256>` blobs) also
+  dedupe across the scan — a dylib shipped under five framework paths
+  costs one blob.
+- **`sha256` field on every ScanItem** so cross-scan diff is a simple
+  set comparison and the blob registry is queryable by content.
+- **Snapshot rows** capture the temporal dimension: every scan opens a
+  `snapshots` row chained to the previous via `parent_id` and writes
+  membership into `snapshot_items`. The diff command itself is
+  deferred, but the foundation is in place.
 
 ## SQLite design notes
 
-The manifest is SQLite (see schema above). The store keeps an in-memory
-`[UUID: ScanItem]` dictionary as the source of truth at runtime — every
-`upsert` and `ingest` mirrors into SQLite via `Database.upsertItem(s)`,
-and `reset()` mirrors into `clearItems`. We did NOT remove the in-memory
-dictionary: this migration was about persistence (incremental writes
-during scan, no full-manifest JSON rewrite on save, no crash-loss risk)
-rather than memory reduction. A future change can flip this around
-(SQLite as primary, in-memory as a working set) once we want lazy
-loading; the `Database` API already supports it.
+The store keeps an in-memory `[UUID: ItemHeader]` dictionary plus a few
+derived indexes as the working set for sidebar / list / search. Full
+`ScanItem` payloads come from SQLite via `Database.item(id:)` on detail-
+view selection. This is the "SQLite primary, in-memory working set"
+arrangement — for a /System scan it's ~5-10× less RAM than holding full
+`ScanItem`s in memory.
 
-Why ScanItem stays a JSON blob in the `items.payload` column rather than
-denormalised columns: the model has 11+ optional discriminated payload
-structs and would balloon the schema. Hot query paths (`item(atPath:)`,
-`items(in:)`, `contents(ofBundleAtPath:)`) all hit dedicated columns +
-indexes. The `payload` column is only read in bulk on document open.
+Why some fields are denormalised columns AND some stay in `payload`:
+the model has 11+ optional discriminated payload structs (Executable,
+App, Framework, LaunchService, MLModel, …) and a per-item
+`relationships` array; promoting *every* field would balloon the
+schema and the migration churn. So we promoted exactly the fields that
+queries / sort orders / FTS pre-resolution actually touch — the rest
+ride in `payload`, which is the **only column read on document open**
+that requires a JSON decode and is **never** read during ordinary
+filter passes.
 
 Why content-addressed blobs stay as files outside SQLite: a single
-strings-dump blob can be 50+ MB, and SQLite BLOBs aren't great at that
-size. Files in `blobs/<2-prefix>/<ref>.bin` are also straightforward to
-diff between bundles with `git diff` or `diff -r`.
+strings-dump blob can be 50+ MB and a `--capture-files` whole-binary
+blob can be 200 MB+; SQLite BLOBs aren't great at that size. Files in
+`blobs/<2-prefix>/<ref>.bin` are also straightforward to diff between
+bundles with `git diff` or `diff -r`, and `darwin-scan extract` just
+`copyItem`s them out (APFS clonefile under the hood).
 
 **Sendable / actor isolation gotcha:** the project's
 `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` means all model types
@@ -369,19 +512,35 @@ conformance of X to Decodable cannot be used in nonisolated context".
 
 ## Known follow-ups (not yet built)
 
-- Code signature parsing for team identifier extraction (we detect
+- **Cross-scan diff command.** Schema and snapshot bookkeeping are done
+  (`snapshots`, `snapshot_items`, `Database.itemsInSnapshot`) but no
+  user-facing command or view walks the chain yet. Needs item-identity
+  changes first to be truly useful — see next bullet.
+- **Multi-version items per path + deterministic IDs.** Today `items`
+  has `path UNIQUE`, so re-scanning replaces the row rather than
+  versioning. For a real diff, drop the unique constraint, key items
+  by `UUID(uuidString: SHA256(path||sha256))`, and make ScanStore.load
+  filter to the latest snapshot's `snapshot_items`.
+- **`__objc_classlist` section walk** for Obj-C class names that aren't
+  exposed as LC_SYMTAB externals (the common case on stripped Apple
+  binaries — see Mach-O parsing section).
+- **Swift symbol demangling.** We store raw mangled names which are
+  substring-searchable; running them through `libswiftDemangle` (or
+  shelling out to `swift demangle`) would make the symbols section
+  much nicer to read.
+- **Code signature parsing** for team identifier extraction (we detect
   `LC_CODE_SIGNATURE` but don't parse the blob).
-- DYLD shared cache *image enumeration* (we parse the header but not the
-  image list — needs more dyld_cache_format.h ported in).
-- Cross-scan diff UI — the schema supports it but no command/view exists yet.
-- Asset catalog (`Assets.car`) extraction.
-- Full strings-cache search UI (the blob is stored when extracted, but no
-  global search across blobs yet).
-- Token-pill UI for search (`.searchable(text:tokens:)`) so typed filters
-  become removable chips inside the search field instead of below it.
-- Lazy loading on top of SQLite (in-memory as a bounded working set; full
-  payloads fetched from `data.db` on demand). The Database API and bundle
-  format are already in place — only ScanStore would need to change.
+- **DYLD shared cache image list enumeration.** We parse the header
+  (architecture + correct imagesCount + subCacheCount on macOS 14+)
+  but don't enumerate the image table to expose individual cache-
+  resident dylibs as scan items.
+- **Asset catalog (`Assets.car`) extraction.**
+- **Token-pill UI for search** (`.searchable(text:tokens:)`) so typed
+  filters become removable chips inside the search field instead of
+  below it.
+- **Snapshot history UI** for jumping between past scan results in
+  one bundle. The snapshots table is populated; nothing reads it yet
+  beyond the most-recent row.
 
 ## Testing
 
@@ -389,7 +548,7 @@ Three test targets cover the stack:
 
 | Target | Framework | Hosted in | What it covers |
 |--------|-----------|-----------|----------------|
-| `DarwinScanCoreTests` | Swift Testing | Framework-only | Search parser/evaluator, ScanItem Codable round-trip, ItemHeader projection, Database upsert/load/meta, ScanStore indexes, ScanPackage save/load, every inspector (PlistInspector, MachOInspector, DyldCacheInspector, LocalizationInspector, ManPageInspector, StringsExtractor), FileWalker excludes, CommandLineRunner smoke. |
+| `DarwinScanCoreTests` | Swift Testing | Framework-only | Search parser/evaluator (incl. FTS filter parse), ScanItem Codable round-trip, ItemHeader projection, Database upsert/load/meta/clear, ScanStore indexes, ScanPackage save/load, every inspector (PlistInspector, MachOInspector, DyldCacheInspector, LocalizationInspector, ManPageInspector, StringsExtractor), FileWalker excludes (incl. cryptex carve-out), CommandLineRunner smoke. SymbolInspector / Extract / snapshot row creation are exercised end-to-end via CommandLineRunner today; dedicated unit suites for each would be welcome additions. |
 | `DarwinScanTests` | Swift Testing | `DarwinScan.app` | UTType registration, SidebarSelection equality/hashing, ScanDocument lifecycle (init / snapshot / round-trip to disk), ScanController startScan + cancel against /bin, view-construction smoke. |
 | `DarwinScanUITests` | XCTest / XCUI | App runner | Welcome view, sidebar category labels, toolbar Scan button, the New Scan options sheet. Deliberately does NOT trigger a real /System scan. |
 
