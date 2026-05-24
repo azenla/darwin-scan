@@ -86,6 +86,17 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .long, help: "Maximum file size (bytes) to fully read for inspections.")
     var maxInspectFileSize: Int64 = 256 * 1024 * 1024
 
+    @Flag(name: .long, inversion: .prefixedNo,
+          help: "Extract exported / imported symbols and Obj-C / Swift class names from every Mach-O binary.")
+    var extractSymbols: Bool = true
+
+    @Flag(name: .long, inversion: .prefixedNo,
+          help: "Copy the bytes of every classified file into the bundle's content-addressed blob store. Required by `darwin-scan extract`.")
+    var captureFiles: Bool = false
+
+    @Option(name: .long, help: "Maximum file size (bytes) that --capture-files will pull into the blob store.")
+    var maxCaptureFileSize: Int64 = 256 * 1024 * 1024
+
     @Flag(name: .shortAndLong,
           help: "Suppress per-tick progress; print one final summary line.")
     var quiet: Bool = false
@@ -110,6 +121,9 @@ struct Generate: AsyncParsableCommand {
         options.inspectMLModels = inspectMLModels
         options.inspectDyldCache = inspectDyldCache
         options.maxInspectFileSize = maxInspectFileSize
+        options.extractSymbols = extractSymbols
+        options.captureFiles = captureFiles
+        options.maxCaptureFileSize = maxCaptureFileSize
 
         let started = Date()
         let isTTY = isatty(fileno(stderr)) != 0

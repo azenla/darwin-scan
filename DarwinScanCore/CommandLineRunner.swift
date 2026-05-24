@@ -60,12 +60,24 @@ public enum CommandLineRunner {
                 refs.reserveCapacity(results.count)
                 var newItems: [ScanItem] = []
                 newItems.reserveCapacity(results.count)
+                var symbolRows: [SymbolRow] = []
+                var symbolIDs: [UUID] = []
                 for r in results {
                     newItems.append(r.item)
                     for ref in r.blobRefs { refs.append(ref) }
+                    if !r.symbols.isEmpty {
+                        symbolRows.append(contentsOf: r.symbols)
+                        symbolIDs.append(r.item.id)
+                    }
                 }
                 blobStore.registerMany(refs)
+                for id in symbolIDs {
+                    if store.items[id] != nil {
+                        store.clearSymbolsForReingest(id)
+                    }
+                }
                 store.ingest(newItems)
+                store.insertSymbols(symbolRows)
             },
             systemInfoSink: { info in
                 store.systemInfo = info

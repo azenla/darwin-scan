@@ -57,12 +57,27 @@ public final class ScanController {
                     refs.reserveCapacity(results.count)
                     var newItems: [ScanItem] = []
                     newItems.reserveCapacity(results.count)
+                    var symbolRows: [SymbolRow] = []
+                    var symbolIDs: [UUID] = []
                     for r in results {
                         newItems.append(r.item)
                         for ref in r.blobRefs { refs.append(ref) }
+                        if !r.symbols.isEmpty {
+                            symbolRows.append(contentsOf: r.symbols)
+                            symbolIDs.append(r.item.id)
+                        }
                     }
                     blobStore.registerMany(refs)
+                    // Path-collision rescans reuse a previous UUID; their
+                    // old symbol rows would otherwise stick around. We
+                    // clear before inserting so the new symbol set wins.
+                    for id in symbolIDs {
+                        if store.items[id] != nil {
+                            store.clearSymbolsForReingest(id)
+                        }
+                    }
                     store.ingest(newItems)
+                    store.insertSymbols(symbolRows)
                 },
                 systemInfoSink: { info in
                     store.systemInfo = info
@@ -87,10 +102,15 @@ public nonisolated struct ScanResult: Sendable {
 public nonisolated struct InspectResult: Sendable {
     public let item: ScanItem
     public let blobRefs: [String]
+    /// Symbols extracted from a Mach-O binary, stamped with this item's UUID
+    /// so the main-actor sink can hand them straight to the database without
+    /// re-parsing. Empty for non-Mach-O items and when `extractSymbols` is off.
+    public let symbols: [SymbolRow]
 
-    public init(item: ScanItem, blobRefs: [String]) {
+    public init(item: ScanItem, blobRefs: [String], symbols: [SymbolRow] = []) {
         self.item = item
         self.blobRefs = blobRefs
+        self.symbols = symbols
     }
 }
 
@@ -254,7 +274,20 @@ public nonisolated struct ScanPipeline: Sendable {
         if let r = enriched.executable?.stringsBlobRef { refs.append(r) }
         if let r = enriched.application?.iconRef { refs.append(r) }
         if let r = enriched.icon?.previewBlobRef { refs.append(r) }
-        return InspectResult(item: enriched, blobRefs: refs)
+
+        // Symbol extraction: only for Mach-O items whose category indicates
+        // a binary we'd actually want symbols for. Skip dyldCache (multi-GB
+        // and not a single binary), kext (would need symbols but they're
+        // typically stripped), and obviously non-binary categories.
+        let symbols: [SymbolRow]
+        if options.extractSymbols
+            && (enriched.category == .executable || enriched.category == .framework)
+            && enriched.executable != nil {
+            symbols = SymbolInspector.extract(url: url, itemID: enriched.id)
+        } else {
+            symbols = []
+        }
+        return InspectResult(item: enriched, blobRefs: refs, symbols: symbols)
     }
 
     // MARK: Classification

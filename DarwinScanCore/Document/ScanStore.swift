@@ -153,6 +153,10 @@ public nonisolated final class ScanStore {
     /// Persists the batch in a single SQLite transaction. We collect the
     /// post-merge items separately so the database always sees the same UUIDs
     /// the in-memory store uses (path collisions reuse the existing id).
+    ///
+    /// Path-collision callers must also call `clearSymbolsForReingest(_:)`
+    /// for any UUID being overwritten — symbol rows are keyed by item_id,
+    /// and stale rows from the prior scan would otherwise accumulate.
     public func ingest(_ produced: [ScanItem]) {
         // Apply to memory first, capturing the actually-stored rows so the
         // database mirrors the same UUIDs.
@@ -220,6 +224,51 @@ public nonisolated final class ScanStore {
 
     public func blob(forRef ref: String) -> Data? {
         blobStore.data(forRef: ref)
+    }
+
+    // MARK: - Symbol persistence
+
+    /// Bulk-insert symbol rows produced by `SymbolInspector`. The worker
+    /// batches these alongside items so the cost is amortised across
+    /// hundreds of rows per transaction. Failures are logged and swallowed
+    /// — a missing batch of symbols shouldn't abort a scan.
+    public func insertSymbols(_ rows: [SymbolRow]) {
+        guard !rows.isEmpty, let database else { return }
+        do {
+            try database.insertSymbols(rows)
+        } catch {
+            print("[ScanStore] database.insertSymbols failed: \(error)")
+        }
+    }
+
+    /// On-demand fetch of all symbols for a single item, used by the
+    /// detail view. Capped at 5000 by Database; UI shows a "more" affordance
+    /// when truncated.
+    public func symbols(forItem itemID: UUID) -> [SymbolRow] {
+        guard let database else { return [] }
+        return (try? database.symbols(forItem: itemID)) ?? []
+    }
+
+    public func symbolCount(forItem itemID: UUID) -> Int {
+        guard let database else { return 0 }
+        return (try? database.symbolCount(forItem: itemID)) ?? 0
+    }
+
+    /// Drop symbols for an item that's about to be reingested at the same
+    /// path with a fresh sha256. Called by the path-collision branch in the
+    /// scan sink before `insertSymbols` for the new content runs.
+    public func clearSymbolsForReingest(_ itemID: UUID) {
+        guard let database else { return }
+        do { try database.deleteSymbols(forItem: itemID) } catch {
+            print("[ScanStore] deleteSymbols failed: \(error)")
+        }
+    }
+
+    /// Global symbol FTS search. Used by the symbol search field once the
+    /// UI is wired up.
+    public func searchSymbols(_ query: String, limit: Int = 500) -> [SymbolHit] {
+        guard let database, !query.isEmpty else { return [] }
+        return (try? database.searchSymbols(query: query, limit: limit)) ?? []
     }
 
     // MARK: - Queries
