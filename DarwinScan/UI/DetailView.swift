@@ -579,7 +579,7 @@ private struct SymbolsSubsection: View {
                 let id = item.id
                 if loadedID == id { return }
                 let loaded = await Task.detached(priority: .userInitiated) {
-                    store.symbols(forItem: id)
+                    await store.symbols(forItem: id)
                 }.value
                 if Task.isCancelled { return }
                 rows = loaded
