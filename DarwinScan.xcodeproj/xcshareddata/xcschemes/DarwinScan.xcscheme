@@ -52,6 +52,17 @@
                ReferencedContainer = "container:DarwinScan.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "FA0606D42FC272C200582663"
+               BuildableName = "DarwinScanCoreTests.xctest"
+               BlueprintName = "DarwinScanCoreTests"
+               ReferencedContainer = "container:DarwinScan.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction

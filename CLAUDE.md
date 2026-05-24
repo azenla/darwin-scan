@@ -10,28 +10,69 @@ diffed by SHA-256.
 ## Build
 
 ```sh
+# App
 xcodebuild -project DarwinScan.xcodeproj -scheme DarwinScan -configuration Debug -destination 'platform=macOS' build
+# CLI
+xcodebuild -project DarwinScan.xcodeproj -scheme darwin-scan -configuration Debug -destination 'platform=macOS' build
 ```
 
 Open in Xcode and Cmd+R to run. Deployment target is macOS 26.5; Xcode 26+.
+The top-level **Run** group in the project navigator surfaces the built
+`DarwinScan.app` and `darwin-scan` binaries — Cmd+click to reveal in Finder.
+
+## CLI
+
+`darwin-scan` ships next to the app target as a separate scheme.
+
+```sh
+# Generate a scan bundle the GUI can open
+darwin-scan generate LocalSystem.darwinscan
+
+# Restrict scope, skip hashing for a fast structural scan
+darwin-scan generate --roots /usr/bin --no-hash-files --no-index-man-pages out.darwinscan
+
+# Every ScanOptions toggle is exposed; see --help.
+darwin-scan generate --help
+```
+
+When run from `BUILT_PRODUCTS_DIR` the framework is loaded via the
+`@executable_path/` rpath; copy `DarwinScanCore.framework` alongside the
+binary if you install it elsewhere.
 
 ## Project shape
 
 Xcode 26's **file-system-synchronized groups** are in use — anything you drop
-inside `DarwinScan/` is automatically compiled. No need to touch the pbxproj
-to add files. Subdirectories are fine; we organize by concern:
+inside any of the source roots is automatically compiled. No need to touch
+the pbxproj to add files. We split into three buildable targets plus three
+test targets:
 
 ```
-DarwinScan/
+DarwinScan/                        # App target (SwiftUI)
 ├── DarwinScanApp.swift            # @main, DocumentGroup
 ├── ContentView.swift              # NavigationSplitView root
+├── Document/ScanDocument.swift    # ReferenceFileDocument; everything else is in core
+└── UI/                            # SidebarView, ItemListView, DetailView, ScanProgressView, WelcomeView
+
+DarwinScanCore/                    # Framework — all non-UI logic. Both app and CLI link this.
 ├── Models/                        # ScanItem, ScanOptions, ScanProgress, SystemInfo
-├── Document/                      # ScanDocument, ScanPackage, ScanStore, BlobStore
+├── Document/                      # ScanPackage, ScanStore, BlobStore, Database
 ├── Scanning/                      # Scanner + per-domain Inspectors + FileWalker + StringsExtractor
 ├── Search/                        # SearchQuery (parser + evaluator)
-├── UI/                            # SidebarView, ItemListView, DetailView, ScanProgressView, WelcomeView
-└── Utilities/                     # Hash, ByteFormat, SystemInfoCollector
+├── Utilities/                     # Hash, ByteFormat, SystemInfoCollector
+└── CommandLineRunner.swift        # Synchronous-style scan driver for the CLI
+
+DarwinScanCommand/                 # CLI target (ArgumentParser)
+└── DarwinScanCommand.swift        # `darwin-scan generate <output>.darwinscan`
+
+DarwinScanCoreTests/               # Swift Testing — framework unit tests (no app dependency)
+DarwinScanTests/                   # Swift Testing — app-level integration tests (hosted in DarwinScan.app)
+DarwinScanUITests/                 # XCTest — XCUI smoke tests
 ```
+
+Adding a file under any synchronized root puts it in the corresponding
+target. The app and CLI both `import DarwinScanCore`; the framework is
+macOS-only with `SUPPORTED_PLATFORMS = macosx` and inherits the project's
+MainActor default actor isolation.
 
 ## Critical build settings (DO NOT casually change)
 
@@ -344,5 +385,49 @@ conformance of X to Decodable cannot be used in nonisolated context".
 
 ## Testing
 
-Test targets exist (`DarwinScanTests`, `DarwinScanUITests`) but are empty
-placeholder files from the template. No real coverage yet.
+Three test targets cover the stack:
+
+| Target | Framework | Hosted in | What it covers |
+|--------|-----------|-----------|----------------|
+| `DarwinScanCoreTests` | Swift Testing | Framework-only | Search parser/evaluator, ScanItem Codable round-trip, ItemHeader projection, Database upsert/load/meta, ScanStore indexes, ScanPackage save/load, every inspector (PlistInspector, MachOInspector, DyldCacheInspector, LocalizationInspector, ManPageInspector, StringsExtractor), FileWalker excludes, CommandLineRunner smoke. |
+| `DarwinScanTests` | Swift Testing | `DarwinScan.app` | UTType registration, SidebarSelection equality/hashing, ScanDocument lifecycle (init / snapshot / round-trip to disk), ScanController startScan + cancel against /bin, view-construction smoke. |
+| `DarwinScanUITests` | XCTest / XCUI | App runner | Welcome view, sidebar category labels, toolbar Scan button, the New Scan options sheet. Deliberately does NOT trigger a real /System scan. |
+
+Run everything from the command line:
+
+```sh
+xcodebuild -project DarwinScan.xcodeproj -scheme DarwinScan -configuration Debug -destination 'platform=macOS' test
+```
+
+…or a single target:
+
+```sh
+xcodebuild -project DarwinScan.xcodeproj -scheme DarwinScan -configuration Debug -destination 'platform=macOS' -only-testing:DarwinScanCoreTests test
+```
+
+### Conventions
+
+- New core logic → `DarwinScanCore/`, paired with a test in
+  `DarwinScanCoreTests/`. Suites that touch `@MainActor` types use
+  `@MainActor @Suite(..., .serialized)` to avoid parallel xctest
+  isolation crashes.
+- App-side glue → `DarwinScan/`, paired with a test in `DarwinScanTests/`.
+  `@testable import DarwinScan` reaches `ScanDocument` (internal).
+- New user-visible UI → add a smoke assertion to `DarwinScanUITests/`.
+  Prefer the resilient predicate-based query (see
+  `testSidebarListsCategoryLabels` for an example) over strict
+  `app.staticTexts[...]` lookups — SwiftUI's accessibility-element
+  type mapping drifts between SDK versions.
+- Tests must NOT depend on the user's `/System` or anything outside the
+  temp dir / `/bin`. The slowest sanctioned scan target is `/bin`
+  (~37 binaries, sub-second).
+
+### Path-canonicalisation note
+
+The macOS temp dir lives under `/var/folders/...` and `/var` is a symlink
+to `/private/var`. Foundation's `URL.path`, `URL.resolvingSymlinksInPath`,
+and `NSString.resolvingSymlinksInPath` disagree about which form to
+return. If a test compares paths produced by both `FileManager` and
+`URL.appendingPathComponent` it'll trip over this. Prefer asserting on
+counts or on substring containment over exact equality, or test the pure
+predicate (`FileWalker.isExcluded`) directly.
