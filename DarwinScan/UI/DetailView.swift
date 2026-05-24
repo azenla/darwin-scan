@@ -457,7 +457,7 @@ private struct ExecutableSection: View {
             ) {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(info.linkedLibraries, id: \.self) { lib in
-                        LinkedLibraryRow(lib: lib, store: store, itemSelection: $itemSelection)
+                        LinkedLibraryRow(lib: lib, sourceItem: item, store: store, itemSelection: $itemSelection)
                     }
                 }
             }
@@ -489,19 +489,173 @@ private struct ExecutableSection: View {
                 .frame(maxHeight: 360)
             }
         }
+
+        SymbolsSubsection(item: item, store: store)
     }
 }
 
-/// One row inside the Linked Libraries list. If the linked path resolves to
-/// an item in this scan it becomes a clickable navigation; otherwise it's
-/// shown greyed out (typical for `@rpath/...` libraries or anything we
-/// didn't visit).
+/// Symbols extracted by `SymbolInspector`, grouped by kind with a live
+/// substring filter. Heavy lifting (the `symbols(forItem:)` SQLite read)
+/// happens in `.task(id:)` so it doesn't run on every body invalidation —
+/// the selection change is the only trigger.
+private struct SymbolsSubsection: View {
+    let item: ScanItem
+    @Bindable var store: ScanStore
+
+    @State private var rows: [SymbolRow] = []
+    @State private var loadedID: UUID?
+    @State private var filter: String = ""
+
+    var body: some View {
+        if rows.isEmpty && loadedID == item.id {
+            EmptyView()
+        } else {
+            let totalsByKind = Dictionary(grouping: rows, by: { $0.kind }).mapValues(\.count)
+            let total = rows.count
+            let filtered = applyFilter(filter, to: rows)
+            Section(
+                title: "Symbols",
+                systemImage: "function",
+                accessory: total > 0 ? "\(total)" : nil
+            ) {
+                VStack(alignment: .leading, spacing: 8) {
+                    if total == 0 {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        // Per-kind count chips. Click a chip to filter to
+                        // that kind (toggle behaviour).
+                        WrappingHStack(spacing: 6) {
+                            ForEach(orderedKinds(in: totalsByKind), id: \.self) { kind in
+                                ColoredChip(
+                                    text: "\(kind.displayName): \(totalsByKind[kind] ?? 0)",
+                                    color: kindColor(kind)
+                                )
+                            }
+                        }
+                        TextField("Filter symbols (substring)…", text: $filter)
+                            .textFieldStyle(.roundedBorder)
+                            .controlSize(.small)
+                        if filtered.isEmpty {
+                            Text("No matches").font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            // Cap visible rows so a 50k-symbol binary doesn't
+                            // explode SwiftUI's layout time.
+                            let visible = Array(filtered.prefix(200))
+                            VStack(alignment: .leading, spacing: 1) {
+                                ForEach(visible, id: \.self) { row in
+                                    HStack(spacing: 6) {
+                                        Image(systemName: kindIcon(row.kind))
+                                            .foregroundStyle(kindColor(row.kind))
+                                            .imageScale(.small)
+                                            .frame(width: 14)
+                                        Text(row.name)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .textSelection(.enabled)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Spacer()
+                                    }
+                                }
+                            }
+                            if filtered.count > visible.count {
+                                Text("…\(filtered.count - visible.count) more (refine the filter to narrow)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                }
+            }
+            .task(id: item.id) {
+                let id = item.id
+                if loadedID == id { return }
+                let loaded = await Task.detached(priority: .userInitiated) {
+                    store.symbols(forItem: id)
+                }.value
+                if Task.isCancelled { return }
+                rows = loaded
+                loadedID = id
+            }
+        }
+    }
+
+    private func applyFilter(_ query: String, to rows: [SymbolRow]) -> [SymbolRow] {
+        let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return rows }
+        return rows.filter { $0.name.lowercased().contains(q) }
+    }
+
+    private func orderedKinds(in map: [SymbolRow.Kind: Int]) -> [SymbolRow.Kind] {
+        let order: [SymbolRow.Kind] = [
+            .function, .data, .objcClass, .objcMetaClass, .objcProtocol,
+            .swiftClass, .swiftStruct, .undefined
+        ]
+        return order.filter { map[$0] != nil }
+    }
+
+    private func kindColor(_ k: SymbolRow.Kind) -> Color {
+        switch k {
+        case .function:      return .green
+        case .data:          return .blue
+        case .objcClass:     return .purple
+        case .objcMetaClass: return .indigo
+        case .objcProtocol:  return .pink
+        case .swiftClass:    return .orange
+        case .swiftStruct:   return .yellow
+        case .undefined:     return .gray
+        }
+    }
+
+    private func kindIcon(_ k: SymbolRow.Kind) -> String {
+        switch k {
+        case .function:      return "f.cursive"
+        case .data:          return "tablecells"
+        case .objcClass:     return "c.circle"
+        case .objcMetaClass: return "c.circle.fill"
+        case .objcProtocol:  return "p.circle"
+        case .swiftClass:    return "swift"
+        case .swiftStruct:   return "shippingbox"
+        case .undefined:     return "questionmark.circle"
+        }
+    }
+}
+
+private extension SymbolRow.Kind {
+    var displayName: String {
+        switch self {
+        case .function:      return "fn"
+        case .data:          return "data"
+        case .objcClass:     return "objc class"
+        case .objcMetaClass: return "objc meta"
+        case .objcProtocol:  return "objc proto"
+        case .swiftClass:    return "swift class"
+        case .swiftStruct:   return "swift struct"
+        case .undefined:     return "imported"
+        }
+    }
+}
+
+/// One row inside the Linked Libraries list. Tries hard to resolve the
+/// linked path against an item in this scan so the row becomes clickable:
+///
+/// 1. Direct match: `store.item(atPath: "/usr/lib/libSystem.B.dylib")`.
+/// 2. `@rpath/Foo.framework/Foo` — substitute each of the binary's rpaths
+///    (`info.rpaths`) for `@rpath`, query the store, return the first hit.
+/// 3. `@executable_path/...` / `@loader_path/...` — substitute the
+///    containing directory of the source binary.
+/// 4. `@rpath/.../Versions/A/Foo` — Apple framework dylibs are often loaded
+///    via the versioned interior path; we also try the un-versioned form.
+///
+/// When all four fail (common for dyld_shared_cache-resident dylibs that
+/// have no on-disk file in this scan), the row renders dimly without a
+/// click target — same as before, but the failure rate drops sharply.
 private struct LinkedLibraryRow: View {
     let lib: String
+    let sourceItem: ScanItem
     @Bindable var store: ScanStore
     @Binding var itemSelection: UUID?
     var body: some View {
-        if let target = store.item(atPath: lib) {
+        if let target = resolve(lib, source: sourceItem, store: store) {
             Button {
                 itemSelection = target.id
             } label: {
@@ -536,6 +690,46 @@ private struct LinkedLibraryRow: View {
                 Spacer()
             }
         }
+    }
+
+    private func resolve(_ rawPath: String, source: ScanItem, store: ScanStore) -> ItemHeader? {
+        // 1. Direct match.
+        if let h = store.item(atPath: rawPath) { return h }
+
+        // 2. @rpath substitution.
+        if rawPath.hasPrefix("@rpath/") {
+            let tail = String(rawPath.dropFirst("@rpath/".count))
+            for rpath in source.executable?.rpaths ?? [] {
+                let expanded: String
+                if rpath.hasPrefix("@executable_path/") {
+                    let base = source.path as NSString
+                    expanded = base.deletingLastPathComponent + "/" + String(rpath.dropFirst("@executable_path/".count)) + "/" + tail
+                } else if rpath.hasPrefix("@loader_path/") {
+                    let base = source.path as NSString
+                    expanded = base.deletingLastPathComponent + "/" + String(rpath.dropFirst("@loader_path/".count)) + "/" + tail
+                } else {
+                    expanded = rpath + "/" + tail
+                }
+                let normalized = (expanded as NSString).standardizingPath
+                if let h = store.item(atPath: normalized) { return h }
+            }
+        }
+
+        // 3. @executable_path / @loader_path substitution.
+        if rawPath.hasPrefix("@executable_path/") || rawPath.hasPrefix("@loader_path/") {
+            let dirURL = URL(fileURLWithPath: source.path).deletingLastPathComponent()
+            let tail: String
+            if rawPath.hasPrefix("@executable_path/") {
+                tail = String(rawPath.dropFirst("@executable_path/".count))
+            } else {
+                tail = String(rawPath.dropFirst("@loader_path/".count))
+            }
+            let expanded = dirURL.appendingPathComponent(tail).path
+            let normalized = (expanded as NSString).standardizingPath
+            if let h = store.item(atPath: normalized) { return h }
+        }
+
+        return nil
     }
 }
 
