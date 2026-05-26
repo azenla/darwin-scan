@@ -1,129 +1,53 @@
 import XCTest
 
-/// UI smoke tests. We deliberately don't trigger a full /System scan in
-/// any of these — `ScanControllerTests` in DarwinScanTests covers the
-/// scan lifecycle directly. These tests just verify the chrome the user
-/// sees on first launch.
+/// UI smoke tests. We deliberately don't trigger a full /System scan in any
+/// of these — `ScanControllerTests` in DarwinScanTests covers the scan
+/// lifecycle directly. These tests just verify the chrome the user sees on
+/// first launch and the welcome window's launcher controls.
+///
+/// **Note on save panels.** The new app flow opens a save panel before any
+/// scan window appears — driving an `NSSavePanel` from XCUI is brittle and
+/// would land a `.darwinscan` directory in the test runner's filesystem.
+/// We therefore stop short of clicking through to a scan; per-document
+/// chrome is covered by Swift Testing in `DarwinScanTests` instead.
 final class DarwinScanUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
 
-    /// Launch the app and bring an untitled document window to the front
-    /// by routing through File > New. DocumentGroup may also pop the
-    /// "Open Recent" panel on launch; this helper closes that path.
     @MainActor
-    private func launchedAppWithNewDocument() -> XCUIApplication {
+    private func launchedApp() -> XCUIApplication {
         let app = XCUIApplication()
         app.launch()
-        // If an open panel comes up first, dismiss it before requesting a
-        // new document.
-        let openPanel = app.windows["Open"]
-        if openPanel.waitForExistence(timeout: 2) {
-            openPanel.buttons["Cancel"].click()
-        }
-        // SwiftUI may auto-open a new document, or it may not — be
-        // defensive and route through File > New when no window is up.
-        if !app.windows.firstMatch.waitForExistence(timeout: 3) {
-            app.menuBars.menus["File"].menuItems["New"].click()
-        }
         return app
     }
 
     @MainActor
-    func testWelcomeViewIsShownOnFirstLaunch() throws {
-        let app = launchedAppWithNewDocument()
-        // Welcome view headline.
+    func testWelcomeWindowIsShownOnLaunch() throws {
+        let app = launchedApp()
+        // The welcome view's title — same string as the previous Untitled
+        // doc's WelcomeView, but now hosted by the launcher window.
         XCTAssertTrue(
             app.staticTexts["DarwinScan"].waitForExistence(timeout: 5),
-            "Welcome view should display the DarwinScan title"
-        )
-        // The primary CTA — Welcome view's Label("Run System Scan", ...)
-        // shows as either a button (text label) or a static text fallback,
-        // depending on macOS version + a11y settings.
-        XCTAssertTrue(
-            app.buttons["Run System Scan"].exists ||
-            app.staticTexts["Run System Scan"].exists,
-            "Welcome view should expose a Run System Scan button"
+            "Welcome window should display the DarwinScan title"
         )
     }
 
     @MainActor
-    func testSidebarListsCategoryLabels() throws {
-        let app = launchedAppWithNewDocument()
-        // Snap a debug screenshot — the SwiftUI sidebar's accessibility
-        // tree changes between SDK versions and this attachment is the
-        // breadcrumb if the assertions below ever start missing rows.
-        let shot = XCTAttachment(screenshot: app.screenshot())
-        shot.name = "Sidebar"
-        shot.lifetime = .keepAlways
-        add(shot)
-
-        // Try the most resilient query path: a label-string predicate
-        // against any element. SwiftUI's `Label` widget exposes its text
-        // as an accessibility label on macOS, but the element type may be
-        // staticText / button / cell / outlineRow depending on layout.
-        func sidebarLabelExists(_ label: String, timeout: TimeInterval = 5) -> Bool {
-            let predicate = NSPredicate(
-                format: "label == %@ OR title == %@ OR identifier == %@",
-                label, label, label
-            )
-            let element = app.descendants(matching: .any)
-                .matching(predicate)
-                .firstMatch
-            return element.waitForExistence(timeout: timeout)
+    func testWelcomeWindowExposesNewAndOpenButtons() throws {
+        let app = launchedApp()
+        // The welcome window's two launcher actions. Each button uses
+        // `Label("New Scan…", ...)` / `Label("Open Scan…", ...)`; on
+        // recent macOS the ellipsis is part of the accessibility label.
+        // Match leniently so SDK drift doesn't bite.
+        func buttonExists(_ name: String) -> Bool {
+            let predicate = NSPredicate(format: "label BEGINSWITH %@", name)
+            return app.buttons.matching(predicate).firstMatch.waitForExistence(timeout: 3)
         }
-        // We only assert on the existence of *some* category as a
-        // smoke check; UI-tree mapping for sidebar labels varies enough
-        // between macOS versions that exhaustive matching is fragile.
-        let candidates = ["System Info", "All Items", "Executables",
-                          "Applications", "Frameworks & Libraries"]
-        let found = candidates.contains { sidebarLabelExists($0, timeout: 2) }
-        XCTAssertTrue(found,
-                      "Sidebar should expose at least one navigable section label")
+        XCTAssertTrue(buttonExists("New Scan"),
+                      "Welcome window should expose a 'New Scan' button")
+        XCTAssertTrue(buttonExists("Open Scan"),
+                      "Welcome window should expose an 'Open Scan' button")
     }
 
-    @MainActor
-    func testToolbarHasScanButton() throws {
-        let app = launchedAppWithNewDocument()
-        // The Scan toolbar item uses Label("Scan", systemImage: "magnifyingglass").
-        XCTAssertTrue(
-            app.buttons["Scan"].waitForExistence(timeout: 5),
-            "Toolbar should expose a Scan button"
-        )
-    }
-
-    @MainActor
-    func testClickingScanOpensTheOptionsSheet() throws {
-        let app = launchedAppWithNewDocument()
-        let scanButton = app.buttons["Scan"]
-        XCTAssertTrue(scanButton.waitForExistence(timeout: 5))
-        scanButton.click()
-        // Options sheet's title.
-        XCTAssertTrue(
-            app.staticTexts["New Scan"].waitForExistence(timeout: 3),
-            "Clicking Scan should present the New Scan options sheet"
-        )
-        // The Roots GroupBox should list the default scan roots.
-        XCTAssertTrue(app.staticTexts["/System"].exists)
-        XCTAssertTrue(app.staticTexts["/bin"].exists)
-        // Cancel out without starting a scan — we don't want a full
-        // /System walk in CI.
-        app.buttons["Cancel"].click()
-    }
-
-    @MainActor
-    func testHashFilesToggleIsPresentInOptions() throws {
-        let app = launchedAppWithNewDocument()
-        app.buttons["Scan"].click()
-        XCTAssertTrue(app.staticTexts["New Scan"].waitForExistence(timeout: 3))
-        // Toggles inside the sheet show up as XCUI switches/checkboxes
-        // with the toggle label as their accessibility identifier.
-        let toggleQuery = app.checkBoxes["Hash every file (SHA-256)"]
-        XCTAssertTrue(
-            toggleQuery.exists || app.switches["Hash every file (SHA-256)"].exists,
-            "Inspection group should expose the SHA-256 toggle"
-        )
-        app.buttons["Cancel"].click()
-    }
 }

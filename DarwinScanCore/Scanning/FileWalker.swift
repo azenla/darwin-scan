@@ -24,6 +24,16 @@ public nonisolated struct FileWalker: Sendable {
     /// dyldCache items appeared in the manifest, because the walker yielded
     /// the symlink at `/System/Cryptexes/OS` without descending.
     public nonisolated func isExcluded(_ path: String) -> Bool {
+        // `Incoming/` is a staging area for the next OS update — every file
+        // under `Cryptexes/OS/` reappears at the same path under
+        // `Cryptexes/Incoming/OS/` while an update is downloaded. The walker
+        // would otherwise double-count every dyld_shared_cache image. We
+        // carve it out *before* the broader cryptex carve-out below so the
+        // permissive check can't override.
+        if path == "/System/Volumes/Preboot/Cryptexes/Incoming"
+            || path.hasPrefix("/System/Volumes/Preboot/Cryptexes/Incoming/") {
+            return true
+        }
         if path.hasPrefix("/System/Volumes/Preboot/Cryptexes/") || path == "/System/Volumes/Preboot/Cryptexes" {
             return false
         }
@@ -32,7 +42,32 @@ public nonisolated struct FileWalker: Sendable {
                 return true
             }
         }
+        if options.englishLocalizationsOnly && isNonEnglishLproj(path) {
+            return true
+        }
         return false
+    }
+
+    /// True when `path` is itself a non-English `.lproj` directory. We don't
+    /// match `/path/foo.lproj/Strings/...` because we want the walker to
+    /// prune the *subtree*, which happens naturally once we exclude the
+    /// `.lproj` directory itself.
+    private nonisolated func isNonEnglishLproj(_ path: String) -> Bool {
+        let last = (path as NSString).lastPathComponent
+        guard last.hasSuffix(".lproj") else { return false }
+        let stem = String(last.dropLast(".lproj".count))
+        return !Self.isEnglishLocale(stem)
+    }
+
+    /// Whether a locale code names English. Accepts the bare language code
+    /// (`en`), region-tagged variants (`en_US`, `en-GB`), and the special
+    /// `Base.lproj` directory Apple ships for nib/xib resources that aren't
+    /// language-specific.
+    public static func isEnglishLocale(_ code: String) -> Bool {
+        if code == "Base" { return true }
+        let lower = code.lowercased()
+        if lower == "en" { return true }
+        return lower.hasPrefix("en_") || lower.hasPrefix("en-")
     }
 
     /// Yields URLs. The returned stream completes when all roots have been

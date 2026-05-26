@@ -2,32 +2,23 @@ import Foundation
 import Testing
 @testable import DarwinScanCore
 
-/// End-to-end save/load coverage for the `.darwinscan` bundle format. We
-/// build a populated store, serialise it via `ScanPackage.makeFileWrapper`,
-/// write it to disk, then load it back from the FileWrapper and assert the
-/// indexes + payloads match.
+/// End-to-end coverage for the in-place `.darwinscan` bundle flow. Each
+/// test creates an empty bundle on disk, populates the store via the
+/// scanner's normal ingest path, then re-opens the same bundle through
+/// `ScanPackage.openInPlace` and asserts the indexes + payloads round-trip.
 @MainActor
-@Suite("ScanPackage save/load", .serialized)
+@Suite("ScanPackage in-place open/save", .serialized)
 struct ScanPackageTests {
-    private func makeTempBundle() throws -> URL {
-        let url = FileManager.default.temporaryDirectory
+    private func makeTempBundleURL() -> URL {
+        FileManager.default.temporaryDirectory
             .appendingPathComponent("DarwinScanCoreTests-\(UUID().uuidString).darwinscan")
-        return url
-    }
-
-    private func attachFreshDatabase(to store: ScanStore) throws {
-        let cacheDir = store.blobStore.cacheDirectory
-        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-        let dbURL = cacheDir.appendingPathComponent(ScanPackage.databaseFilename)
-        try? FileManager.default.removeItem(at: dbURL)
-        let db = try Database(at: dbURL)
-        store.databaseURL = dbURL
-        store.attachDatabase(db)
     }
 
     @Test func roundTripPopulatedBundle() throws {
-        let source = ScanStore()
-        try attachFreshDatabase(to: source)
+        let bundleURL = makeTempBundleURL()
+        defer { try? FileManager.default.removeItem(at: bundleURL) }
+
+        let source = try ScanPackage.createEmpty(at: bundleURL)
         source.systemInfo = SystemInfo(
             productName: "macOS",
             productVersion: "26.5",
@@ -41,6 +32,7 @@ struct ScanPackageTests {
             sipStatus: nil,
             capturedAt: Date(timeIntervalSince1970: 1_700_000_000)
         )
+        source.beginSnapshot(systemInfo: source.systemInfo)
         let items: [ScanItem] = (0..<5).map { i in
             ScanItem(
                 id: UUID(),
@@ -55,17 +47,12 @@ struct ScanPackageTests {
             )
         }
         source.ingest(items)
+        source.completeCurrentSnapshot()
+        try source.database?.checkpoint()
 
-        let bundleURL = try makeTempBundle()
-        defer { try? FileManager.default.removeItem(at: bundleURL) }
-        let wrapper = try ScanPackage.makeFileWrapper(from: source)
-        try wrapper.write(to: bundleURL, options: [.atomic], originalContentsURL: nil)
-
-        // Reload through a fresh ScanStore via the same APIs the GUI uses
-        // when opening a document.
+        // Re-open the bundle through the same code path the GUI uses.
         let loaded = ScanStore()
-        let loadedWrapper = try FileWrapper(url: bundleURL, options: [])
-        try ScanPackage.load(into: loaded, from: loadedWrapper)
+        try ScanPackage.openInPlace(at: bundleURL, into: loaded)
 
         #expect(loaded.items.count == items.count)
         #expect(loaded.counts()[.executable] == 3)
@@ -78,17 +65,24 @@ struct ScanPackageTests {
     }
 
     @Test func emptyBundleLoadsCleanly() throws {
-        let source = ScanStore()
-        try attachFreshDatabase(to: source)
-        let bundleURL = try makeTempBundle()
+        let bundleURL = makeTempBundleURL()
         defer { try? FileManager.default.removeItem(at: bundleURL) }
-        let wrapper = try ScanPackage.makeFileWrapper(from: source)
-        try wrapper.write(to: bundleURL, options: [.atomic], originalContentsURL: nil)
+        let source = try ScanPackage.createEmpty(at: bundleURL)
+        try source.database?.checkpoint()
 
         let loaded = ScanStore()
-        try ScanPackage.load(into: loaded, from: try FileWrapper(url: bundleURL, options: []))
+        try ScanPackage.openInPlace(at: bundleURL, into: loaded)
         #expect(loaded.items.isEmpty)
         #expect(loaded.database != nil)
+    }
+
+    @Test func createEmptyRejectsExistingDestination() throws {
+        let bundleURL = makeTempBundleURL()
+        defer { try? FileManager.default.removeItem(at: bundleURL) }
+        _ = try ScanPackage.createEmpty(at: bundleURL)
+        #expect(throws: (any Error).self) {
+            _ = try ScanPackage.createEmpty(at: bundleURL)
+        }
     }
 }
 
@@ -133,10 +127,10 @@ struct CommandLineRunnerTests {
         let dbURL = bundleURL.appendingPathComponent("data.db")
         #expect(FileManager.default.fileExists(atPath: dbURL.path))
 
-        // Re-open the bundle through ScanPackage.load to make sure the
-        // GUI's load path agrees with what the CLI produced.
+        // Re-open the bundle through ScanPackage.openInPlace to make sure
+        // the GUI's load path agrees with what the CLI produced.
         let store = ScanStore()
-        try ScanPackage.load(into: store, from: try FileWrapper(url: bundleURL, options: []))
+        try ScanPackage.openInPlace(at: bundleURL, into: store)
         // The framework source tree contains plenty of Swift files; nothing
         // is a recognised category, but the worker should at least visit them
         // without crashing. We just assert the database opened.

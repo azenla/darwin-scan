@@ -65,7 +65,11 @@ public nonisolated final class ScanStore {
     public private(set) var pathReferencedBy: [String: [UUID]] = [:]
     public private(set) var itemsByOwningBundle: [String: [UUID]] = [:]
 
-    public let blobStore: BlobStore = BlobStore()
+    /// Bundle-backed blob store. `init()` defers to a temp scratch dir for
+    /// API consumers (tests, ad-hoc callers) and is replaced by
+    /// `attachBundle(blobsDirectory:)` when a document opens an actual
+    /// `.darwinscan` bundle from disk.
+    public private(set) var blobStore: BlobStore
 
     /// Optional persistent backing. When attached, every mutation is mirrored
     /// to SQLite so the on-disk `data.db` stays current.
@@ -90,13 +94,30 @@ public nonisolated final class ScanStore {
     /// `snapshotHistory()` call and cached until `beginSnapshot` invalidates.
     private var cachedHistory: [SnapshotRecord]?
 
-    public init() {}
+    public init() {
+        // Spin a temporary scratch dir for the blob store. Production callers
+        // immediately replace it with `attachBundle(blobsDirectory:)` once
+        // they know the on-disk bundle location; tests and ad-hoc callers
+        // pick up the scratch dir as-is.
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("darwinscan-scratch", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        self.blobStore = BlobStore(rootDirectory: temp)
+    }
 
-    /// Attach (or detach) the persistent database. Called by `ScanDocument`
-    /// once it has decided where on disk to keep `data.db`. Subsequent
-    /// `upsert`/`ingest`/`reset` calls write through.
+    /// Attach (or detach) the persistent database. Called by the document
+    /// open path once it has the `data.db` URL inside the bundle.
+    /// Subsequent `upsert`/`ingest`/`reset` calls write through.
     public func attachDatabase(_ db: Database?) {
         self.database = db
+    }
+
+    /// Point the store at a `.darwinscan` bundle's `blobs/` directory.
+    /// Replaces the temporary scratch BlobStore created in `init()`. Called
+    /// by `ScanPackage.openInPlace` and the new-bundle flow before the
+    /// scanner starts writing.
+    public func attachBundle(blobsDirectory: URL) {
+        self.blobStore = BlobStore(rootDirectory: blobsDirectory)
     }
 
     /// Encode a single meta value to the attached database. Failures are

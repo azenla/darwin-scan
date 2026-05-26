@@ -1,48 +1,51 @@
 import Foundation
 
 /// Optional extractor that captures printable strings from Mach-O binaries via
-/// `/usr/bin/strings`. Output streams directly to disk inside the BlobStore's
-/// cache directory — we deliberately do NOT hold the bytes in worker memory
-/// (a single dyld_shared_cache strings dump can be 100+ MB; multiplied by
-/// concurrent workers that's GB-scale and a likely OOM).
+/// `/usr/bin/strings`. Output streams directly to disk — we deliberately do
+/// NOT hold the bytes in worker memory (a single dyld_shared_cache strings
+/// dump can be 100+ MB; multiplied by concurrent workers that's GB-scale
+/// and a likely OOM).
 public nonisolated enum StringsExtractor {
-    /// Run `strings -n <minLen> <path>`, piping stdout straight into a file
-    /// in `cacheDirectory`. The result file is hashed after writing and
-    /// renamed to the content-addressed `strings-<sha>.bin` form so it
-    /// dedupes across identical strings outputs.
+    /// Run `strings -n <minLen> <path>`, piping stdout straight into a temp
+    /// file inside the bundle's `blobs/` directory. The result is hashed
+    /// after writing and moved to its sharded content-addressed home via
+    /// `BlobWriter` (`<root>/<prefix>/strings-<sha>.bin`) so identical
+    /// strings outputs dedupe.
     ///
     /// Returns the blob ref on success, nil on failure. Memory cost per call
     /// is ~zero — Process pipes bytes directly through a FileHandle.
     public static func streamStrings(
         from url: URL,
         minLength: Int,
-        into cacheDirectory: URL
+        using writer: BlobWriter
     ) -> String? {
         let stringsURL = URL(fileURLWithPath: "/usr/bin/strings")
         guard FileManager.default.isExecutableFile(atPath: stringsURL.path) else { return nil }
 
-        // Write to a temp file first, hash, then rename to the
-        // content-addressed name. The two-step is necessary because we don't
-        // know the SHA-256 until the bytes are on disk.
+        // Write to a temp file at the BlobWriter's root (same volume as the
+        // sharded destinations, so the eventual `moveItem` is a rename, not
+        // a copy). Two-step write is necessary because the SHA-256 isn't
+        // known until the bytes are on disk.
         let tempName = "strings-tmp-\(UUID().uuidString).bin"
-        let tempURL = cacheDirectory.appendingPathComponent(tempName)
+        let tempURL = writer.rootDirectory.appendingPathComponent(tempName)
+        try? FileManager.default.createDirectory(at: writer.rootDirectory, withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: tempURL.path, contents: nil)
-        guard let writer = try? FileHandle(forWritingTo: tempURL) else { return nil }
+        guard let writeHandle = try? FileHandle(forWritingTo: tempURL) else { return nil }
 
         let process = Process()
         process.executableURL = stringsURL
         process.arguments = ["-n", "\(minLength)", "-arch", "all", url.path]
-        process.standardOutput = writer
+        process.standardOutput = writeHandle
         process.standardError = Pipe()
         do {
             try process.run()
         } catch {
-            try? writer.close()
+            try? writeHandle.close()
             try? FileManager.default.removeItem(at: tempURL)
             return nil
         }
         process.waitUntilExit()
-        try? writer.close()
+        try? writeHandle.close()
 
         guard process.terminationStatus == 0,
               let sha = Hash.sha256(of: tempURL) else {
@@ -50,18 +53,8 @@ public nonisolated enum StringsExtractor {
             return nil
         }
         let ref = "strings-\(sha)"
-        let finalURL = cacheDirectory.appendingPathComponent("\(ref).bin")
-        if FileManager.default.fileExists(atPath: finalURL.path) {
-            // Identical strings output already on disk — drop the temp.
-            try? FileManager.default.removeItem(at: tempURL)
-        } else {
-            do {
-                try FileManager.default.moveItem(at: tempURL, to: finalURL)
-            } catch {
-                try? FileManager.default.removeItem(at: tempURL)
-                return nil
-            }
-        }
+        writer.copy(from: tempURL, ref: ref)
+        try? FileManager.default.removeItem(at: tempURL)
         return ref
     }
 

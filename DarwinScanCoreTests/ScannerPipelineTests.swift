@@ -14,7 +14,7 @@ struct ScannerPipelineTests {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("Pipeline-blobs-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
-        return ScanPipeline(options: options, blobWriter: BlobWriter(directory: tmp))
+        return ScanPipeline(options: options, blobWriter: BlobWriter(rootDirectory: tmp))
     }
 
     @Test func classifiesPlistFile() throws {

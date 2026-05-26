@@ -2,7 +2,7 @@ import SwiftUI
 import DarwinScanCore
 
 struct ContentView: View {
-    let document: ScanDocument
+    @Bindable var session: ScanSession
     @State private var sidebar: SidebarSelection? = .systemInfo
     @State private var itemSelection: UUID? = nil
     @State private var showOptions: Bool = false
@@ -11,20 +11,20 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(store: document.store, selection: $sidebar)
+            SidebarView(store: session.store, selection: $sidebar)
                 .frame(minWidth: 220, idealWidth: 240)
         } content: {
             ItemListView(
-                store: document.store,
+                store: session.store,
                 selection: sidebar ?? .systemInfo,
                 itemSelection: $itemSelection
             )
             .frame(minWidth: 300, idealWidth: 380)
         } detail: {
-            if document.store.items.isEmpty && !controller.isRunning {
+            if session.store.items.isEmpty && !controller.isRunning {
                 WelcomeView { showScanOptions() }
             } else {
-                DetailView(store: document.store, itemSelection: $itemSelection)
+                DetailView(store: session.store, itemSelection: $itemSelection)
                     .frame(minWidth: 360, idealWidth: 540)
             }
         }
@@ -59,14 +59,14 @@ struct ContentView: View {
                 onStart: {
                     let opts = pendingOptions
                     showOptions = false
-                    controller.startScan(options: opts, ingestInto: document.store)
+                    controller.startScan(options: opts, ingestInto: session.store)
                 }
             )
         }
     }
 
     private func showScanOptions() {
-        pendingOptions = document.store.options
+        pendingOptions = session.store.options
         showOptions = true
     }
 }

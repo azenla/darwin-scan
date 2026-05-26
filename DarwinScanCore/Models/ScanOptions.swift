@@ -28,6 +28,13 @@ public nonisolated struct ScanOptions: Codable, Hashable, Sendable {
     public var stringsMinLength: Int = 6
     public var indexManPages: Bool = true
     public var inspectLocalizations: Bool = true
+    /// When on, the walker skips non-English `.lproj` subtrees entirely and
+    /// the classifier drops non-English `.strings` / `.stringsdict`. Treats
+    /// `en`, `en_US`, `en_GB`, `en-US`, `en-GB`, and the cross-platform
+    /// `Base.lproj` directory as English. Substantially shrinks scans of
+    /// `/System/Library/CoreServices` and `/System/Applications` where
+    /// hundreds of `.lproj` directories live.
+    public var englishLocalizationsOnly: Bool = false
     public var inspectAppBundles: Bool = true
     public var inspectMLModels: Bool = true
     public var inspectDyldCache: Bool = true
@@ -64,6 +71,7 @@ public nonisolated struct ScanOptions: Codable, Hashable, Sendable {
         stringsMinLength: Int = 6,
         indexManPages: Bool = true,
         inspectLocalizations: Bool = true,
+        englishLocalizationsOnly: Bool = false,
         inspectAppBundles: Bool = true,
         inspectMLModels: Bool = true,
         inspectDyldCache: Bool = true,
@@ -80,6 +88,7 @@ public nonisolated struct ScanOptions: Codable, Hashable, Sendable {
         self.stringsMinLength = stringsMinLength
         self.indexManPages = indexManPages
         self.inspectLocalizations = inspectLocalizations
+        self.englishLocalizationsOnly = englishLocalizationsOnly
         self.inspectAppBundles = inspectAppBundles
         self.inspectMLModels = inspectMLModels
         self.inspectDyldCache = inspectDyldCache

@@ -381,6 +381,34 @@ struct FileWalkerTests {
     }
 
 
+    @Test func walkerExcludesCryptexIncomingStaging() {
+        // `/System/Volumes/Preboot/Cryptexes/Incoming/` mirrors the live
+        // `OS/` cryptex content during OS updates. Walking it doubles every
+        // dyld_shared_cache image. Carved out unconditionally.
+        let walker = FileWalker(options: ScanOptions())
+        #expect(walker.isExcluded("/System/Volumes/Preboot/Cryptexes/Incoming"))
+        #expect(walker.isExcluded("/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/dyld/dyld_shared_cache_arm64e"))
+        // Live OS path is still allowed.
+        #expect(!walker.isExcluded("/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e"))
+        // Prefix-overlap that isn't the Incoming directory itself shouldn't trigger.
+        #expect(!walker.isExcluded("/System/Volumes/Preboot/Cryptexes/IncomingPolicy"))
+    }
+
+    @Test func walkerExcludesNonEnglishLprojWhenRequested() {
+        var options = ScanOptions()
+        options.englishLocalizationsOnly = true
+        let walker = FileWalker(options: options)
+        #expect(walker.isExcluded("/Foo.app/Contents/Resources/de.lproj"))
+        #expect(walker.isExcluded("/Foo.app/Contents/Resources/fr_CA.lproj"))
+        #expect(!walker.isExcluded("/Foo.app/Contents/Resources/en.lproj"))
+        #expect(!walker.isExcluded("/Foo.app/Contents/Resources/en_US.lproj"))
+        #expect(!walker.isExcluded("/Foo.app/Contents/Resources/Base.lproj"))
+        // Children of an excluded lproj aren't directly excluded by this
+        // predicate — the walker prunes the subtree by not descending past
+        // the excluded directory. Verify the lproj parent is the cut point.
+        #expect(!walker.isExcluded("/Foo.app/Contents/Resources/de.lproj/Localizable.strings"))
+    }
+
     @Test func walkerIgnoresMissingRoots() async {
         var options = ScanOptions()
         options.roots = ["/no/such/root/\(UUID().uuidString)"]
@@ -389,5 +417,28 @@ struct FileWalkerTests {
         var count = 0
         for await _ in walker.makeStream() { count += 1 }
         #expect(count == 0)
+    }
+}
+
+@Suite("DyldCacheLayout")
+struct DyldCacheLayoutTests {
+    /// Smoke coverage that the layout parser handles the macOS dyld cache
+    /// when present. Skipped (returns silently) when the cache file isn't
+    /// readable — the CI / sandbox environments without /System access
+    /// should still pass these tests.
+    @Test func loadsMainCacheAndAtLeastOneLinkeditSubcache() {
+        let url = URL(fileURLWithPath: "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e")
+        guard FileManager.default.isReadableFile(atPath: url.path) else { return }
+        guard let layout = DyldCacheLayout.load(mainCacheURL: url) else {
+            Issue.record("Expected to load layout for arm64e cache")
+            return
+        }
+        // The arm64e cache has multiple subcaches; at least one of them
+        // should carry the `.dyldlinkedit` suffix so symbol extraction
+        // has somewhere to read from. The main cache is `subcaches[0]`,
+        // so total subcaches is 1 + subcache_count_in_main_header.
+        #expect(layout.subcaches.count > 1, "expected subcaches beyond the main file")
+        let hasLinkedit = layout.subcaches.contains { $0.url.path.hasSuffix("dyldlinkedit") }
+        #expect(hasLinkedit, "expected at least one .dyldlinkedit subcache to be parsed")
     }
 }

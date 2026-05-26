@@ -70,7 +70,6 @@ public final class ScanController {
                     var newItems: [ScanItem] = []
                     newItems.reserveCapacity(results.count)
                     var symbolRows: [SymbolRow] = []
-                    var symbolIDs: [UUID] = []
                     for r in results {
                         newItems.append(r.item)
                         // Secondary items (e.g. dyld_shared_cache virtual
@@ -80,17 +79,19 @@ public final class ScanController {
                         for ref in r.blobRefs { refs.append(ref) }
                         if !r.symbols.isEmpty {
                             symbolRows.append(contentsOf: r.symbols)
-                            symbolIDs.append(r.item.id)
                         }
                     }
                     blobStore.registerMany(refs)
                     // Path-collision rescans reuse a previous UUID; their
                     // old symbol rows would otherwise stick around. We
                     // clear before inserting so the new symbol set wins.
-                    for id in symbolIDs {
-                        if store.items[id] != nil {
-                            store.clearSymbolsForReingest(id)
-                        }
+                    // Collect IDs from the symbol rows themselves so
+                    // cached-image symbols (whose itemID points at the
+                    // virtual framework, not the cache file) are covered.
+                    var symbolItemIDs: Set<UUID> = []
+                    for row in symbolRows { symbolItemIDs.insert(row.itemID) }
+                    for id in symbolItemIDs where store.items[id] != nil {
+                        store.clearSymbolsForReingest(id)
                     }
                     store.ingest(newItems)
                     store.insertSymbols(symbolRows)
@@ -375,6 +376,7 @@ public nonisolated struct ScanPipeline: Sendable {
         // `.dyldCache` items so the user still sees them in the list —
         // they just don't synthesise children.
         var additionalItems: [ScanItem] = []
+        var additionalSymbols: [SymbolRow] = []
         if enriched.category == .dyldCache,
            options.inspectDyldCache,
            !DyldCacheInspector.isSubcache(filename: (enriched.path as NSString).lastPathComponent),
@@ -382,17 +384,61 @@ public nonisolated struct ScanPipeline: Sendable {
            !images.isEmpty {
             let cacheArch = enriched.dyldCache?.architecture ?? "?"
             additionalItems.reserveCapacity(images.count)
+            // Parse subcache layout once per main cache so each per-image
+            // inspection only touches load commands + the symbol/string
+            // ranges it needs. Falling back to a header-only layout when
+            // load fails keeps the virtual items flowing even if symbol
+            // extraction can't run.
+            let cacheLayout: DyldCacheLayout? = options.extractSymbols
+                ? DyldCacheLayout.load(mainCacheURL: url)
+                : nil
+            let sharedStrtab = cacheLayout.map { DyldCachedImageInspector.SharedStringTable(layout: $0) }
             for image in images {
-                additionalItems.append(buildVirtualImageItem(
+                let item = buildVirtualImageItem(
                     image: image,
                     cachePath: enriched.path,
                     cacheName: enriched.name,
                     cacheArch: cacheArch
-                ))
+                )
+                additionalItems.append(item)
+                if let cacheLayout, let sharedStrtab {
+                    if let result = DyldCachedImageInspector.extract(
+                        layout: cacheLayout,
+                        sharedStrtab: sharedStrtab,
+                        imageAddress: image.address,
+                        itemID: item.id
+                    ) {
+                        additionalSymbols.append(contentsOf: result.symbols)
+                        // strings_fts ingestion happens off-main, same
+                        // path as the regular Mach-O strings pipeline.
+                        if options.extractStrings, let cstr = result.cstringBytes, let database {
+                            let text = DyldCachedImageInspector.cstringTokensText(
+                                cstr,
+                                minLength: options.stringsMinLength
+                            )
+                            if !text.isEmpty {
+                                try? database.indexStrings(
+                                    itemID: item.id,
+                                    itemPath: item.path,
+                                    content: text
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        return InspectResult(item: enriched, blobRefs: refs, symbols: symbols, additionalItems: additionalItems)
+        // Fold any cached-image symbols into the result. The batch sink will
+        // route them to the database; we tagged each row with its virtual
+        // item's UUID up above so they land under the correct framework
+        // row, not the cache file's row.
+        var allSymbols = symbols
+        if !additionalSymbols.isEmpty {
+            allSymbols.append(contentsOf: additionalSymbols)
+        }
+
+        return InspectResult(item: enriched, blobRefs: refs, symbols: allSymbols, additionalItems: additionalItems)
     }
 
     /// Build a virtual `framework` item for one image inside a
@@ -465,6 +511,11 @@ public nonisolated struct ScanPipeline: Sendable {
             case "lproj":
                 if options.inspectLocalizations,
                    let info = LocalizationInspector.inspectLprojDirectory(url) {
+                    if options.englishLocalizationsOnly,
+                       let lang = info.language,
+                       !FileWalker.isEnglishLocale(lang) {
+                        return nil
+                    }
                     return (ScanItem(
                         id: ItemIdentity.uuid(path: path, sha256: nil, bundlePathOnly: true),
                         path: path, name: filename, category: .localization,
@@ -536,6 +587,11 @@ public nonisolated struct ScanPipeline: Sendable {
         if options.inspectLocalizations,
            (ext == "strings" || ext == "stringsdict"),
            let info = LocalizationInspector.inspect(url: url) {
+            if options.englishLocalizationsOnly,
+               let lang = info.language,
+               !FileWalker.isEnglishLocale(lang) {
+                return nil
+            }
             var tags: [String] = [ext]
             if let lang = info.language { tags.append(lang) }
             let sha = options.hashFiles ? Hash.sha256(of: url) : nil
@@ -768,7 +824,7 @@ public nonisolated struct ScanPipeline: Sendable {
             if let ref = StringsExtractor.streamStrings(
                 from: url,
                 minLength: options.stringsMinLength,
-                into: blobWriter.directory
+                using: blobWriter
             ) {
                 enriched.stringsBlobRef = ref
                 // Tokenize the blob into FTS5 on this worker thread. Loading
@@ -922,7 +978,10 @@ public nonisolated struct ScanPipeline: Sendable {
     /// String once. Failures are silent — we shouldn't abort a scan for a
     /// missing FTS row.
     private func indexStringsBlob(database: Database, itemID: UUID, itemPath: String, ref: String) {
-        let blobURL = blobWriter.directory.appendingPathComponent("\(ref).bin")
+        let prefix = BlobStore.shardPrefix(forRef: ref)
+        let blobURL = blobWriter.rootDirectory
+            .appendingPathComponent(prefix, isDirectory: true)
+            .appendingPathComponent("\(ref).bin")
         guard let data = try? Data(contentsOf: blobURL, options: [.mappedIfSafe]),
               !data.isEmpty,
               let text = String(data: data, encoding: .utf8) else { return }

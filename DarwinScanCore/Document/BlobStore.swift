@@ -10,52 +10,56 @@ import Observation
 /// 2. **Parallelism** — the background scan workers write blobs concurrently.
 ///    Passing `Data` across actor boundaries copies bytes; passing a ref
 ///    string is free.
-/// 3. **Save time** — when the document is saved, `FileWrapper(url:)` reads
-///    bytes from disk lazily, so we don't materialize everything just to
-///    serialize.
+/// 3. **Save time** — historically `FileWrapper(url:)` streamed bytes from a
+///    session cache directory into the bundle on save. The store now writes
+///    directly into the open bundle's `blobs/<prefix>/<ref>.bin` sharded
+///    layout, so there is no save-time copy: every byte lands in its final
+///    home as the scanner produces it.
 ///
-/// Blobs always live on disk at `~/Library/Caches/io.zenla.DarwinScan/
-/// <session>/<ref>.bin`. Freshly-scanned blobs land there via `BlobWriter`;
-/// blobs read out of a loaded `.darwinscan` bundle are streamed into the same
-/// directory by `ScanPackage.load`. Because SwiftUI's `ReferenceFileDocument`
-/// machinery now invokes `newDocument` / `init(configuration:)` / `snapshot`
-/// from background threads, this type is explicitly `nonisolated` (overriding
-/// the project default of MainActor). Mutations to `refs` are funnelled
-/// through the scanner's MainActor `batchSink` and through `ScanPackage.load`
-/// on the document-init thread — there is no concurrent writer.
+/// **Sharded on-disk layout.** Blobs live at
+/// `<rootDirectory>/<2-char-prefix>/<ref>.bin`, matching the saved bundle
+/// format described in `ScanPackage`. The prefix is the first two characters
+/// of the hash part of the ref (after any `hint-` prefix, e.g. for
+/// `icon-3a4f…` the prefix is `3a`).
+///
+/// **Isolation.** Because the open-bundle flow runs the scanner straight into
+/// the bundle directory (no per-session cache copy), and SwiftUI's old
+/// `ReferenceFileDocument` machinery already invoked save paths from
+/// background threads, this type is explicitly `nonisolated`. Mutations to
+/// `refs` are funnelled through the scanner's MainActor `batchSink` and
+/// through `ScanPackage.openInPlace` at load time — there is no concurrent
+/// writer to `refs` itself. Concurrent writes from inspector tasks land in
+/// distinct content-addressed paths and are safe on APFS.
 @Observable
 public nonisolated final class BlobStore {
     /// Every ref we know about. The bytes live at `blobURL(forRef:)`.
     public private(set) var refs: Set<String> = []
 
-    /// Where blobs live on disk. Created on init; cleaned up on deinit.
-    public let cacheDirectory: URL
+    /// Root of the sharded blob layout — typically `<bundle>/blobs/` for an
+    /// open document, or any temp directory in tests.
+    public let rootDirectory: URL
 
-    public init() {
-        let base = FileManager.default
-            .urls(for: .cachesDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let session = "session-\(UUID().uuidString)"
-        cacheDirectory = base
-            .appendingPathComponent("io.zenla.DarwinScan", isDirectory: true)
-            .appendingPathComponent(session, isDirectory: true)
+    /// Back-compat alias. Older code (and CLAUDE.md) referred to this as
+    /// `cacheDirectory`; the store now writes directly into the bundle's
+    /// `blobs/` directory, but the symbol stayed identical so call sites
+    /// continue to compile.
+    public var cacheDirectory: URL { rootDirectory }
+
+    /// Create a fresh BlobStore that owns the given directory. Pass the
+    /// bundle's `blobs/` subdirectory for normal operation; tests can pass a
+    /// per-test temp dir. The directory is created if it doesn't exist.
+    public init(rootDirectory: URL) {
+        self.rootDirectory = rootDirectory
         try? FileManager.default.createDirectory(
-            at: cacheDirectory, withIntermediateDirectories: true
+            at: rootDirectory, withIntermediateDirectories: true
         )
     }
 
-    deinit {
-        // Best-effort cleanup. If anything is still readable from us through
-        // FileWrapper after a save, it's been copied into the package by then.
-        let dir = cacheDirectory
-        try? FileManager.default.removeItem(at: dir)
-    }
-
     /// Produce a `BlobWriter` that worker tasks can use to write blobs
-    /// concurrently. Writes go to distinct content-addressed paths so they
-    /// don't collide on APFS.
+    /// concurrently. Writes go to distinct content-addressed paths under
+    /// the same sharded layout, so they don't collide on APFS.
     public func makeWriter() -> BlobWriter {
-        BlobWriter(directory: cacheDirectory)
+        BlobWriter(rootDirectory: rootDirectory)
     }
 
     /// Register a ref the worker just wrote to disk. Idempotent.
@@ -67,56 +71,69 @@ public nonisolated final class BlobStore {
         for ref in refs { self.refs.insert(ref) }
     }
 
-    /// Read the bytes for a blob ref. Returns nil if the ref isn't known.
-    /// Called from the UI when rendering icons / strings dumps.
+    /// Read the bytes for a blob ref. Returns nil if the ref isn't known or
+    /// the file is missing.
     public func data(forRef ref: String) -> Data? {
         try? Data(contentsOf: blobURL(forRef: ref))
     }
 
-    /// Build the directory FileWrapper subtree for inclusion in the saved
-    /// document. We use `FileWrapper(url:)` so Foundation can stream bytes
-    /// from disk into the destination rather than materializing everything.
-    public func makeFileWrappersForSave() -> [String: [String: FileWrapper]] {
-        var bucketed: [String: [String: FileWrapper]] = [:]
-        for ref in refs {
-            let prefix = String(blobHashPart(ref).prefix(2))
-            let filename = "\(ref).bin"
-            let url = blobURL(forRef: ref)
-            guard let wrapper = try? FileWrapper(url: url, options: [.immediate]) else { continue }
-            wrapper.preferredFilename = filename
-            bucketed[prefix, default: [:]][filename] = wrapper
-        }
-        return bucketed
-    }
-
-    /// Path inside the cache directory for a given ref. Public so the
-    /// `BlobWriter` and tests can introspect.
+    /// Path inside the sharded blob layout for a given ref.
     public func blobURL(forRef ref: String) -> URL {
-        cacheDirectory.appendingPathComponent("\(ref).bin")
+        let prefix = Self.shardPrefix(forRef: ref)
+        return rootDirectory
+            .appendingPathComponent(prefix, isDirectory: true)
+            .appendingPathComponent("\(ref).bin")
     }
 
-    /// Strip optional "hint-" prefix to expose the raw hash for sharding.
-    private func blobHashPart(_ ref: String) -> String {
-        if let dash = ref.firstIndex(of: "-") {
-            return String(ref[ref.index(after: dash)...])
+    /// Discover blob refs already on disk under `rootDirectory` and register
+    /// them. Called by `ScanPackage.openInPlace` after attaching the existing
+    /// bundle, so the in-memory `refs` set mirrors the bundle's contents
+    /// without a copy step.
+    public func scanForExistingBlobs() {
+        let fm = FileManager.default
+        guard let prefixes = try? fm.contentsOfDirectory(at: rootDirectory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return }
+        for prefixURL in prefixes {
+            let isDir = (try? prefixURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            guard isDir else { continue }
+            guard let files = try? fm.contentsOfDirectory(at: prefixURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+            for fileURL in files {
+                let name = fileURL.lastPathComponent
+                guard name.hasSuffix(".bin") else { continue }
+                refs.insert(String(name.dropLast(4)))
+            }
         }
-        return ref
+    }
+
+    /// First two characters of the hash part of a ref. Refs are either
+    /// `<ref>` (a plain sha256) or `<hint>-<sha256>` (e.g. `icon-3a4f…`).
+    /// We shard on the hash side so a single hint doesn't make one bucket
+    /// huge.
+    public static func shardPrefix(forRef ref: String) -> String {
+        if let dash = ref.firstIndex(of: "-") {
+            let after = ref.index(after: dash)
+            return String(ref[after...].prefix(2))
+        }
+        return String(ref.prefix(2))
     }
 }
 
 /// Worker-side writer. Sendable because it carries only a directory URL —
 /// concurrent writes to distinct files in the same dir are safe on APFS.
 public nonisolated struct BlobWriter: Sendable {
-    public let directory: URL
+    public let rootDirectory: URL
 
-    public init(directory: URL) {
-        self.directory = directory
+    /// Back-compat alias; older code grabbed `writer.directory`.
+    public var directory: URL { rootDirectory }
+
+    public init(rootDirectory: URL) {
+        self.rootDirectory = rootDirectory
     }
 
-    /// Write `data` under the given ref. Idempotent: if the file exists with
-    /// matching size we skip the write to avoid touching atime / mtime.
+    /// Write `data` under the given ref into the sharded layout. Idempotent:
+    /// if the file already exists at the same size we skip the write to
+    /// avoid touching atime / mtime.
     public func write(_ data: Data, ref: String) {
-        let url = directory.appendingPathComponent("\(ref).bin")
+        let url = ensureShardURL(forRef: ref)
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
         if let attrs, (attrs[.size] as? Int) == data.count {
             return
@@ -124,14 +141,14 @@ public nonisolated struct BlobWriter: Sendable {
         try? data.write(to: url, options: .atomic)
     }
 
-    /// Copy `source` into the blob directory as `<ref>.bin` using
+    /// Copy `source` into the blob layout as `<prefix>/<ref>.bin` using
     /// FileManager — the byte stream stays in the kernel rather than passing
     /// through Foundation Data, so capturing a 200 MB Mach-O is constant-
     /// memory for the scanner. Idempotent: if a file with the same ref and
     /// size already exists, the copy is skipped (typical for content-
     /// addressed dedup across identical binaries).
     public func copy(from source: URL, ref: String) {
-        let dst = directory.appendingPathComponent("\(ref).bin")
+        let dst = ensureShardURL(forRef: ref)
         let fm = FileManager.default
         if let attrs = try? fm.attributesOfItem(atPath: dst.path),
            let dstSize = attrs[.size] as? Int,
@@ -140,11 +157,19 @@ public nonisolated struct BlobWriter: Sendable {
            srcSize == dstSize {
             return
         }
-        // Use clonefile (APFS copy-on-write) under the hood via copyItem.
-        // If the dst already exists with the wrong size, remove first.
         if fm.fileExists(atPath: dst.path) {
             try? fm.removeItem(at: dst)
         }
         try? fm.copyItem(at: source, to: dst)
+    }
+
+    /// Sharded destination URL for a ref, with the prefix directory created
+    /// on demand. Cheap to call repeatedly — `createDirectory(withIntermediate…)`
+    /// is a no-op when the dir exists.
+    private func ensureShardURL(forRef ref: String) -> URL {
+        let prefix = BlobStore.shardPrefix(forRef: ref)
+        let prefixURL = rootDirectory.appendingPathComponent(prefix, isDirectory: true)
+        try? FileManager.default.createDirectory(at: prefixURL, withIntermediateDirectories: true)
+        return prefixURL.appendingPathComponent("\(ref).bin")
     }
 }

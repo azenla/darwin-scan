@@ -261,17 +261,80 @@ struct ItemRow: View {
                             .lineLimit(1)
                     }
                 }
-                Text(header.path)
+                Text(PathCompactor.compact(header.path))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .help(header.path)
             }
             Spacer()
             if !header.tags.isEmpty {
                 TagChips(tags: Array(header.tags.prefix(3)))
             }
         }
+    }
+}
+
+/// Render long paths compactly for list rows.
+///
+/// Rule: keep the **last two** path components verbatim, shorten earlier
+/// components to their capital initials (or first character when the
+/// component has no capitals). The full path remains in the detail view
+/// and as the row's tooltip.
+///
+/// Examples:
+///   /System/Library/PrivateFrameworks/Foo.framework/Versions/A/Foo
+///     -> /S/L/PF/F.framework/V/A/Foo
+///   /usr/share/man/man1/ls.1
+///     -> /u/s/m/man1/ls.1
+///   /bin/ls
+///     -> /bin/ls          (≤2 trailing components, unchanged)
+///
+/// Virtual dyld-cache paths use `#` as the separator between the cache
+/// file and the image path; we treat the part after `#` as its own path
+/// for compaction so an arm64e cache full of dylibs reads as
+/// `/S/.../dyld_shared_cache_arm64e # /u/lib/libSystem.B.dylib`.
+enum PathCompactor {
+    static func compact(_ path: String) -> String {
+        if let hashRange = path.range(of: "#") {
+            let cache = String(path[..<hashRange.lowerBound])
+            let image = String(path[hashRange.upperBound...])
+            return "\(compactSegments(cache)) # \(compactSegments(image))"
+        }
+        return compactSegments(path)
+    }
+
+    private static func compactSegments(_ path: String) -> String {
+        let leadingSlash = path.hasPrefix("/")
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard parts.count > 2 else { return path }
+        let keepFromIndex = parts.count - 2
+        var out: [String] = []
+        out.reserveCapacity(parts.count)
+        for (idx, part) in parts.enumerated() {
+            out.append(idx < keepFromIndex ? initials(of: part) : part)
+        }
+        return (leadingSlash ? "/" : "") + out.joined(separator: "/")
+    }
+
+    private static func initials(of component: String) -> String {
+        // Strip extension before initialing (e.g. "Foo.framework" -> "Foo");
+        // re-attach the extension so the type cue ("F.framework") survives.
+        let nsComponent = component as NSString
+        let stem = nsComponent.deletingPathExtension
+        let ext = nsComponent.pathExtension
+        let stemInitials = initialsForStem(stem.isEmpty ? component : stem)
+        if !ext.isEmpty, !stem.isEmpty {
+            return "\(stemInitials).\(ext)"
+        }
+        return stemInitials
+    }
+
+    private static func initialsForStem(_ stem: String) -> String {
+        let capitals = stem.filter { $0.isUppercase }
+        if capitals.count >= 2 { return String(capitals) }
+        return stem.first.map(String.init) ?? stem
     }
 }
 

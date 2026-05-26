@@ -67,9 +67,9 @@ test targets:
 
 ```
 DarwinScan/                        # App target (SwiftUI)
-├── DarwinScanApp.swift            # @main, DocumentGroup
+├── DarwinScanApp.swift            # @main, Welcome window + WindowGroup<URL>
 ├── ContentView.swift              # NavigationSplitView root
-├── Document/ScanDocument.swift    # ReferenceFileDocument; everything else is in core
+├── Document/ScanDocument.swift    # ScanSession (in-place bundle session)
 └── UI/                            # SidebarView, ItemListView, DetailView, ScanProgressView, WelcomeView
 
 DarwinScanCore/                    # Framework — all non-UI logic. Both app and CLI link this.
@@ -120,9 +120,9 @@ MainActor default actor isolation.
             │                                    │
             ▼                                    ▼ (child tasks, parallel)
 ┌─────────────────────────┐         ┌──────────────────────────────────────┐
-│ ScanDocument            │         │ ScanPipeline (Sendable struct)       │
-│  ReferenceFileDocument  │         │  - classifies one URL → ScanItem     │
-│  ObservableObject       │         │  - extracts symbols / strings        │
+│ ScanSession             │         │ ScanPipeline (Sendable struct)       │
+│  @Observable @MainActor │         │  - classifies one URL → ScanItem     │
+│  bundleURL: URL         │         │  - extracts symbols / strings        │
 │   └─ store (ScanStore)  │         │  - writes blob bytes to disk via     │
 └─────────────────────────┘         │    BlobWriter                        │
             │                       │  - tokenises strings → strings_fts   │
@@ -141,7 +141,7 @@ MainActor default actor isolation.
 ┌─────────────────────────┐         ┌──────────────────────────┐
 │ BlobStore (nonisolated) │         │ Database (nonisolated,   │
 │  refs: Set<String>      │         │   thread-safe via lock)  │
-│  cacheDirectory: URL    │         │  items + 28 hot columns  │
+│  rootDirectory: URL     │         │  items + 28 hot columns  │
 │  + copy(from:ref:) for  │ ◀─────▶ │  symbols + symbols_fts   │
 │  whole-file capture     │         │  strings_fts (contentless│
 └─────────────────────────┘         │  snapshots / snapshot_   │
@@ -303,13 +303,15 @@ relationships + snapshot_items, all together). Reads happen at document
 open (`Database.allItems` populates the in-memory `ItemHeader` map) and
 on-demand for the heavy `ScanItem` payload via `Database.item(id:)`.
 
-When a document is **open**, the live `data.db` lives in
-`~/Library/Caches/io.zenla.DarwinScan/session-<uuid>/data.db` alongside the
-blob shards. `ScanDocument.snapshot` calls `database.checkpoint()` (WAL →
-main file) before `FileWrapper(url:)` streams the file into the saved
-bundle. On open we copy `data.db` out of the bundle into a fresh session
-cache dir and attach it — that way the saved bundle stays untouched while
-the user works.
+The bundle is the live working copy. **No session cache directory, no
+save-time copy.** `ScanPackage.createEmpty(at:)` initializes a fresh
+`.darwinscan` package at the user's chosen URL (writes `format.txt`,
+`blobs/`, an empty `data.db`); `ScanPackage.openInPlace(at:into:)` attaches
+an existing bundle. The scanner writes Mach-O headers, blob bytes, and
+SQLite rows straight into the bundle directory as it goes. File → Save is
+a WAL checkpoint, not a copy. Without DocumentGroup's Untitled-then-Save
+flow, every scan window is backed by an actual on-disk bundle from the
+moment it opens.
 
 `<ref>` is `<hint>-<sha256-hex>`, e.g. `icon-3a4f...`, `strings-9b21...`,
 `file-a97c...` (whole-file capture), `appicon-5d0e...`. Sharding by 2-char
@@ -429,6 +431,44 @@ respectively). Strict pointer-chasing through
 `__objc_classlist → objc_class → class_ro_t → name` — which would
 correctly distinguish classes from method/ivar/protocol names — is
 still deferred; it needs chained-fixup decoding on modern binaries.
+
+## DYLD cached-image symbol + strings extraction
+
+`Scanning/DyldCacheLayout.swift` + `Scanning/DyldCachedImageInspector.swift`
+extract symbols (and the per-image `__TEXT,__cstring` slice) from every
+dylib embedded in a `dyld_shared_cache_<arch>` file.
+
+The modern split-cache layout puts each image's Mach-O header in one
+subcache (a `.NN` "text" file) and its `__LINKEDIT` segment — which carries
+the LC_SYMTAB nlist + string tables — in a different subcache (a
+`.NN.dyldlinkedit` file). Pre-load understanding got two things wrong;
+both are fixed here:
+
+1. **Subcache array lives past 4 KB.** The arm64e cache stores its subcache
+   array at file offset ~0x39218 (the x86_64 cache at ~0x38968). The
+   previous loader read only the first 4 KB of the cache header and saw
+   zero subcaches. `DyldCacheLayout.load` now seeks to `subcacheOffset`
+   explicitly before reading the entries.
+2. **LC_SYMTAB offsets are subcache-local file offsets, not "unified file"
+   offsets.** For a cached image, `LC_SYMTAB.symoff` and `stroff` are file
+   offsets into the subcache file that contains the image's
+   `__LINKEDIT` segment. Resolving them is therefore a two-step process:
+   parse the image's load commands to get `__LINKEDIT.vmaddr`, map that
+   VM address through the layout to identify the LINKEDIT subcache, then
+   apply `symoff` / `stroff` as offsets within that subcache file.
+
+The string pool inside a LINKEDIT subcache can run hundreds of MB and is
+shared across every image that LINKEDIT subcache serves.
+`DyldCachedImageInspector.SharedStringTable` mmaps each LINKEDIT subcache
+on first use via `Data(contentsOf:options:[.mappedIfSafe])` so the per-
+image name lookups don't re-fault the same pages. A /System scan
+extracts ~4.5 million symbols across both arm64e and x86_64 caches in
+~55 s.
+
+`__TEXT,__cstring` extraction works similarly: each image's `__cstring`
+section header carries an `addr` (VM) and `size`. The layout resolves
+`addr` to a `(subcache, fileOffset)` pair; we read those bytes and feed
+them into `strings_fts` for the virtual item.
 
 ## DYLD shared cache + cryptex firmlinks
 
@@ -633,11 +673,6 @@ conformance of X to Decodable cannot be used in nonisolated context".
   one shows its metadata but doesn't swap the displayed items.
   `ScanStore.reloadFromLatestSnapshot()` already exists — needs a
   `reloadSnapshot(id:)` variant and a "viewing historical" banner.
-- **Symbol + strings extraction from cached dylibs inside the dyld
-  shared cache.** We enumerate the image table and emit virtual
-  framework items, but each virtual today has zero symbols and no
-  strings. Doing it needs the cache-mapping pointer → file-offset
-  translation, then a SymbolInspector-style walk per image.
 - **`__objc_classlist` pointer chasing.** Today's Obj-C class
   extraction reads raw bytes from `__TEXT,__objc_classname` — which
   catches names but mixes them with method/protocol/ivar identifiers

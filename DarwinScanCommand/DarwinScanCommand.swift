@@ -134,6 +134,10 @@ struct Generate: AsyncParsableCommand {
     var inspectLocalizations: Bool = true
 
     @Flag(name: .long, inversion: .prefixedNo,
+          help: "Skip non-English .lproj subtrees and non-English .strings files.")
+    var englishLocalizationsOnly: Bool = false
+
+    @Flag(name: .long, inversion: .prefixedNo,
           help: "Inspect .app bundles (Info.plist + icon extraction).")
     var inspectAppBundles: Bool = true
 
@@ -179,6 +183,7 @@ struct Generate: AsyncParsableCommand {
         options.stringsMinLength = stringsMinLength
         options.indexManPages = indexManPages
         options.inspectLocalizations = inspectLocalizations
+        options.englishLocalizationsOnly = englishLocalizationsOnly
         options.inspectAppBundles = inspectAppBundles
         options.inspectMLModels = inspectMLModels
         options.inspectDyldCache = inspectDyldCache

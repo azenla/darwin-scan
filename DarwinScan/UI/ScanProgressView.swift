@@ -134,32 +134,43 @@ struct ScanOptionsSheet: View {
                 .font(.callout)
 
             GroupBox("Roots") {
-                ForEach(options.roots, id: \.self) { root in
-                    HStack {
-                        Image(systemName: "folder")
-                        Text(root)
-                            .font(.system(.callout, design: .monospaced))
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(options.roots, id: \.self) { root in
+                        HStack {
+                            Image(systemName: "folder")
+                            Text(root)
+                                .font(.system(.callout, design: .monospaced))
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             GroupBox("Inspection") {
-                Toggle("Hash every file (SHA-256)", isOn: $options.hashFiles)
-                Toggle("Index man pages", isOn: $options.indexManPages)
-                Toggle("Inspect localizations (.strings)", isOn: $options.inspectLocalizations)
-                Toggle("Inspect ML models", isOn: $options.inspectMLModels)
-                Toggle("Inspect dyld_shared_cache headers", isOn: $options.inspectDyldCache)
-                Toggle("Follow symbolic links", isOn: $options.followSymlinks)
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Hash every file (SHA-256)", isOn: $options.hashFiles)
+                    Toggle("Index man pages", isOn: $options.indexManPages)
+                    Toggle("Inspect localizations (.strings)", isOn: $options.inspectLocalizations)
+                    Toggle("English localizations only", isOn: $options.englishLocalizationsOnly)
+                        .disabled(!options.inspectLocalizations)
+                        .padding(.leading, 18)
+                    Toggle("Inspect ML models", isOn: $options.inspectMLModels)
+                    Toggle("Inspect dyld_shared_cache headers", isOn: $options.inspectDyldCache)
+                    Toggle("Follow symbolic links", isOn: $options.followSymlinks)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             GroupBox("Strings Cache") {
-                Toggle("Extract printable strings from Mach-O executables", isOn: $options.extractStrings)
-                Stepper("Min length: \(options.stringsMinLength)", value: $options.stringsMinLength, in: 4...64)
-                    .disabled(!options.extractStrings)
-                Text("Increases scan time substantially. Strings are stored inside the .darwinscan bundle for offline search.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Extract printable strings from Mach-O executables", isOn: $options.extractStrings)
+                    Stepper("Min length: \(options.stringsMinLength)", value: $options.stringsMinLength, in: 4...64)
+                        .disabled(!options.extractStrings)
+                    Text("Increases scan time substantially. Strings are stored inside the .darwinscan bundle for offline search.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             HStack {
