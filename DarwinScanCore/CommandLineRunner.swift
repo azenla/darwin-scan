@@ -1,17 +1,10 @@
 import Foundation
 
-/// One-shot scan driver suitable for a command-line invocation. The SwiftUI
-/// `ScanController` is fire-and-forget (it returns immediately and writes
-/// back via callbacks); this helper waits for the scan to finish.
-///
-/// Identical write model to the app: the destination `.darwinscan` bundle is
-/// either created (`ScanPackage.createEmpty`) or opened in place
-/// (`ScanPackage.openInPlace`), and the worker streams items straight into
-/// `<bundle>/data.db` and `<bundle>/blobs/<prefix>/`. No FileWrapper-style
-/// save copy at the end.
+/// Synchronous-style drivers for the new two-phase CLI. The SwiftUI
+/// `ScanController` is fire-and-forget; these helpers await completion so
+/// `darwin-scan` exits with a sensible status code.
 @MainActor
 public enum CommandLineRunner {
-    /// Progress snapshot delivered to the host CLI for display.
     public struct ProgressUpdate: Sendable {
         public let phase: ScanProgress.Phase
         public let filesVisited: Int
@@ -30,12 +23,10 @@ public enum CommandLineRunner {
         }
     }
 
-    /// Run a scan with `options` and write the resulting state into the
-    /// `.darwinscan` bundle at `outputBundleURL`. Creates the bundle if it
-    /// doesn't exist; opens it in place and appends a new snapshot if it
-    /// does. Progress updates are delivered at the same cadence the GUI
-    /// receives them (~150 ms throttle).
-    public static func runScan(
+    /// Phase 1: import only. Creates the bundle if it doesn't exist; chains
+    /// a new snapshot onto the existing snapshot history otherwise.
+    public static func runImport(
+        source: any SourceProvider,
         options: ScanOptions,
         outputBundleURL: URL,
         progressHandler: @escaping @MainActor (ProgressUpdate) -> Void = { _ in }
@@ -45,77 +36,104 @@ public enum CommandLineRunner {
         if fm.fileExists(atPath: outputBundleURL.path) {
             store = ScanStore()
             try ScanPackage.openInPlace(at: outputBundleURL, into: store)
-            FileHandle.standardError.write(Data("Re-scanning existing bundle (latest snapshot will become the parent of this one)\n".utf8))
         } else {
             store = try ScanPackage.createEmpty(at: outputBundleURL)
         }
         store.options = options
+
         let started = Date()
         store.lastScanStarted = started
-        let info = SystemInfoCollector.capture()
-        store.systemInfo = info
-        store.beginSnapshot(at: started, systemInfo: info)
+        store.systemInfo = source.systemInfo
+        store.beginImport(
+            source: source.sourceKind,
+            sourceRef: source.sourceRef,
+            startedAt: started,
+            label: source.snapshotLabel,
+            systemInfo: source.systemInfo,
+            options: options
+        )
 
         let writer = store.blobStore.makeWriter()
         let blobStore = store.blobStore
+        let pipeline = ImportPipeline(options: options, blobWriter: writer, source: source)
+        let walker = FileWalker(options: options, rootURLs: source.roots)
 
-        let worker = ScanWorker()
-        await worker.run(
-            options: options,
-            blobWriter: writer,
-            database: store.database,
-            progressSink: { snapshot in
-                progressHandler(ProgressUpdate(from: snapshot))
-            },
+        await ImportWorker.run(
+            pipeline: pipeline,
+            walker: walker,
+            progressSink: { snapshot in progressHandler(ProgressUpdate(from: snapshot)) },
             batchSink: { results in
-                var refs: [String] = []
-                refs.reserveCapacity(results.count)
-                var newItems: [ScanItem] = []
-                newItems.reserveCapacity(results.count)
-                var symbolRows: [SymbolRow] = []
+                var refs: [String] = []; refs.reserveCapacity(results.count)
+                var items: [ScanItem] = []; items.reserveCapacity(results.count)
                 for r in results {
-                    newItems.append(r.item)
-                    newItems.append(contentsOf: r.additionalItems)
+                    items.append(r.item)
                     for ref in r.blobRefs { refs.append(ref) }
-                    if !r.symbols.isEmpty {
-                        symbolRows.append(contentsOf: r.symbols)
-                    }
                 }
                 blobStore.registerMany(refs)
-                // Clear-on-rescan keyed by every itemID we're about to
-                // re-insert symbols for — covers both first-class binaries
-                // (whose item is `r.item`) and cached-image symbols
-                // (whose item is one of `r.additionalItems`).
-                var symbolItemIDs: Set<UUID> = []
-                for row in symbolRows { symbolItemIDs.insert(row.itemID) }
-                for id in symbolItemIDs where store.items[id] != nil {
-                    store.clearSymbolsForReingest(id)
-                }
-                store.ingest(newItems)
-                store.insertSymbols(symbolRows)
-            },
-            systemInfoSink: { info in
-                store.systemInfo = info
+                store.ingest(items)
             }
         )
 
         let completed = Date()
-        let result = store.finalizeScan(at: completed)
-        switch result.kind {
-        case .discarded:
-            store.reloadFromLatestSnapshot()
-            FileHandle.standardError.write(Data("No changes detected — snapshot discarded; bundle on disk is unchanged.\n".utf8))
-        case .kept:
-            FileHandle.standardError.write(Data("Snapshot kept: +\(result.added) -\(result.removed) ~\(result.changed)\n".utf8))
-        case .noSnapshot:
-            break
-        }
+        store.completeImport(at: completed)
+        try? store.database?.checkpoint()
+        FileHandle.standardError.write(Data("Imported \(store.itemCount) items.\n".utf8))
+        source.cleanup()
+    }
 
-        // Checkpoint the WAL into the main DB file. The on-disk bundle is
-        // already up-to-date from the per-batch transactions; this just
-        // collapses the WAL so a copy of the bundle (or `darwin-scan
-        // extract`) sees the final state without depending on the
-        // companion `-wal` / `-shm` files.
+    /// Phase 2: re-runnable analysis. `snapshotID == nil` means "latest".
+    public static func runAnalysis(
+        bundleURL: URL,
+        snapshotID: Int64? = nil,
+        options: ScanOptions,
+        progressHandler: @escaping @MainActor (ProgressUpdate) -> Void = { _ in }
+    ) async throws {
+        let store = ScanStore()
+        try ScanPackage.openInPlace(at: bundleURL, into: store)
+        guard let database = store.database else {
+            throw NSError(domain: "darwin-scan", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Bundle has no database."])
+        }
+        let target: Int64?
+        if let snapshotID {
+            target = snapshotID
+        } else {
+            target = try database.latestSnapshotID()
+        }
+        guard let target else {
+            throw NSError(domain: "darwin-scan", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "No snapshot to analyze."])
+        }
+        try? database.markSnapshotAnalysis(snapshotID: target, state: .running, analyzedAt: nil, analyzerVersion: nil)
+        store.invalidateSnapshotHistory()
+
+        let worker = AnalysisWorker()
+        await worker.run(
+            snapshotID: target,
+            options: options,
+            store: store,
+            progressSink: { snapshot in progressHandler(ProgressUpdate(from: snapshot)) }
+        )
+        try? database.markSnapshotAnalysis(
+            snapshotID: target,
+            state: .done,
+            analyzedAt: Date(),
+            analyzerVersion: Database.currentAnalyzerVersion
+        )
+        try? database.checkpoint()
+        FileHandle.standardError.write(Data("Analysis complete for snapshot \(target).\n".utf8))
+    }
+
+    public static func listSnapshots(bundleURL: URL) throws -> [SnapshotRecord] {
+        let store = ScanStore()
+        try ScanPackage.openInPlace(at: bundleURL, into: store)
+        return store.snapshotHistory()
+    }
+
+    public static func deleteSnapshot(bundleURL: URL, snapshotID: Int64) throws {
+        let store = ScanStore()
+        try ScanPackage.openInPlace(at: bundleURL, into: store)
+        store.deleteSnapshot(snapshotID)
         try? store.database?.checkpoint()
     }
 }

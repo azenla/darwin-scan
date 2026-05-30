@@ -24,7 +24,7 @@ struct DetailView: View {
             if let id = itemSelection, let item = loadedItem, loadedID == id {
                 DetailContent(item: item, store: store, itemSelection: $itemSelection)
                     .id(id)
-            } else if let id = itemSelection, let header = store.items[id] {
+            } else if let id = itemSelection, let header = store.itemHeader(id: id) {
                 // Selection changed but the full payload isn't loaded yet —
                 // typically a single frame. Show a slim placeholder so the
                 // header info doesn't pop in.
@@ -190,7 +190,18 @@ private struct HeaderCard: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                Button {
+                    let controller = ScanController()
+                    controller.analyzeItem(item.id, options: store.options, in: store)
+                    if let active = store.activeSnapshotID { store.setActiveSnapshot(active) }
+                } label: {
+                    Label(item.analysisState == .done ? "Re-Analyze" : "Analyze", systemImage: "sparkles")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Run analysis on just this item — useful when developing new inspectors.")
                 Spacer()
+                AnalysisStateChip(state: item.analysisState, analyzedAt: item.analyzedAt)
             }
         }
         .padding(16)
@@ -255,6 +266,40 @@ private struct CategoryBadge: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
         .background(Capsule().fill(.tint.opacity(0.18)))
+    }
+}
+
+/// Small chip near the detail header showing whether the item has been
+/// analyzed (and when). Color matches the sidebar's snapshot row badge.
+struct AnalysisStateChip: View {
+    let state: AnalysisState
+    let analyzedAt: Date?
+
+    var body: some View {
+        let (label, color): (String, Color) = {
+            switch state {
+            case .pending: return ("Pending Analysis", .orange)
+            case .running: return ("Analyzing…", .blue)
+            case .done:    return ("Analyzed", .green)
+            case .failed:  return ("Analysis Failed", .red)
+            case .none, .partial: return ("Partial", .yellow)
+            }
+        }()
+        return HStack(spacing: 4) {
+            Image(systemName: state == .done ? "checkmark.seal" : "clock.badge.questionmark")
+                .imageScale(.small)
+            Text(label)
+                .font(.caption2)
+            if state == .done, let analyzedAt {
+                Text("· \(ByteFormat.compactDate(analyzedAt))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(color.opacity(0.15)))
     }
 }
 
@@ -1424,36 +1469,22 @@ private struct FlowLayout: Layout {
 struct SystemInfoView: View {
     @Bindable var store: ScanStore
 
+    private var activeRecord: SnapshotRecord? {
+        guard let id = store.activeSnapshotID else { return nil }
+        return store.snapshotHistory().first { $0.id == id }
+    }
+
     var body: some View {
+        let kind = activeRecord?.sourceKind ?? .currentSystem
         VStack(alignment: .leading, spacing: 16) {
             if let info = store.systemInfo {
-                Section(title: "Host", systemImage: "macpro.gen3") {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if let p = info.productName, let v = info.productVersion {
-                            InfoRow(label: "OS", value: "\(p) \(v)")
-                        }
-                        if let b = info.productBuildVersion { InfoRow(label: "Build", value: b) }
-                        if let h = info.hardwareModel { InfoRow(label: "Model", value: h) }
-                        if let cpu = info.cpuBrand { InfoRow(label: "CPU", value: cpu) }
-                        if !info.architectures.isEmpty {
-                            HStack(alignment: .firstTextBaseline) {
-                                Text("Arch")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 110, alignment: .leading)
-                                WrappingHStack(spacing: 6) {
-                                    ForEach(info.architectures, id: \.self) { arch in
-                                        ColoredChip(text: arch, color: archColor(arch))
-                                    }
-                                }
-                            }
-                        }
-                        if let host = info.hostName { InfoRow(label: "Hostname", value: host) }
-                        if let sip = info.sipStatus { InfoRow(label: "SIP", value: sip) }
-                        InfoRow(label: "Captured", value: ByteFormat.compactDate(info.capturedAt))
-                    }
+                switch kind {
+                case .currentSystem:
+                    hostSection(info)
+                case .ipsw:
+                    buildInfoSection(info, record: activeRecord)
                 }
-                if let kv = info.kernelVersion {
+                if let kv = info.kernelVersion, kind == .currentSystem {
                     Section(title: "Kernel", systemImage: "cpu") {
                         Text(kv)
                             .font(.system(.caption, design: .monospaced))
@@ -1461,7 +1492,7 @@ struct SystemInfoView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                if let boot = info.bootArgs, !boot.isEmpty {
+                if let boot = info.bootArgs, !boot.isEmpty, kind == .currentSystem {
                     Section(title: "Boot Args", systemImage: "power") {
                         Text(boot)
                             .font(.system(.caption, design: .monospaced))
@@ -1473,11 +1504,103 @@ struct SystemInfoView: View {
                 ContentUnavailableView(
                     "No system info yet",
                     systemImage: "info.circle",
-                    description: Text("Run a scan to capture host information.")
+                    description: Text("Import a snapshot to capture host or IPSW info.")
                 )
             }
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func hostSection(_ info: SystemInfo) -> some View {
+        Section(title: "Host", systemImage: "macpro.gen3") {
+            VStack(alignment: .leading, spacing: 6) {
+                if let p = info.productName, let v = info.productVersion {
+                    InfoRow(label: "OS", value: "\(p) \(v)")
+                }
+                if let b = info.productBuildVersion { InfoRow(label: "Build", value: b) }
+                if let h = info.hardwareModel { InfoRow(label: "Model", value: h) }
+                if let cpu = info.cpuBrand { InfoRow(label: "CPU", value: cpu) }
+                if !info.architectures.isEmpty {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Arch")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        WrappingHStack(spacing: 6) {
+                            ForEach(info.architectures, id: \.self) { arch in
+                                ColoredChip(text: arch, color: archColor(arch))
+                            }
+                        }
+                    }
+                }
+                if let host = info.hostName { InfoRow(label: "Hostname", value: host) }
+                if let sip = info.sipStatus { InfoRow(label: "SIP", value: sip) }
+                InfoRow(label: "Captured", value: ByteFormat.compactDate(info.capturedAt))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func buildInfoSection(_ info: SystemInfo, record: SnapshotRecord?) -> some View {
+        // The "System Info" sidebar selection, when the active snapshot is
+        // an IPSW, becomes a Build Info dashboard for that image. The
+        // header surfaces the image name (e.g. "Image #1 · UniversalMac…")
+        // so it's obvious which build the panel describes.
+        Section(title: "Build Info" + (record.map { " · \(label(for: $0))" } ?? ""),
+                systemImage: "shippingbox") {
+            VStack(alignment: .leading, spacing: 6) {
+                if let v = info.productVersion {
+                    InfoRow(label: "macOS", value: v)
+                }
+                if let b = info.productBuildVersion { InfoRow(label: "Build", value: b) }
+                if let train = info.buildTrain { InfoRow(label: "Train", value: train) }
+                if !info.architectures.isEmpty {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Arch")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        WrappingHStack(spacing: 6) {
+                            ForEach(info.architectures, id: \.self) { arch in
+                                ColoredChip(text: arch, color: archColor(arch))
+                            }
+                        }
+                    }
+                }
+                if let source = record?.sourceRef {
+                    InfoRow(label: "Source", value: source)
+                }
+                if let started = record?.startedAt {
+                    InfoRow(label: "Imported", value: ByteFormat.compactDate(started))
+                }
+            }
+        }
+        if let devices = info.supportedProductTypes, !devices.isEmpty {
+            Section(title: "Supported Devices · \(devices.count)", systemImage: "macbook.and.iphone") {
+                WrappingHStack(spacing: 6) {
+                    ForEach(devices, id: \.self) { device in
+                        Text(device)
+                            .font(.caption.monospaced())
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(.tint.opacity(0.12)))
+                    }
+                }
+            }
+        }
+    }
+
+    private func label(for record: SnapshotRecord) -> String {
+        // "Image #N" if the snapshot has no friendly label; otherwise the
+        // friendly label produced by the source provider (e.g.
+        // "IPSW · UniversalMac_26.5_25F71_Restore" → strip the prefix so
+        // the header line stays short).
+        if let lbl = record.label {
+            if lbl.hasPrefix("IPSW · ") { return "Image #\(record.id) · " + String(lbl.dropFirst("IPSW · ".count)) }
+            return "Image #\(record.id) · \(lbl)"
+        }
+        return "Image #\(record.id)"
     }
 }

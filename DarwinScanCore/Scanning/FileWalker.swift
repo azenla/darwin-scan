@@ -8,9 +8,15 @@ import Foundation
 /// We use `AsyncStream` so callers can iterate with `for await`.
 public nonisolated struct FileWalker: Sendable {
     public let options: ScanOptions
+    /// Optional override of `options.roots`. When non-empty, the walker
+    /// visits these URLs instead of the option-derived path list. Used by
+    /// `IPSWSource` to point the walker at mountpoint-relative URLs while
+    /// keeping the rest of ScanOptions intact.
+    public let rootURLs: [URL]
 
-    public init(options: ScanOptions) {
+    public init(options: ScanOptions, rootURLs: [URL] = []) {
         self.options = options
+        self.rootURLs = rootURLs
     }
 
     /// True if `path` (or one of its prefix segments) is in the excludes list.
@@ -77,8 +83,10 @@ public nonisolated struct FileWalker: Sendable {
         return AsyncStream { continuation in
             Task.detached(priority: .userInitiated) {
                 let fm = FileManager.default
-                for root in walker.options.roots {
-                    let rootURL = URL(fileURLWithPath: root, isDirectory: true)
+                let roots: [URL] = walker.rootURLs.isEmpty
+                    ? walker.options.roots.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                    : walker.rootURLs
+                for rootURL in roots {
                     var isDir: ObjCBool = false
                     guard fm.fileExists(atPath: rootURL.path, isDirectory: &isDir) else { continue }
                     if !isDir.boolValue {

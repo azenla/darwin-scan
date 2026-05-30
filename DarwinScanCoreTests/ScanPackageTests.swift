@@ -32,7 +32,7 @@ struct ScanPackageTests {
             sipStatus: nil,
             capturedAt: Date(timeIntervalSince1970: 1_700_000_000)
         )
-        source.beginSnapshot(systemInfo: source.systemInfo)
+        source.beginImport(source: .currentSystem, sourceRef: "test", systemInfo: source.systemInfo)
         let items: [ScanItem] = (0..<5).map { i in
             ScanItem(
                 id: UUID(),
@@ -47,19 +47,20 @@ struct ScanPackageTests {
             )
         }
         source.ingest(items)
-        source.completeCurrentSnapshot()
+        source.completeImport()
         try source.database?.checkpoint()
 
         // Re-open the bundle through the same code path the GUI uses.
         let loaded = ScanStore()
         try ScanPackage.openInPlace(at: bundleURL, into: loaded)
+        try ScanPackage.populateActiveSnapshot(store: loaded)
 
-        #expect(loaded.items.count == items.count)
+        #expect(loaded.itemCount == items.count)
         #expect(loaded.counts()[.executable] == 3)
         #expect(loaded.counts()[.framework] == 2)
         #expect(loaded.systemInfo?.productVersion == "26.5")
         // Outgoing relationship persisted via SQLite.
-        let firstID = loaded.itemsByPath["/x/0"]
+        let firstID = loaded.itemHeader(atPath: "/x/0")?.id
         let targets = try loaded.database?.outgoingTargets(sourceID: firstID!) ?? []
         #expect(targets == ["/y"])
     }
@@ -72,7 +73,8 @@ struct ScanPackageTests {
 
         let loaded = ScanStore()
         try ScanPackage.openInPlace(at: bundleURL, into: loaded)
-        #expect(loaded.items.isEmpty)
+        try ScanPackage.populateActiveSnapshot(store: loaded)
+        #expect(loaded.itemCount == 0)
         #expect(loaded.database != nil)
     }
 
@@ -115,7 +117,9 @@ struct CommandLineRunnerTests {
         options.extractStrings = false
         options.indexManPages = false
 
-        try await CommandLineRunner.runScan(
+        let source = CurrentSystemSource(options: options)
+        try await CommandLineRunner.runImport(
+            source: source,
             options: options,
             outputBundleURL: bundleURL,
             progressHandler: { _ in }
@@ -131,6 +135,7 @@ struct CommandLineRunnerTests {
         // the GUI's load path agrees with what the CLI produced.
         let store = ScanStore()
         try ScanPackage.openInPlace(at: bundleURL, into: store)
+        try ScanPackage.populateActiveSnapshot(store: store)
         // The framework source tree contains plenty of Swift files; nothing
         // is a recognised category, but the worker should at least visit them
         // without crashing. We just assert the database opened.

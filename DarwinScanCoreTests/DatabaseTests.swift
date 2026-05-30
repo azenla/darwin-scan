@@ -117,7 +117,7 @@ struct DatabaseTests {
         #expect(Set(fetched.map(\.id)) == Set(items.map(\.id)))
     }
 
-    @Test func clearItemsAlsoClearsRelationships() throws {
+    @Test func deleteItemAlsoClearsRelationships() throws {
         let (db, url) = try makeTempDB()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let item = ScanItem(
@@ -126,7 +126,7 @@ struct DatabaseTests {
             relationships: [Relationship(kind: .linksDylib, targetPath: "/y")]
         )
         try db.upsertItem(item)
-        try db.clearItems()
+        try db.deleteItem(id: item.id)
         #expect(try db.allItems().isEmpty)
         #expect(try db.outgoingTargets(sourceID: item.id).isEmpty)
     }

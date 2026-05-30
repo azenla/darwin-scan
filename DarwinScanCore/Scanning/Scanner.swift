@@ -1,259 +1,368 @@
 import Foundation
 import Observation
 
-/// Single-shot scan controller. Holds an `actor`-isolated worker that does the
-/// heavy lifting and a `@Observable` MainActor-side surface (`progress`,
-/// `isRunning`) that SwiftUI can bind to.
+/// Two-phase scan orchestrator.
 ///
-/// IMPORTANT: `progress` has a single writer — the worker, via `progressSink`.
-/// `batchSink` ingests items but does NOT touch `progress`. This is what keeps
-/// the on-screen counters from flapping: every snapshot is internally
-/// consistent because no other callback can clobber individual fields between
-/// snapshots.
+/// - **Import**: walks a `SourceProvider`, hashes files, captures bytes into
+///   the blob store, and writes minimal `ScanItem` rows. Items land with
+///   `category = .unanalyzed` and `analysisState = .pending`. Fast — there
+///   are no inspector calls in this phase. Bound to the in-flight snapshot
+///   so cancelling discards just that snapshot.
+///
+/// - **Analyze**: re-runs the inspectors against captured blob bytes (or
+///   live file paths for current-system imports where capture is off).
+///   Refines category, populates per-category payloads, extracts symbols
+///   and strings into FTS. Re-runnable on a finished snapshot or on a
+///   single item.
+///
+/// `ScanController` is the SwiftUI-facing surface. It owns the worker actor
+/// and emits `ScanProgress` snapshots for the UI to bind to.
 @Observable
 @MainActor
 public final class ScanController {
     public var progress: ScanProgress = ScanProgress()
     public var isRunning: Bool = false
-    public var lastResult: ScanResult?
+    public var phase: Phase = .idle
+
+    public enum Phase: Equatable {
+        case idle
+        case importing
+        case analyzing
+        case done
+        case failed(String)
+    }
 
     private var workerTask: Task<Void, Never>?
+    /// Provider currently driving the active import. Held so we can tear
+    /// down (unmount IPSW, remove extraction dir) when the import finishes
+    /// or is cancelled.
+    private var activeSource: (any SourceProvider)?
 
     public init() {}
 
-    public func cancel() {
-        workerTask?.cancel()
-    }
+    public func cancel() { workerTask?.cancel() }
 
-    public func startScan(options: ScanOptions, ingestInto store: ScanStore) {
+    // MARK: - Import
+
+    /// Start an import using the given source. Creates a new snapshot row in
+    /// the bundle, walks the source, writes minimal items + captures bytes.
+    /// Does NOT run analysis — call `startAnalysis(...)` afterwards.
+    public func startImport(
+        source: any SourceProvider,
+        options: ScanOptions,
+        into store: ScanStore
+    ) {
         guard !isRunning else { return }
         isRunning = true
-        progress = ScanProgress(phase: .enumerating, startedAt: Date())
-        store.reset()
+        phase = .importing
+        progress = ScanProgress(phase: .importing, startedAt: Date())
         store.options = options
         let started = Date()
         store.lastScanStarted = started
-        // Capture sw_vers / uname / SIP state at scan start so the snapshot
-        // row records OS-level metadata for later diff. Also seed
-        // `store.systemInfo` so the toolbar reflects the host immediately
-        // (worker would otherwise set it again ~150ms in).
-        let capturedInfo = SystemInfoCollector.capture()
-        store.systemInfo = capturedInfo
-        // Open a snapshot row for this scan. `ingest` will record per-item
-        // membership; `finalizeScan` below either keeps it or discards it
-        // depending on whether anything changed.
-        store.beginSnapshot(at: started, systemInfo: capturedInfo)
+        store.systemInfo = source.systemInfo
 
+        let snapshotID = store.beginImport(
+            source: source.sourceKind,
+            sourceRef: source.sourceRef,
+            startedAt: started,
+            label: source.snapshotLabel,
+            systemInfo: source.systemInfo,
+            options: options
+        )
+        guard snapshotID != nil else {
+            phase = .failed("Failed to open snapshot row")
+            isRunning = false
+            return
+        }
+
+        activeSource = source
         let writer = store.blobStore.makeWriter()
         let blobStore = store.blobStore
+        let pipeline = ImportPipeline(options: options, blobWriter: writer, source: source)
+        let walker = FileWalker(options: options, rootURLs: source.roots)
 
-        let worker = ScanWorker()
-        // Pin the scan at `.utility` so the TaskGroup children running on the
-        // worker actor's executor inherit it. Without this, the task adopts
-        // the SwiftUI gesture's `.userInitiated` QoS, and ImageIO's internal
-        // dispatches (`CGImageSourceCreateThumbnailAtIndex` in IconInspector)
-        // run at `.default` — a higher-QoS thread waiting on lower-QoS work
-        // is the textbook priority inversion the runtime warns about.
         workerTask = Task(priority: .utility) { @MainActor [weak self] in
-            await worker.run(
-                options: options,
-                blobWriter: writer,
-                database: store.database,
+            await ImportWorker.run(
+                pipeline: pipeline,
+                walker: walker,
                 progressSink: { [weak self] snapshot in
                     self?.progress = snapshot
                 },
                 batchSink: { results in
-                    // Ingest only — never write to `progress` from here.
-                    // The worker owns all progress counters.
                     var refs: [String] = []
                     refs.reserveCapacity(results.count)
                     var newItems: [ScanItem] = []
                     newItems.reserveCapacity(results.count)
-                    var symbolRows: [SymbolRow] = []
                     for r in results {
                         newItems.append(r.item)
-                        // Secondary items (e.g. dyld_shared_cache virtual
-                        // images) ride alongside their parent in the same
-                        // ingest call so they share a transaction.
-                        newItems.append(contentsOf: r.additionalItems)
                         for ref in r.blobRefs { refs.append(ref) }
-                        if !r.symbols.isEmpty {
-                            symbolRows.append(contentsOf: r.symbols)
-                        }
                     }
                     blobStore.registerMany(refs)
-                    // Path-collision rescans reuse a previous UUID; their
-                    // old symbol rows would otherwise stick around. We
-                    // clear before inserting so the new symbol set wins.
-                    // Collect IDs from the symbol rows themselves so
-                    // cached-image symbols (whose itemID points at the
-                    // virtual framework, not the cache file) are covered.
-                    var symbolItemIDs: Set<UUID> = []
-                    for row in symbolRows { symbolItemIDs.insert(row.itemID) }
-                    for id in symbolItemIDs where store.items[id] != nil {
-                        store.clearSymbolsForReingest(id)
-                    }
                     store.ingest(newItems)
-                    store.insertSymbols(symbolRows)
-                },
-                systemInfoSink: { info in
-                    store.systemInfo = info
                 }
             )
             self?.progress.phase = .done
             self?.progress.inFlightPaths.removeAll()
             self?.isRunning = false
             let completed = Date()
-            // Finalize the snapshot. If nothing changed since the parent
-            // snapshot, the new row is discarded (and the in-memory view
-            // is reloaded from the parent so the user sees the prior
-            // state). Otherwise the row is kept with completed_at set.
-            let result = store.finalizeScan(at: completed)
-            switch result.kind {
-            case .discarded:
-                store.reloadFromLatestSnapshot()
-                print("[ScanController] snapshot discarded — no changes since previous scan")
-            case .kept:
-                print("[ScanController] snapshot kept: +\(result.added) -\(result.removed) ~\(result.changed)")
-            case .noSnapshot:
-                break
+            if Task.isCancelled {
+                store.discardCurrentImport()
+                self?.phase = .failed("cancelled")
+            } else {
+                store.completeImport(at: completed)
+                self?.phase = .done
             }
+            self?.activeSource?.cleanup()
+            self?.activeSource = nil
+            try? store.database?.checkpoint()
         }
     }
-}
 
-public nonisolated struct ScanResult: Sendable {
-    public var itemCount: Int
+    // MARK: - Analyze
 
-    public init(itemCount: Int) { self.itemCount = itemCount }
-}
+    /// Run analysis over every item in `snapshotID` (defaults to the
+    /// active snapshot). Idempotent — items are reset and re-analyzed.
+    public func startAnalysis(
+        snapshotID: Int64? = nil,
+        options: ScanOptions,
+        in store: ScanStore
+    ) {
+        guard !isRunning else { return }
+        guard let database = store.database else { return }
+        let targetSnapshot = snapshotID ?? store.activeSnapshotID
+        guard let targetSnapshot else { return }
+        isRunning = true
+        phase = .analyzing
+        progress = ScanProgress(phase: .analyzing, startedAt: Date())
+        try? database.markSnapshotAnalysis(
+            snapshotID: targetSnapshot,
+            state: .running,
+            analyzedAt: nil,
+            analyzerVersion: nil
+        )
+        store.invalidateSnapshotHistory()
 
-/// Output of one inspector run, with any blob bytes already persisted to disk
-/// by the worker before this struct crosses an actor boundary.
-public nonisolated struct InspectResult: Sendable {
-    public let item: ScanItem
-    public let blobRefs: [String]
-    /// Symbols extracted from a Mach-O binary, stamped with this item's UUID
-    /// so the main-actor sink can hand them straight to the database without
-    /// re-parsing. Empty for non-Mach-O items and when `extractSymbols` is off.
-    public let symbols: [SymbolRow]
-    /// Secondary items emitted alongside the primary one. Today this is
-    /// populated only by the dyld_shared_cache classifier — one cache URL
-    /// expands to thousands of virtual `framework` items, one per cached
-    /// dylib image. These items have no `fileBlobRef` (the cache file
-    /// itself is what gets captured) and aren't symbol/strings-inspected
-    /// from this entry point; they cross-link back via `.inDyldCache`.
-    public let additionalItems: [ScanItem]
+        let worker = AnalysisWorker()
+        workerTask = Task(priority: .utility) { @MainActor [weak self] in
+            // AnalysisWorker.run is an instance method on the actor, so the
+            // body runs on the worker's executor — MainActor stays free
+            // during the per-item SQL + inspector loop.
+            await worker.run(
+                snapshotID: targetSnapshot,
+                options: options,
+                store: store,
+                progressSink: { [weak self] snapshot in
+                    self?.progress = snapshot
+                }
+            )
+            let completed = Date()
+            self?.progress.phase = .done
+            self?.progress.inFlightPaths.removeAll()
+            self?.isRunning = false
+            if Task.isCancelled {
+                try? database.markSnapshotAnalysis(
+                    snapshotID: targetSnapshot,
+                    state: .partial,
+                    analyzedAt: nil,
+                    analyzerVersion: Database.currentAnalyzerVersion
+                )
+                self?.phase = .failed("cancelled")
+            } else {
+                try? database.markSnapshotAnalysis(
+                    snapshotID: targetSnapshot,
+                    state: .done,
+                    analyzedAt: completed,
+                    analyzerVersion: Database.currentAnalyzerVersion
+                )
+                self?.phase = .done
+            }
+            store.invalidateSnapshotHistory()
+            // Refresh the active-snapshot in-memory view from disk so the
+            // user sees the refined items. The refresh re-reads ~half a
+            // million headers for a /System-scale bundle, so push it off
+            // MainActor — the controller has already flipped `.isRunning`
+            // back to false, so the toolbar is responsive while this runs.
+            if let active = store.activeSnapshotID {
+                let store = store
+                let snapID = active
+                Task.detached(priority: .userInitiated) {
+                    store.setActiveSnapshot(snapID)
+                }
+            }
+            try? database.checkpoint()
+        }
+    }
 
-    public init(item: ScanItem, blobRefs: [String], symbols: [SymbolRow] = [], additionalItems: [ScanItem] = []) {
-        self.item = item
-        self.blobRefs = blobRefs
-        self.symbols = symbols
-        self.additionalItems = additionalItems
+    /// Re-run analysis for a single item. Intended for the detail view's
+    /// "Analyze this item" affordance.
+    public func analyzeItem(_ itemID: UUID, options: ScanOptions, in store: ScanStore) {
+        guard let database = store.database else { return }
+        guard let item = try? database.item(id: itemID) else { return }
+        let pipeline = AnalysisPipeline(options: options, blobStore: store.blobStore, database: database)
+        let refined = pipeline.analyze(item: item)
+        store.applyAnalysis(refined.item, symbols: refined.symbols)
+        try? database.setItemAnalysisState(
+            itemID: itemID,
+            state: .done,
+            analyzedAt: Date(),
+            analyzerVersion: Database.currentAnalyzerVersion
+        )
     }
 }
 
-// MARK: - Worker
+// MARK: - Import result
 
-public actor ScanWorker {
-    public init() {}
+public nonisolated struct ImportResult: Sendable {
+    public let item: ScanItem
+    public let blobRefs: [String]
+    public init(item: ScanItem, blobRefs: [String]) {
+        self.item = item
+        self.blobRefs = blobRefs
+    }
+}
 
-    /// Run a scan. Architecture: a sliding-window `TaskGroup` keeps N
-    /// inspector tasks in flight at any time, where N = (activeCPUs - 1).
-    /// The walker is a single producer; its iterator is pumped from this
-    /// actor's body (never from child tasks, which keeps it Sendable-clean).
-    /// Throttled flushes batch ingested items so SwiftUI sees ~4 updates per
-    /// second instead of one per file.
-    ///
-    /// The TaskGroup payload is `(URL, InspectResult?)` rather than just
-    /// `InspectResult?` so we can identify which URL just completed and
-    /// remove it from the in-flight set — that's what powers the live queue
-    /// view in the UI.
-    public func run(
-        options: ScanOptions,
-        blobWriter: BlobWriter,
-        database: Database? = nil,
-        progressSink: @escaping @Sendable @MainActor (ScanProgress) -> Void,
-        batchSink: @escaping @Sendable @MainActor ([InspectResult]) -> Void,
-        systemInfoSink: @escaping @Sendable @MainActor (SystemInfo) -> Void
-    ) async {
-        let info = SystemInfoCollector.capture()
-        await systemInfoSink(info)
+// MARK: - Import pipeline
 
-        let pipeline = ScanPipeline(options: options, blobWriter: blobWriter, database: database)
-        let walker = FileWalker(options: options)
+public nonisolated struct ImportPipeline: Sendable {
+    public let options: ScanOptions
+    public let blobWriter: BlobWriter
+    public let source: any SourceProvider
 
-        let maxConcurrent = max(2, ProcessInfo.processInfo.activeProcessorCount - 1)
-        var progress = ScanProgress(
-            phase: .enumerating,
-            startedAt: Date(),
-            workerCount: maxConcurrent
+    public init(options: ScanOptions, blobWriter: BlobWriter, source: any SourceProvider) {
+        self.options = options
+        self.blobWriter = blobWriter
+        self.source = source
+    }
+
+    /// Capture one file into the bundle, returning a minimal ScanItem.
+    /// Skips directories entirely (analysis recovers bundles from the
+    /// per-file rows it imports inside them).
+    public func importOne(url: URL) -> ImportResult? {
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .isSymbolicLinkKey]
+        guard let values = try? url.resourceValues(forKeys: keys) else { return nil }
+        let isFile = values.isRegularFile ?? false
+        // Bundle wrappers come in as directories. Record them as bundle-
+        // shaped items so the analyzer can classify them; their bytes don't
+        // need capture (their constituent files do).
+        let isDir = values.isDirectory ?? false
+        let path = source.canonicalPath(for: url)
+        let filename = url.lastPathComponent
+        let size = Int64(values.fileSize ?? 0)
+        let mtime = values.contentModificationDate
+
+        if isDir {
+            // Emit a placeholder row only for known bundle extensions so we
+            // don't flood the manifest with every directory in the tree.
+            let ext = url.pathExtension.lowercased()
+            let knownBundleExt: Set<String> = ["app", "framework", "bundle", "kext", "mlpackage", "mlmodelc", "lproj"]
+            guard knownBundleExt.contains(ext) else { return nil }
+            let item = ScanItem(
+                id: ItemIdentity.uuid(path: path, sha256: nil, bundlePathOnly: true),
+                path: path,
+                name: filename,
+                category: .unanalyzed,
+                size: size,
+                modifiedAt: mtime,
+                sha256: nil,
+                insideBundle: false,
+                owningBundlePath: nil,
+                tags: ["unanalyzed"]
+            )
+            return ImportResult(item: item, blobRefs: [])
+        }
+        guard isFile else { return nil }
+
+        // Hash + (optionally) capture the bytes. We always hash when
+        // captureFiles is on because the deterministic id needs sha256.
+        let sha: String?
+        if options.hashFiles || options.captureFiles {
+            sha = Hash.sha256(of: url)
+        } else {
+            sha = nil
+        }
+        var refs: [String] = []
+        var fileBlobRef: String? = nil
+        if options.captureFiles, size > 0, size <= options.maxCaptureFileSize, let sha {
+            let ref = "file-\(sha)"
+            blobWriter.copy(from: url, ref: ref)
+            fileBlobRef = ref
+            refs.append(ref)
+        }
+
+        let item = ScanItem(
+            id: ItemIdentity.uuid(path: path, sha256: sha),
+            path: path,
+            name: filename,
+            category: .unanalyzed,
+            size: size,
+            modifiedAt: mtime,
+            sha256: sha,
+            insideBundle: false, // analyzer fills this in
+            owningBundlePath: nil,
+            fileBlobRef: fileBlobRef,
+            tags: ["unanalyzed"]
         )
+        return ImportResult(item: item, blobRefs: refs)
+    }
+}
+
+// MARK: - Import worker
+
+public actor ImportWorker {
+    public static func run(
+        pipeline: ImportPipeline,
+        walker: FileWalker,
+        progressSink: @escaping @Sendable @MainActor (ScanProgress) -> Void,
+        batchSink: @escaping @Sendable @MainActor ([ImportResult]) -> Void
+    ) async {
+        let maxConcurrent = max(2, ProcessInfo.processInfo.activeProcessorCount - 1)
+        var progress = ScanProgress(phase: .importing, startedAt: Date(), workerCount: maxConcurrent)
         await progressSink(progress)
 
-        var batch: [InspectResult] = []
+        var batch: [ImportResult] = []
         batch.reserveCapacity(256)
         var lastFlush = Date()
         var lastProgressEmit = Date()
         let flushInterval: TimeInterval = 0.25
         let progressInterval: TimeInterval = 0.15
         let batchSize = 256
-
-        // Ordered list of paths currently being inspected. Order = enqueue
-        // order, so the UI shows a stable list. We use an array rather than
-        // a Set because rendering wants determinism.
         var inFlight: [String] = []
         inFlight.reserveCapacity(maxConcurrent)
 
-        await withTaskGroup(of: (URL, InspectResult?).self) { group in
+        await withTaskGroup(of: (URL, ImportResult?).self) { group in
             var iterator = walker.makeStream().makeAsyncIterator()
-
-            // Prime the window with `maxConcurrent` initial tasks. After this,
-            // every completed task triggers one new task — keeping the window
-            // saturated until the walker is exhausted.
             for _ in 0..<maxConcurrent {
                 guard let url = await iterator.next() else { break }
                 progress.filesVisited += 1
                 inFlight.append(url.path)
                 group.addTask {
                     if Task.isCancelled { return (url, nil) }
-                    return (url, pipeline.inspect(url: url))
+                    return (url, pipeline.importOne(url: url))
                 }
             }
-            progress.phase = .inspecting
             progress.inFlightPaths = inFlight
             await progressSink(progress)
 
             while let (completedURL, result) = await group.next() {
-                if Task.isCancelled {
-                    group.cancelAll()
-                    continue
-                }
-
-                // Remove the completed URL from the in-flight list. There's
-                // exactly one matching entry — we never enqueue the same URL
-                // twice. firstIndex(of:) is O(n) but n ≤ activeCPUs.
+                if Task.isCancelled { group.cancelAll(); continue }
                 if let idx = inFlight.firstIndex(of: completedURL.path) {
                     inFlight.remove(at: idx)
                 }
-
-                if let result = result {
+                if let result {
                     batch.append(result)
                     progress.filesInspected += 1
                     progress.itemsFound += 1
                     progress.perCategoryCounts[result.item.category, default: 0] += 1
+                    progress.bytesHashed += result.item.size
                 }
-
-                // Top up the window with the next URL, if any.
                 if let url = await iterator.next() {
                     progress.filesVisited += 1
                     inFlight.append(url.path)
                     group.addTask {
                         if Task.isCancelled { return (url, nil) }
-                        return (url, pipeline.inspect(url: url))
+                        return (url, pipeline.importOne(url: url))
                     }
                 }
-
                 let now = Date()
                 if batch.count >= batchSize || (now.timeIntervalSince(lastFlush) >= flushInterval && !batch.isEmpty) {
                     let toSend = batch
@@ -268,837 +377,9 @@ public actor ScanWorker {
                 }
             }
         }
-
-        if !batch.isEmpty {
-            await batchSink(batch)
-        }
-
+        if !batch.isEmpty { await batchSink(batch) }
         progress.phase = .done
         progress.inFlightPaths = []
         await progressSink(progress)
     }
 }
-
-// MARK: - Pipeline
-
-/// Stateless inspector dispatcher. `Sendable` so it can be captured by the
-/// concurrent child tasks. The `BlobWriter` it carries writes to disk without
-/// any actor hops — bytes never cross thread boundaries.
-///
-/// `database` is an optional handle the pipeline uses to push large per-item
-/// data straight into SQLite from the worker thread, bypassing the main-
-/// actor batchSink for payloads that would dominate UI thread time. Today
-/// that's used for `strings_fts` ingestion: a 10 MB strings dump tokenises
-/// in ~200 ms, and doing that on MainActor would stall every frame during
-/// the scan. The `Database` class is itself thread-safe (internal lock).
-public nonisolated struct ScanPipeline: Sendable {
-    public let options: ScanOptions
-    public let blobWriter: BlobWriter
-    public let database: Database?
-    public let machO = MachOInspector()
-
-    public init(options: ScanOptions, blobWriter: BlobWriter, database: Database? = nil) {
-        self.options = options
-        self.blobWriter = blobWriter
-        self.database = database
-    }
-
-    /// Routes a URL to the appropriate inspector and returns the resulting
-    /// item plus the set of blob refs we wrote to disk for it.
-    public func inspect(url: URL) -> InspectResult? {
-        guard let (item, blobs) = classify(url: url) else { return nil }
-        // Write the in-memory blobs to disk on this worker thread before
-        // crossing back to MainActor — keeps peak memory low and keeps the
-        // main thread out of the byte-pushing path entirely.
-        for (ref, data) in blobs {
-            blobWriter.write(data, ref: ref)
-        }
-        var enriched = item
-        populateContextAndRelationships(item: &enriched, originalURL: url)
-
-        // File capture: copy the file bytes verbatim into the blob store so
-        // a future `darwin-scan extract` can rebuild the original tree. Only
-        // for regular files (no bundles) under the size cap. We need a
-        // SHA-256 — reuse the item's if hashing is on, compute one if not.
-        if options.captureFiles, enriched.size > 0, enriched.size <= options.maxCaptureFileSize {
-            let isRegularFile = (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
-            if isRegularFile {
-                let sha: String?
-                if let existing = enriched.sha256 {
-                    sha = existing
-                } else {
-                    sha = Hash.sha256(of: url)
-                    enriched.sha256 = sha
-                }
-                if let sha {
-                    let ref = "file-\(sha)"
-                    blobWriter.copy(from: url, ref: ref)
-                    enriched.fileBlobRef = ref
-                }
-            }
-        }
-
-        // Collect every ref this item references, whether it came in via
-        // the in-memory `blobs` dict (icons, app icons) OR was streamed
-        // directly to disk by an inspector (strings). The BlobStore needs
-        // to know about all of them so saved bundles include the files.
-        var refs = Array(blobs.keys)
-        if let r = enriched.executable?.stringsBlobRef { refs.append(r) }
-        if let r = enriched.application?.iconRef { refs.append(r) }
-        if let r = enriched.icon?.previewBlobRef { refs.append(r) }
-        if let r = enriched.fileBlobRef { refs.append(r) }
-
-        // Symbol extraction: only for Mach-O items whose category indicates
-        // a binary we'd actually want symbols for. Skip dyldCache (multi-GB
-        // and not a single binary), kext (would need symbols but they're
-        // typically stripped), and obviously non-binary categories.
-        let symbols: [SymbolRow]
-        if options.extractSymbols
-            && (enriched.category == .executable || enriched.category == .framework)
-            && enriched.executable != nil {
-            symbols = SymbolInspector.extract(url: url, itemID: enriched.id)
-        } else {
-            symbols = []
-        }
-
-        // DYLD shared cache: enumerate the cached dylib images and emit a
-        // virtual `framework` item per image, cross-linked back to the
-        // cache file via `.inDyldCache`. The virtual items have no on-disk
-        // path and no fileBlobRef — extraction restores the cache file,
-        // not the individual virtuals.
-        //
-        // We only enumerate from the **main** cache file, not the numbered
-        // subcache shards (`.01`, `.02`, …). Each shard has its own
-        // dyld_v1 header so they all classify as `.dyldCache`, but for
-        // arches where the shard replicates the main cache's imagesCount
-        // (x86_64 does this on macOS 26) we'd otherwise emit the same
-        // dylib once per shard. Subcache shards stay as their own
-        // `.dyldCache` items so the user still sees them in the list —
-        // they just don't synthesise children.
-        var additionalItems: [ScanItem] = []
-        var additionalSymbols: [SymbolRow] = []
-        if enriched.category == .dyldCache,
-           options.inspectDyldCache,
-           !DyldCacheInspector.isSubcache(filename: (enriched.path as NSString).lastPathComponent),
-           let images = DyldCacheInspector.enumerateImages(url: url),
-           !images.isEmpty {
-            let cacheArch = enriched.dyldCache?.architecture ?? "?"
-            additionalItems.reserveCapacity(images.count)
-            // Parse subcache layout once per main cache so each per-image
-            // inspection only touches load commands + the symbol/string
-            // ranges it needs. Falling back to a header-only layout when
-            // load fails keeps the virtual items flowing even if symbol
-            // extraction can't run.
-            let cacheLayout: DyldCacheLayout? = options.extractSymbols
-                ? DyldCacheLayout.load(mainCacheURL: url)
-                : nil
-            let sharedStrtab = cacheLayout.map { DyldCachedImageInspector.SharedStringTable(layout: $0) }
-            for image in images {
-                let item = buildVirtualImageItem(
-                    image: image,
-                    cachePath: enriched.path,
-                    cacheName: enriched.name,
-                    cacheArch: cacheArch
-                )
-                additionalItems.append(item)
-                if let cacheLayout, let sharedStrtab {
-                    if let result = DyldCachedImageInspector.extract(
-                        layout: cacheLayout,
-                        sharedStrtab: sharedStrtab,
-                        imageAddress: image.address,
-                        itemID: item.id
-                    ) {
-                        additionalSymbols.append(contentsOf: result.symbols)
-                        // strings_fts ingestion happens off-main, same
-                        // path as the regular Mach-O strings pipeline.
-                        if options.extractStrings, let cstr = result.cstringBytes, let database {
-                            let text = DyldCachedImageInspector.cstringTokensText(
-                                cstr,
-                                minLength: options.stringsMinLength
-                            )
-                            if !text.isEmpty {
-                                try? database.indexStrings(
-                                    itemID: item.id,
-                                    itemPath: item.path,
-                                    content: text
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fold any cached-image symbols into the result. The batch sink will
-        // route them to the database; we tagged each row with its virtual
-        // item's UUID up above so they land under the correct framework
-        // row, not the cache file's row.
-        var allSymbols = symbols
-        if !additionalSymbols.isEmpty {
-            allSymbols.append(contentsOf: additionalSymbols)
-        }
-
-        return InspectResult(item: enriched, blobRefs: refs, symbols: allSymbols, additionalItems: additionalItems)
-    }
-
-    /// Build a virtual `framework` item for one image inside a
-    /// dyld_shared_cache file. The synthesized path uses `#` as a
-    /// separator (`<cachePath>#<imagePath>`) so the deterministic id is
-    /// unique even when the same dylib appears across multiple
-    /// architectures' caches.
-    private func buildVirtualImageItem(
-        image: DyldCacheImage,
-        cachePath: String,
-        cacheName: String,
-        cacheArch: String
-    ) -> ScanItem {
-        let virtualPath = "\(cachePath)#\(image.path)"
-        let imageName = (image.path as NSString).lastPathComponent
-        let frameworkInfo = FrameworkInfo(
-            bundleIdentifier: nil,
-            shortVersionString: nil,
-            currentVersion: nil,
-            executableName: imageName,
-            headerCount: 0,
-            isPrivate: image.path.contains("/PrivateFrameworks/")
-        )
-        var tags: [String] = ["dyld-cache-image", "framework"]
-        if !cacheArch.isEmpty, cacheArch != "?" { tags.append(cacheArch) }
-        if frameworkInfo.isPrivate { tags.append("private") }
-
-        return ScanItem(
-            id: ItemIdentity.uuid(path: virtualPath, sha256: nil, bundlePathOnly: true),
-            path: virtualPath,
-            name: imageName,
-            category: .framework,
-            size: 0, // bytes inside the cache — unknown without parsing Mach-O headers.
-            modifiedAt: image.modTime > 0
-                ? Date(timeIntervalSince1970: TimeInterval(image.modTime))
-                : nil,
-            sha256: nil,
-            insideBundle: true,
-            owningBundlePath: cachePath,
-            framework: frameworkInfo,
-            tags: tags,
-            context: "in \(cacheName)",
-            relationships: [
-                Relationship(kind: .inDyldCache, targetPath: cachePath, note: cacheArch)
-            ]
-        )
-    }
-
-    // MARK: Classification
-
-    private func classify(url: URL) -> (ScanItem, [String: Data])? {
-        let path = url.path
-        let filename = url.lastPathComponent
-        let ext = url.pathExtension.lowercased()
-
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .isSymbolicLinkKey]
-        guard let values = try? url.resourceValues(forKeys: keys) else { return nil }
-        let isDir = values.isDirectory ?? false
-        let isFile = values.isRegularFile ?? false
-        let size = Int64((values.fileSize ?? 0))
-        let mtime = values.contentModificationDate
-
-        if isDir {
-            switch ext {
-            case "app":         return makeAppBundleItem(at: url, size: size, mtime: mtime)
-            case "framework":   return makeFrameworkItem(at: url, size: size, mtime: mtime)
-            case "kext":        return makeKextItem(at: url, size: size, mtime: mtime)
-            case "mlpackage", "mlmodelc":
-                                return makeMLModelItem(at: url, size: size, mtime: mtime)
-            case "lproj":
-                if options.inspectLocalizations,
-                   let info = LocalizationInspector.inspectLprojDirectory(url) {
-                    if options.englishLocalizationsOnly,
-                       let lang = info.language,
-                       !FileWalker.isEnglishLocale(lang) {
-                        return nil
-                    }
-                    return (ScanItem(
-                        id: ItemIdentity.uuid(path: path, sha256: nil, bundlePathOnly: true),
-                        path: path, name: filename, category: .localization,
-                        size: size, modifiedAt: mtime, sha256: nil,
-                        insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
-                        localization: info,
-                        tags: ["lproj", info.language ?? "?"]
-                    ), [:])
-                }
-                return nil
-            case "bundle":      return makeFrameworkItem(at: url, size: size, mtime: mtime)
-            default:            return nil
-            }
-        }
-
-        guard isFile else { return nil }
-
-        if options.inspectDyldCache, DyldCacheInspector.looksLikeDyldCache(filename: filename),
-           let info = DyldCacheInspector.inspect(url: url) {
-            var tags: [String] = ["dyld-cache"]
-            if let arch = info.architecture { tags.append(arch) }
-            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
-            return (ScanItem(
-                id: ItemIdentity.uuid(path: path, sha256: sha),
-                path: path, name: filename, category: .dyldCache,
-                size: size, modifiedAt: mtime, sha256: sha,
-                insideBundle: false, owningBundlePath: nil,
-                dyldCache: info,
-                tags: tags
-            ), [:])
-        }
-
-        if (path.hasPrefix("/System/Library/LaunchDaemons/") || path.hasPrefix("/System/Library/LaunchAgents/"))
-            && ext == "plist",
-           let info = PlistInspector.decodeLaunchService(at: url) {
-            var tags = [info.kind == .daemon ? "daemon" : "agent"]
-            if info.runAtLoad { tags.append("RunAtLoad") }
-            if info.keepAlive { tags.append("KeepAlive") }
-            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
-            return (ScanItem(
-                id: ItemIdentity.uuid(path: path, sha256: sha),
-                path: path, name: info.label ?? filename, category: .launchService,
-                size: size, modifiedAt: mtime, sha256: sha,
-                insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
-                launchService: info,
-                tags: tags
-            ), [:])
-        }
-
-        // Plists that aren't launch services. We catch these BEFORE the
-        // Mach-O fallback because plists never have Mach-O magic, but the
-        // explicit detection lets us extract structure (format, top-level
-        // shape, key count) for the detail view.
-        if ext == "plist", let (info, _) = PlistInspector.decodePlistInfo(at: url) {
-            var tags: [String] = ["plist", info.format.rawValue]
-            if info.kind != .other { tags.append(info.kind.rawValue) }
-            if info.looksLikeInfoPlist { tags.append("Info.plist") }
-            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
-            return (ScanItem(
-                id: ItemIdentity.uuid(path: path, sha256: sha),
-                path: path, name: filename, category: .plist,
-                size: size, modifiedAt: mtime, sha256: sha,
-                insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
-                plist: info,
-                tags: tags
-            ), [:])
-        }
-
-        if options.inspectLocalizations,
-           (ext == "strings" || ext == "stringsdict"),
-           let info = LocalizationInspector.inspect(url: url) {
-            if options.englishLocalizationsOnly,
-               let lang = info.language,
-               !FileWalker.isEnglishLocale(lang) {
-                return nil
-            }
-            var tags: [String] = [ext]
-            if let lang = info.language { tags.append(lang) }
-            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
-            return (ScanItem(
-                id: ItemIdentity.uuid(path: path, sha256: sha),
-                path: path, name: filename, category: .localization,
-                size: size, modifiedAt: mtime, sha256: sha,
-                insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
-                localization: info,
-                tags: tags
-            ), [:])
-        }
-
-        if options.indexManPages && isManPagePath(path) {
-            if let (info, _) = ManPageInspector.inspect(url: url) {
-                var tags: [String] = ["man"]
-                if let section = info.section { tags.append("\(section)") }
-                let sha = options.hashFiles ? Hash.sha256(of: url) : nil
-                return (ScanItem(
-                    id: ItemIdentity.uuid(path: path, sha256: sha),
-                    path: path, name: info.title ?? filename, category: .manPage,
-                    size: size, modifiedAt: mtime, sha256: sha,
-                    insideBundle: false, owningBundlePath: nil,
-                    manPage: info,
-                    tags: tags
-                ), [:])
-            }
-        }
-
-        if options.inspectMLModels, isMLModelExtension(ext),
-           let info = MLModelInspector.inspect(url: url) {
-            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
-            return (ScanItem(
-                id: ItemIdentity.uuid(path: path, sha256: sha),
-                path: path, name: filename, category: .mlModel,
-                size: size, modifiedAt: mtime, sha256: sha,
-                insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
-                mlModel: info,
-                tags: ["ml", info.container.rawValue]
-            ), [:])
-        }
-
-        if isIconExtension(ext), let (info, preview) = IconInspector.inspect(url: url) {
-            var blobs: [String: Data] = [:]
-            var infoCopy = info
-            if let preview {
-                let ref = "icon-" + Hash.sha256Hex(preview)
-                blobs[ref] = preview
-                infoCopy.previewBlobRef = ref
-            }
-            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
-            return (ScanItem(
-                id: ItemIdentity.uuid(path: path, sha256: sha),
-                path: path, name: filename, category: .icon,
-                size: size, modifiedAt: mtime, sha256: sha,
-                insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
-                icon: infoCopy,
-                tags: [info.kind.rawValue]
-            ), blobs)
-        }
-
-        if let scriptInfo = readShebang(url) {
-            let sha = options.hashFiles ? Hash.sha256(of: url) : nil
-            return (ScanItem(
-                id: ItemIdentity.uuid(path: path, sha256: sha),
-                path: path, name: filename, category: .script,
-                size: size, modifiedAt: mtime, sha256: sha,
-                insideBundle: isInsideBundle(path), owningBundlePath: owningBundle(path),
-                script: scriptInfo,
-                tags: [scriptInfo.language ?? "script"]
-            ), [:])
-        }
-
-        if let machoInfo = machO.inspect(url: url) {
-            return makeMachOItem(at: url, size: size, mtime: mtime, info: machoInfo)
-        }
-
-        return nil
-    }
-
-    // MARK: Item builders
-
-    private func makeAppBundleItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
-        guard let info = PlistInspector.decodeAppBundle(at: url) else { return nil }
-        var infoCopy = info
-        var blobs: [String: Data] = [:]
-        if let png = AppBundleInspector.renderIconPNG(forBundle: url) {
-            let ref = "appicon-" + Hash.sha256Hex(png)
-            blobs[ref] = png
-            infoCopy.iconRef = ref
-        }
-        var tags: [String] = ["app"]
-        if info.isHidden    { tags.append("hidden") }
-        if info.isAgentApp  { tags.append("background-only") }
-        if let category = info.category { tags.append(category) }
-        return (ScanItem(
-            id: ItemIdentity.uuid(path: url.path, sha256: nil, bundlePathOnly: true),
-            path: url.path,
-            name: info.displayName ?? url.deletingPathExtension().lastPathComponent,
-            category: .application,
-            size: size, modifiedAt: mtime, sha256: nil,
-            insideBundle: false, owningBundlePath: nil,
-            application: infoCopy,
-            tags: tags
-        ), blobs)
-    }
-
-    private func makeFrameworkItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
-        guard let info = PlistInspector.decodeFrameworkBundle(at: url) else {
-            let bare = FrameworkInfo(
-                bundleIdentifier: nil, shortVersionString: nil, currentVersion: nil,
-                executableName: nil, headerCount: 0,
-                isPrivate: url.path.contains("/PrivateFrameworks/")
-            )
-            return (ScanItem(
-                id: ItemIdentity.uuid(path: url.path, sha256: nil, bundlePathOnly: true),
-                path: url.path, name: url.deletingPathExtension().lastPathComponent,
-                category: .framework, size: size, modifiedAt: mtime, sha256: nil,
-                insideBundle: false, owningBundlePath: nil,
-                framework: bare,
-                tags: bare.isPrivate ? ["private-framework"] : ["framework"]
-            ), [:])
-        }
-        var tags: [String] = ["framework"]
-        if info.isPrivate { tags.append("private") }
-        return (ScanItem(
-            id: ItemIdentity.uuid(path: url.path, sha256: nil, bundlePathOnly: true),
-            path: url.path, name: url.deletingPathExtension().lastPathComponent,
-            category: .framework, size: size, modifiedAt: mtime, sha256: nil,
-            insideBundle: false, owningBundlePath: nil,
-            framework: info,
-            tags: tags
-        ), [:])
-    }
-
-    private func makeKextItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
-        let info = PlistInspector.decodeFrameworkBundle(at: url)
-            ?? FrameworkInfo(
-                bundleIdentifier: nil, shortVersionString: nil, currentVersion: nil,
-                executableName: nil, headerCount: 0, isPrivate: false
-            )
-        return (ScanItem(
-            id: ItemIdentity.uuid(path: url.path, sha256: nil, bundlePathOnly: true),
-            path: url.path, name: url.deletingPathExtension().lastPathComponent,
-            category: .kext, size: size, modifiedAt: mtime, sha256: nil,
-            insideBundle: false, owningBundlePath: nil,
-            framework: info,
-            tags: ["kext"]
-        ), [:])
-    }
-
-    private func makeMLModelItem(at url: URL, size: Int64, mtime: Date?) -> (ScanItem, [String: Data])? {
-        guard let info = MLModelInspector.inspect(url: url) else { return nil }
-        return (ScanItem(
-            id: ItemIdentity.uuid(path: url.path, sha256: nil, bundlePathOnly: true),
-            path: url.path, name: url.deletingPathExtension().lastPathComponent,
-            category: .mlModel, size: size, modifiedAt: mtime, sha256: nil,
-            insideBundle: false, owningBundlePath: nil,
-            mlModel: info,
-            tags: ["ml", info.container.rawValue]
-        ), [:])
-    }
-
-    private func makeMachOItem(at url: URL, size: Int64, mtime: Date?, info: ExecutableInfo) -> (ScanItem, [String: Data])? {
-        var enriched = info
-        // The strings dump is streamed directly to disk inside the BlobStore
-        // cache dir via `StringsExtractor.streamStrings`, so we have no other
-        // in-memory blobs to register from this Mach-O path.
-        let blobs: [String: Data] = [:]
-        let path = url.path
-        let filename = url.lastPathComponent
-        let inside = isInsideBundle(path)
-        let owning = owningBundle(path)
-        // Compute sha256 once up-front so the deterministic item ID can be
-        // derived from (path, sha256) and strings_fts can be indexed under
-        // the same id before the ScanItem is constructed. When hashing is
-        // off the id falls back to a random UUID — re-scans of unhashed
-        // binaries won't dedup, which is the documented tradeoff.
-        let sha = options.hashFiles ? Hash.sha256(of: url) : nil
-        let itemID = ItemIdentity.uuid(path: path, sha256: sha)
-
-        enriched.isApple = isApplePath(path)
-        enriched.isCrossPlatformTool = WellKnownCrossPlatformTools.contains(filename.lowercased())
-
-        // Code signature: convert the slice-relative blob offset that
-        // MachOInspector recorded into a file-absolute one (the slice
-        // itself may live deep inside a FAT binary), then parse the
-        // CodeDirectory for team / signing id / hardened-runtime.
-        if let csSliceOff = info.codeSignatureSliceOffset,
-           let csSize = info.codeSignatureSize {
-            let sliceFile = machO.sliceFileOffset(for: url)
-            let absolute = sliceFile + csSliceOff
-            if let csInfo = CodeSignatureInspector.parse(url: url, fileOffset: absolute, size: csSize) {
-                enriched.signingIdentifier = csInfo.signingIdentifier
-                enriched.teamIdentifier = csInfo.teamIdentifier
-                enriched.isHardenedRuntime = csInfo.isHardenedRuntime
-            }
-        }
-
-        if info.kind == .executable, let usage = StringsExtractor.grepInBinary(url: url, needle: "usage:") {
-            enriched.usageLine = usage
-        } else if info.kind == .executable, let usage = StringsExtractor.grepInBinary(url: url, needle: "Usage:") {
-            enriched.usageLine = usage
-        }
-
-        let category: ItemCategory
-        switch info.kind {
-        case .dylib, .bundle: category = .framework
-        case .kext:           category = .kext
-        case .executable:     category = .executable
-        default:              category = .other
-        }
-
-        var roles: [ExecutableInfo.Role] = []
-        if info.kind == .executable {
-            if enriched.usageLine != nil { roles.append(.cli) }
-            if path.contains("/libexec/") || path.contains("/PrivateFrameworks/") { roles.append(.helper) }
-            if enriched.isCrossPlatformTool { roles.append(.interpreter) }
-        } else if info.kind == .dylib {
-            roles.append(.library)
-        }
-        enriched.roles = roles
-
-        if options.extractStrings && info.kind == .executable && size <= options.maxInspectFileSize {
-            // Streams /usr/bin/strings output directly to disk; no blob bytes
-            // are ever held in worker memory. The function hashes the file
-            // after writing and returns the content-addressed ref — caller
-            // doesn't add anything to `blobs`, which is reserved for the
-            // in-memory writer path.
-            if let ref = StringsExtractor.streamStrings(
-                from: url,
-                minLength: options.stringsMinLength,
-                using: blobWriter
-            ) {
-                enriched.stringsBlobRef = ref
-                // Tokenize the blob into FTS5 on this worker thread. Loading
-                // a multi-MB strings dump as String + calling MainActor
-                // tokenization would stall the UI; doing it inline here
-                // keeps everything off-main. The Database lock serializes
-                // FTS inserts across worker tasks.
-                if let database {
-                    indexStringsBlob(database: database, itemID: itemID, itemPath: path, ref: ref)
-                }
-            }
-        }
-
-        var tags: [String] = []
-        switch info.kind {
-        case .executable: tags.append("executable")
-        case .dylib:      tags.append("dylib")
-        case .bundle:     tags.append("bundle")
-        case .dylinker:   tags.append("dylinker")
-        case .kext:       tags.append("kext")
-        case .object:     tags.append("object")
-        case .dsym:       tags.append("dsym")
-        case .core:       tags.append("core")
-        case .unknown:    tags.append("macho")
-        }
-        for arch in info.architectures { tags.append(arch) }
-        if info.isFatBinary { tags.append("fat") }
-        if enriched.isCrossPlatformTool { tags.append("cross-platform") }
-        if enriched.isApple == false { tags.append("third-party") }
-        if let platform = info.platform { tags.append(platform) }
-        if enriched.usageLine != nil { tags.append("cli") }
-
-        return (ScanItem(
-            id: itemID, path: path, name: filename, category: category,
-            size: size, modifiedAt: mtime,
-            sha256: sha,
-            insideBundle: inside, owningBundlePath: owning,
-            executable: enriched,
-            tags: tags
-        ), blobs)
-    }
-
-    // MARK: Context + relationships
-
-    /// Compute `context` (the disambiguating label shown next to the name in
-    /// lists) and `relationships` (outgoing graph edges). Pure derivation from
-    /// the item's own fields plus the original URL — no cross-item lookups, so
-    /// it's safe to run in the inspector pipeline before items are reconciled.
-    private func populateContextAndRelationships(item: inout ScanItem, originalURL: URL) {
-        // --- context ---
-        if let bundlePath = item.owningBundlePath {
-            let basename = (bundlePath as NSString).lastPathComponent
-            let displayName = (basename as NSString).deletingPathExtension
-            switch item.category {
-            case .localization:
-                if let lang = item.localization?.language {
-                    item.context = "\(displayName) · \(lang)"
-                } else {
-                    item.context = displayName
-                }
-            case .manPage:
-                if let section = item.manPage?.section {
-                    item.context = "\(displayName) · section \(section)"
-                } else {
-                    item.context = displayName
-                }
-            default:
-                item.context = displayName
-            }
-        } else {
-            // Top-level item — show parent directory for disambiguation.
-            let parent = originalURL.deletingLastPathComponent().path
-            let parentName = (parent as NSString).lastPathComponent
-            switch item.category {
-            case .manPage:
-                if let section = item.manPage?.section {
-                    item.context = "section \(section)"
-                }
-            case .application:
-                // Top-level apps: parent path like /System/Applications or /System/Library/CoreServices
-                if !parent.isEmpty, parent != "/" { item.context = parent }
-            default:
-                if !parentName.isEmpty { item.context = parentName }
-            }
-        }
-
-        // --- relationships ---
-        var rels: [Relationship] = []
-        if let owning = item.owningBundlePath {
-            rels.append(Relationship(kind: .ownedByBundle, targetPath: owning, note: nil))
-        }
-        if let exec = item.executable {
-            for lib in exec.linkedLibraries {
-                rels.append(Relationship(kind: .linksDylib, targetPath: lib, note: nil))
-            }
-        }
-        if let ls = item.launchService, let program = ls.program {
-            rels.append(Relationship(kind: .launchesProgram, targetPath: program, note: "Program"))
-        }
-        // App / framework / kext bundle → main executable. The bundle item
-        // exposes its executable's name via the appropriate info struct;
-        // the layout (Contents/MacOS/, Versions/A/, or top-level) depends
-        // on the bundle kind. We emit one or two candidate paths; the one
-        // that matches an on-disk item resolves in the DetailView, the
-        // other renders as a dangling-target row and is harmless.
-        if let app = item.application, let execPath = app.executablePath {
-            rels.append(Relationship(
-                kind: .containsExecutable,
-                targetPath: execPath,
-                note: app.executableName
-            ))
-        }
-        if let fw = item.framework, let execName = fw.executableName {
-            switch item.category {
-            case .kext:
-                // Kexts ship the binary in Contents/MacOS/<name>, just like
-                // an app bundle. No Versions/ symlink chain.
-                rels.append(Relationship(
-                    kind: .containsExecutable,
-                    targetPath: "\(item.path)/Contents/MacOS/\(execName)",
-                    note: execName
-                ))
-            default:
-                // Frameworks: standard layout is Versions/A/<name> with a
-                // Versions/Current symlink. Bundles ship the binary at the
-                // top level. The walker yields the on-disk path (not the
-                // symlink target), so Versions/A/<name> is what we expect
-                // to find in the scan. Also emit the flat path for
-                // unversioned `.bundle` directories.
-                rels.append(Relationship(
-                    kind: .containsExecutable,
-                    targetPath: "\(item.path)/Versions/A/\(execName)",
-                    note: execName
-                ))
-                rels.append(Relationship(
-                    kind: .containsExecutable,
-                    targetPath: "\(item.path)/\(execName)",
-                    note: execName
-                ))
-            }
-        }
-        item.relationships = rels
-    }
-
-    // MARK: Strings FTS
-
-    /// Load a strings-dump blob from disk and ingest it into the database's
-    /// `strings_fts` virtual table. Called from the worker pipeline so the
-    /// tokenisation doesn't run on the main actor. The string content can
-    /// be tens of MB for a large dylib; we load it as Data and convert to
-    /// String once. Failures are silent — we shouldn't abort a scan for a
-    /// missing FTS row.
-    private func indexStringsBlob(database: Database, itemID: UUID, itemPath: String, ref: String) {
-        let prefix = BlobStore.shardPrefix(forRef: ref)
-        let blobURL = blobWriter.rootDirectory
-            .appendingPathComponent(prefix, isDirectory: true)
-            .appendingPathComponent("\(ref).bin")
-        guard let data = try? Data(contentsOf: blobURL, options: [.mappedIfSafe]),
-              !data.isEmpty,
-              let text = String(data: data, encoding: .utf8) else { return }
-        try? database.indexStrings(itemID: itemID, itemPath: itemPath, content: text)
-    }
-
-    // MARK: Heuristics
-
-    private func isMLModelExtension(_ ext: String) -> Bool {
-        ["mlmodel", "mlpackage", "mlmodelc", "onnx", "tflite", "pt", "pth"].contains(ext)
-    }
-
-    private func isIconExtension(_ ext: String) -> Bool {
-        ["icns", "png", "jpg", "jpeg", "tiff", "heic", "car"].contains(ext)
-    }
-
-    private func isManPagePath(_ path: String) -> Bool {
-        path.contains("/share/man/man")
-    }
-
-    private func isInsideBundle(_ path: String) -> Bool {
-        path.contains(".app/") ||
-            path.contains(".framework/") ||
-            path.contains(".bundle/") ||
-            path.contains(".kext/") ||
-            path.contains(".mlpackage/") ||
-            path.contains(".mlmodelc/")
-    }
-
-    private func owningBundle(_ path: String) -> String? {
-        for suffix in [".app", ".framework", ".bundle", ".kext", ".mlpackage", ".mlmodelc"] {
-            if let range = path.range(of: "\(suffix)/") {
-                let endIndex = range.upperBound
-                let bundleEnd = path.index(before: endIndex)
-                return String(path[path.startIndex..<bundleEnd])
-            }
-        }
-        return nil
-    }
-
-    private func isApplePath(_ path: String) -> Bool {
-        path.hasPrefix("/System/") ||
-            path.hasPrefix("/usr/lib") ||
-            path.hasPrefix("/usr/libexec") ||
-            path.hasPrefix("/usr/sbin") ||
-            (path.hasPrefix("/usr/bin/") && WellKnownAppleBinaries.contains((path as NSString).lastPathComponent))
-    }
-
-    private func readShebang(_ url: URL) -> ScriptInfo? {
-        guard let head = try? FileHandle(forReadingFrom: url).read(upToCount: 256), head.count >= 2 else { return nil }
-        guard head[0] == 0x23, head[1] == 0x21 else { return nil } // "#!"
-        guard let nl = head.firstIndex(of: 0x0A) else { return nil }
-        let interp = String(data: head[2..<nl], encoding: .utf8)?.trimmingCharacters(in: .whitespaces)
-        let language = languageFromInterpreter(interp ?? "")
-        return ScriptInfo(interpreter: interp, language: language, lineCount: nil)
-    }
-
-    private func languageFromInterpreter(_ line: String) -> String? {
-        let firstToken = line.split(separator: " ").first.map(String.init) ?? line
-        let last = (firstToken as NSString).lastPathComponent
-        if last == "env" {
-            let tokens = line.split(separator: " ").map(String.init)
-            if tokens.count >= 2 {
-                let cmd = (tokens[1] as NSString).lastPathComponent
-                return normalizeLanguage(cmd)
-            }
-        }
-        return normalizeLanguage(last)
-    }
-
-    private func normalizeLanguage(_ name: String) -> String? {
-        let lower = name.lowercased()
-        if lower.hasPrefix("python") { return "python" }
-        if lower.hasPrefix("perl")   { return "perl" }
-        if lower.hasPrefix("ruby")   { return "ruby" }
-        if lower.hasPrefix("node")   { return "node" }
-        if lower.hasPrefix("bash") || lower.hasPrefix("zsh") || lower.hasPrefix("sh") || lower == "dash" { return "shell" }
-        if lower.hasPrefix("awk")    { return "awk" }
-        if lower.hasPrefix("tcl")    { return "tcl" }
-        if lower == "osascript"      { return "applescript" }
-        return name.isEmpty ? nil : name
-    }
-}
-
-// MARK: - Reference data (nonisolated so the pipeline can use them off-main)
-
-nonisolated private let WellKnownAppleBinaries: Set<String> = [
-    "diskutil", "tmutil", "csrutil", "softwareupdate", "pmset",
-    "launchctl", "systemsetup", "asr", "dscl", "scutil",
-    "codesign", "spctl", "stapler", "xattr", "xcrun", "xcode-select",
-    "say", "open", "pbcopy", "pbpaste", "defaults",
-    "log", "system_profiler", "ioreg", "kextstat", "vm_stat"
-]
-
-nonisolated private let WellKnownCrossPlatformTools: Set<String> = [
-    "perl", "perl5.34", "perl5.28", "perl5.30", "perl5.32",
-    "python", "python3", "python3.9", "python3.10", "python3.11", "python3.12",
-    "ruby", "irb", "gem", "bundle",
-    "tclsh", "wish",
-    "awk", "gawk", "sed", "grep", "egrep", "fgrep",
-    "bash", "zsh", "sh", "dash", "ksh", "tcsh", "csh",
-    "vim", "vi", "ex", "view", "nano", "emacs", "ed",
-    "less", "more", "head", "tail", "cat", "tac",
-    "make", "gmake",
-    "git", "svn", "cvs",
-    "openssl", "curl", "wget",
-    "ssh", "scp", "sftp", "rsync", "telnet",
-    "tar", "gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "zstd",
-    "patch", "diff", "diff3", "sdiff", "cmp",
-    "expr", "bc", "dc", "factor",
-    "find", "xargs", "locate", "which", "whereis",
-    "uniq", "sort", "comm", "join", "paste",
-    "tr", "cut", "wc", "split", "csplit", "od", "fold", "fmt",
-    "ps", "top", "kill", "killall", "pkill", "pgrep", "renice", "nice",
-    "ping", "traceroute", "netstat", "nc", "host", "dig", "nslookup",
-    "ftp",
-    "yacc", "bison", "flex",
-    "lex", "m4", "as", "nm", "ar", "ranlib",
-    "tmux", "screen"
-]

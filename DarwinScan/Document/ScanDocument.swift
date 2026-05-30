@@ -3,34 +3,36 @@ import UniformTypeIdentifiers
 import DarwinScanCore
 
 extension UTType {
-    /// Custom directory-package type for `.darwinscan` documents. Conforms
-    /// to `package` so Finder treats it as a single file. Declared in-code
-    /// only; double-click open from Finder will route through our
-    /// `.onOpenURL` handler in the app shell.
     static let darwinScan: UTType = UTType(
         exportedAs: "io.zenla.DarwinScan.scan",
         conformingTo: .package
     )
 }
 
-/// A live, in-memory handle to one open `.darwinscan` bundle. Replaces the
-/// old `ReferenceFileDocument` setup: the bundle now exists on disk *before*
-/// the window opens — `ScanPackage.createEmpty(at:)` or `openInPlace(at:)`
-/// produces the on-disk state, and this class owns the resulting `ScanStore`
-/// for the window's lifetime.
+/// A live, in-memory handle to one open `.darwinscan` bundle.
 ///
-/// Mutations happen on MainActor. The underlying `ScanStore`, `BlobStore`,
-/// and `Database` are explicitly `nonisolated` so background scan tasks can
-/// hand off bytes and SQL writes without trapping in `assumeIsolated`.
+/// **Two-step open** so big bundles don't freeze MainActor:
+///
+/// 1. `open(at:)` / `createNew(at:)` (sync, fast) — opens the SQLite handle
+///    and the blob store. `loadingState` starts as `.pendingFirstLoad`.
+/// 2. `populateInitialView()` (async, off-main) — actually loads the active
+///    snapshot's headers into memory. ContentView calls this on first
+///    appear via `.task`.
 @Observable
 @MainActor
 final class ScanSession {
     let bundleURL: URL
     let store: ScanStore
 
-    /// Backed by `URL.path` on `bundleURL`; surfaced so the window title can
-    /// show `Foo.darwinscan` without re-deriving from the URL on every body
-    /// re-render.
+    enum LoadingState: Equatable {
+        case pendingFirstLoad   // bundle opened, headers not yet read
+        case loading            // headers being read off-main
+        case ready              // in-memory view is up to date
+        case failed(String)
+    }
+
+    var loadingState: LoadingState = .pendingFirstLoad
+
     var displayName: String { bundleURL.deletingPathExtension().lastPathComponent }
 
     init(bundleURL: URL, store: ScanStore) {
@@ -38,25 +40,49 @@ final class ScanSession {
         self.store = store
     }
 
-    /// Open an existing bundle on disk into a new session. Throws
-    /// `ScanPackage.LoadError` for malformed bundles.
+    /// Open an existing bundle on disk into a new session. Cheap — only
+    /// opens the SQLite handle and blob store. The in-memory view is
+    /// loaded asynchronously by `populateInitialView()`.
     static func open(at bundleURL: URL) throws -> ScanSession {
         let store = ScanStore()
         try ScanPackage.openInPlace(at: bundleURL, into: store)
         return ScanSession(bundleURL: bundleURL, store: store)
     }
 
-    /// Create a brand-new empty bundle at `bundleURL` and wrap it in a
-    /// session. Throws if the destination already exists or can't be
-    /// created.
+    /// Create a brand-new empty bundle. Already-empty stores skip the
+    /// header-load step entirely — the welcome view shows immediately.
     static func createNew(at bundleURL: URL) throws -> ScanSession {
         let store = try ScanPackage.createEmpty(at: bundleURL)
-        return ScanSession(bundleURL: bundleURL, store: store)
+        let session = ScanSession(bundleURL: bundleURL, store: store)
+        session.loadingState = .ready  // nothing to load
+        return session
     }
 
-    /// Checkpoint the WAL into the main DB file. Called by the File > Save
-    /// menu item and at app-quit time so the bundle is consistent on disk
-    /// even if the next launch happens to find the directory mid-flight.
+    /// Async populate of the active snapshot's headers. Idempotent —
+    /// re-running re-reads from disk (used after analysis to pick up the
+    /// refined items). The heavy SQLite scan + ItemHeader hydration runs
+    /// off MainActor so the window stays responsive.
+    func populateInitialView() async {
+        guard loadingState != .loading, loadingState != .ready else { return }
+        loadingState = .loading
+        let store = self.store
+        await Task.detached(priority: .userInitiated) {
+            try? ScanPackage.populateActiveSnapshot(store: store)
+        }.value
+        loadingState = .ready
+    }
+
+    /// Force a re-read of the active snapshot — e.g. after analysis
+    /// completes and the refined items need to land in the in-memory view.
+    func refreshActiveSnapshot() async {
+        loadingState = .loading
+        let store = self.store
+        await Task.detached(priority: .userInitiated) {
+            try? ScanPackage.populateActiveSnapshot(store: store)
+        }.value
+        loadingState = .ready
+    }
+
     func checkpoint() {
         try? store.database?.checkpoint()
     }

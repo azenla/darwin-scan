@@ -8,13 +8,13 @@ import Testing
 /// pokes the inspector dispatch in isolation so we can assert on the
 /// classification + tag + relationship details without spinning up an
 /// AsyncStream walker.
-@Suite("ScanPipeline classification")
+@Suite("AnalysisPipeline classification")
 struct ScannerPipelineTests {
-    private func makePipeline(options: ScanOptions = ScanOptions()) -> ScanPipeline {
+    private func makePipeline(options: ScanOptions = ScanOptions()) -> AnalysisPipeline {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("Pipeline-blobs-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
-        return ScanPipeline(options: options, blobWriter: BlobWriter(rootDirectory: tmp))
+        return AnalysisPipeline(options: options, blobStore: BlobStore(rootDirectory: tmp))
     }
 
     @Test func classifiesPlistFile() throws {
@@ -27,7 +27,7 @@ struct ScannerPipelineTests {
             .write(to: url)
 
         let pipeline = makePipeline()
-        let result = try #require(pipeline.inspect(url: url))
+        let result = try #require(pipeline.analyze(url: url) as AnalysisOutput?)
         #expect(result.item.category == .plist)
         #expect(result.item.tags.contains("plist"))
     }
@@ -77,7 +77,7 @@ struct ScannerPipelineTests {
         try "\"k\" = \"v\";".write(to: url, atomically: true, encoding: .utf8)
 
         let pipeline = makePipeline()
-        let result = try #require(pipeline.inspect(url: url))
+        let result = try #require(pipeline.analyze(url: url) as AnalysisOutput?)
         #expect(result.item.category == .localization)
         #expect(result.item.tags.contains("strings"))
         #expect(result.item.localization?.language == "en")
@@ -92,7 +92,7 @@ struct ScannerPipelineTests {
         try "#!/bin/bash\necho hi\n".write(to: url, atomically: true, encoding: .utf8)
 
         let pipeline = makePipeline()
-        let result = try #require(pipeline.inspect(url: url))
+        let result = try #require(pipeline.analyze(url: url) as AnalysisOutput?)
         #expect(result.item.category == .script)
         #expect(result.item.script?.language == "shell")
     }
@@ -113,7 +113,7 @@ struct ScannerPipelineTests {
             toolio \\- example tool
             """.write(to: url, atomically: true, encoding: .utf8)
         let pipeline = makePipeline()
-        let result = try #require(pipeline.inspect(url: url))
+        let result = try #require(pipeline.analyze(url: url) as AnalysisOutput?)
         #expect(result.item.category == .manPage)
         #expect(result.item.manPage?.section == "1")
         #expect(result.item.manPage?.title == "toolio")
@@ -123,7 +123,7 @@ struct ScannerPipelineTests {
         let url = URL(fileURLWithPath: "/bin/ls")
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         let pipeline = makePipeline()
-        let result = try #require(pipeline.inspect(url: url))
+        let result = try #require(pipeline.analyze(url: url) as AnalysisOutput?)
         #expect(result.item.category == .executable)
         #expect(result.item.executable?.kind == .executable)
         // The `isApple` heuristic is path-prefix based and does NOT include
@@ -152,10 +152,10 @@ struct ScannerPipelineTests {
         )
         try "\"k\" = \"v\";".write(to: plistURL, atomically: true, encoding: .utf8)
         let pipeline = makePipeline()
-        let result = try #require(pipeline.inspect(url: plistURL))
+        let result = pipeline.analyze(url: plistURL)
         #expect(result.item.insideBundle)
         #expect(result.item.owningBundlePath?.hasSuffix(".app") == true)
-        #expect(result.item.relationships.contains { $0.kind == .ownedByBundle })
+        #expect(result.item.relationships.contains { $0.kind == Relationship.Kind.ownedByBundle })
     }
 }
 
@@ -186,43 +186,20 @@ struct ScanOptionsTests {
     }
 }
 
-@Suite("ScanStore freetext search")
+/// `ScanStore.search` and the in-memory `items` dict are gone — the list
+/// view now streams via SQL through `ScanStore.forEachHeader` (with an
+/// in-memory `SearchQuery` filter wrapped around it). The closest
+/// behavioral equivalent we can unit-test is the per-category stream,
+/// which is exercised here against a real on-disk bundle.
+@Suite("ScanStore category stream")
 struct ScanStoreSearchTests {
     @MainActor
-    @Test func freeTextMatchesAcrossFields() {
-        let store = ScanStore()
-        let header = ItemHeader(from: ScanItem(
-            id: UUID(),
-            path: "/usr/bin/safari-helper",
-            name: "safari-helper",
-            category: .executable,
-            size: 0,
-            modifiedAt: nil,
-            insideBundle: false,
-            owningBundlePath: nil,
-            tags: ["cli"]
-        ))
-        // Bypass upsert's collision logic — we just want a header in the
-        // dictionary to test the legacy free-text search path.
-        store.ingest([ScanItem(
-            id: header.id,
-            path: header.path,
-            name: header.name,
-            category: header.category,
-            size: 0,
-            modifiedAt: nil,
-            insideBundle: false,
-            owningBundlePath: nil,
-            tags: header.tags
-        )])
-        #expect(store.search("safari").count == 1)
-        #expect(store.search("HELPER").count == 1)  // case-insensitive
-        #expect(store.search("nope").isEmpty)
-    }
-
-    @MainActor
-    @Test func emptyQueryWithScopeReturnsCategorySlice() {
-        let store = ScanStore()
+    @Test func forEachHeaderRespectsCategoryFilter() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StoreStream-\(UUID().uuidString).darwinscan")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try ScanPackage.createEmpty(at: url)
+        store.beginImport(source: .currentSystem, sourceRef: "test", systemInfo: nil)
         store.ingest([
             ScanItem(id: UUID(), path: "/a", name: "a", category: .executable,
                      size: 0, modifiedAt: nil, insideBundle: false, owningBundlePath: nil),
@@ -231,7 +208,11 @@ struct ScanStoreSearchTests {
             ScanItem(id: UUID(), path: "/c", name: "c", category: .executable,
                      size: 0, modifiedAt: nil, insideBundle: false, owningBundlePath: nil),
         ])
-        #expect(store.search("", scope: .executable).count == 2)
-        #expect(store.search("", scope: .framework).count == 1)
+        var executables: [ItemHeader] = []
+        store.forEachHeader(category: .executable) { executables.append($0); return true }
+        var frameworks: [ItemHeader] = []
+        store.forEachHeader(category: .framework) { frameworks.append($0); return true }
+        #expect(executables.count == 2)
+        #expect(frameworks.count == 1)
     }
 }

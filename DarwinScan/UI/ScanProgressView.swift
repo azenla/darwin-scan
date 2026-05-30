@@ -110,6 +110,8 @@ struct ScanProgressBar: View {
         switch progress.phase {
         case .idle:         return "Idle"
         case .enumerating:  return "Enumerating files…"
+        case .importing:    return "Importing files…"
+        case .analyzing:    return "Analyzing items…"
         case .inspecting:   return "Inspecting in parallel…"
         case .writing:      return "Writing…"
         case .done:         return "Done"
@@ -118,69 +120,167 @@ struct ScanProgressBar: View {
     }
 }
 
-/// Sheet shown before a scan starts so the user can review options.
-struct ScanOptionsSheet: View {
+/// Sheet for adding a snapshot — pick a source (current system or IPSW) and
+/// review options. Replaces the old "scan options" sheet which couldn't tell
+/// the user where the bytes were coming from.
+struct NewSnapshotSheet: View {
     @Binding var options: ScanOptions
+    @Binding var sourceChoice: SourceChoice
+    @Binding var ipswURL: URL?
     var onCancel: () -> Void
     var onStart: () -> Void
 
+    enum SourceChoice: String, CaseIterable, Identifiable {
+        case currentSystem
+        case ipsw
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .currentSystem: return "Current System"
+            case .ipsw:          return "IPSW Image"
+            }
+        }
+        var symbol: String {
+            switch self {
+            case .currentSystem: return "desktopcomputer"
+            case .ipsw:          return "shippingbox"
+            }
+        }
+        var blurb: String {
+            switch self {
+            case .currentSystem:
+                return "Walk this Mac's /System, /bin, /sbin, /usr and capture file bytes into the bundle."
+            case .ipsw:
+                return "Mount an IPSW image (Apple Silicon Mac or device) and import its system payload. Each IPSW becomes a snapshot — chain two to diff across an OS update."
+            }
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("New Scan")
-                .font(.title2)
-                .bold()
-            Text("Restricted to system-image paths. User data (/Users, /Applications, /Library, /Volumes) is never read.")
-                .foregroundStyle(.secondary)
-                .font(.callout)
+            Text("Add Snapshot")
+                .font(.title2).bold()
 
-            GroupBox("Roots") {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(options.roots, id: \.self) { root in
-                        HStack {
-                            Image(systemName: "folder")
-                            Text(root)
-                                .font(.system(.callout, design: .monospaced))
+            // Source picker — pretty cards
+            HStack(spacing: 12) {
+                ForEach(SourceChoice.allCases) { choice in
+                    SourceCard(
+                        choice: choice,
+                        selected: sourceChoice == choice,
+                        onTap: { sourceChoice = choice }
+                    )
+                }
+            }
+
+            if sourceChoice == .ipsw {
+                GroupBox("IPSW File") {
+                    HStack(spacing: 8) {
+                        Image(systemName: "doc.fill")
+                            .foregroundStyle(.tint)
+                        if let url = ipswURL {
+                            Text(url.lastPathComponent)
+                                .font(.callout)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        } else {
+                            Text("No IPSW selected")
+                                .foregroundStyle(.secondary)
                         }
+                        Spacer()
+                        Button("Choose…", action: pickIPSW)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            GroupBox("Inspection") {
+            GroupBox("Import") {
                 VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Hash every file (SHA-256)", isOn: $options.hashFiles)
-                    Toggle("Index man pages", isOn: $options.indexManPages)
-                    Toggle("Inspect localizations (.strings)", isOn: $options.inspectLocalizations)
-                    Toggle("English localizations only", isOn: $options.englishLocalizationsOnly)
-                        .disabled(!options.inspectLocalizations)
-                        .padding(.leading, 18)
-                    Toggle("Inspect ML models", isOn: $options.inspectMLModels)
-                    Toggle("Inspect dyld_shared_cache headers", isOn: $options.inspectDyldCache)
-                    Toggle("Follow symbolic links", isOn: $options.followSymlinks)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            GroupBox("Strings Cache") {
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Extract printable strings from Mach-O executables", isOn: $options.extractStrings)
-                    Stepper("Min length: \(options.stringsMinLength)", value: $options.stringsMinLength, in: 4...64)
-                        .disabled(!options.extractStrings)
-                    Text("Increases scan time substantially. Strings are stored inside the .darwinscan bundle for offline search.")
+                    Toggle("Capture file bytes into bundle", isOn: $options.captureFiles)
+                    Text(options.captureFiles
+                         ? "Required for IPSW analysis and for re-running analysis later. Recommended."
+                         : "Skipping capture makes a smaller bundle but analysis can only run against the live filesystem.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            Text("Analysis is a separate step — after import you can run or re-run it from the toolbar. Two-phase model means you only pay capture cost once.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel, action: onCancel)
-                Button("Start Scan", action: onStart)
+                Button("Start Import", action: onStart)
+                    .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
+                    .disabled(sourceChoice == .ipsw && ipswURL == nil)
             }
         }
         .padding(20)
-        .frame(minWidth: 480, idealWidth: 540)
+        .frame(minWidth: 540, idealWidth: 600)
+    }
+
+    private func pickIPSW() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose IPSW"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedFileTypes = ["ipsw"]
+        if panel.runModal() == .OK, let url = panel.url {
+            ipswURL = url
+        }
     }
 }
+
+private struct SourceCard: View {
+    let choice: NewSnapshotSheet.SourceChoice
+    let selected: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Image(systemName: choice.symbol)
+                        .font(.title)
+                        .foregroundStyle(selected ? Color.white : Color.accentColor)
+                    Spacer()
+                    if selected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.white)
+                    }
+                }
+                Text(choice.label)
+                    .font(.headline)
+                    .foregroundStyle(selected ? Color.white : Color.primary)
+                Text(choice.blurb)
+                    .font(.caption)
+                    .multilineTextAlignment(.leading)
+                    .foregroundStyle(selected ? Color.white.opacity(0.85) : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(12)
+            // Fixed height — without this the IPSW card (longer blurb)
+            // grows taller than the Current System card and the two-up row
+            // looks uneven. Spacer above eats any leftover space so the
+            // top-aligned content stays the same regardless of card text.
+            .frame(maxWidth: .infinity, minHeight: 150, maxHeight: 150, alignment: .topLeading)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(selected ? Color.accentColor : Color.gray.opacity(0.12))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(selected ? Color.accentColor : Color.gray.opacity(0.3), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// Compatibility shim — older call sites still expect this name.
+typealias ScanOptionsSheet = NewSnapshotSheet

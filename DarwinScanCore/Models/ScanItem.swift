@@ -4,6 +4,7 @@ import Foundation
 /// what the scanner found. An item can belong to exactly one category; cross-
 /// category relationships are expressed via references inside the detail payload.
 public nonisolated enum ItemCategory: String, Codable, CaseIterable, Identifiable, Sendable {
+    case unanalyzed        // imported, analysis hasn't refined the category yet
     case executable        // CLI tools and other MH_EXECUTE Mach-Os outside .app bundles
     case application       // .app bundles
     case launchService     // launchd plists (agents/daemons)
@@ -23,6 +24,7 @@ public nonisolated enum ItemCategory: String, Codable, CaseIterable, Identifiabl
 
     public var displayName: String {
         switch self {
+        case .unanalyzed:    return "Pending Analysis"
         case .executable:    return "Executables"
         case .application:   return "Applications"
         case .launchService: return "Launch Services"
@@ -42,6 +44,7 @@ public nonisolated enum ItemCategory: String, Codable, CaseIterable, Identifiabl
 
     public var systemImageName: String {
         switch self {
+        case .unanalyzed:    return "clock.badge.questionmark"
         case .executable:    return "terminal"
         case .application:   return "app.dashed"
         case .launchService: return "gearshape.2"
@@ -111,6 +114,58 @@ public nonisolated struct ScanItem: Codable, Identifiable, Hashable, Sendable {
     /// Outgoing graph edges to other items in the same scan.
     public var relationships: [Relationship] = []
 
+    /// Per-item analysis state. Imported rows default to `.pending`; the
+    /// analyzer flips them to `.done` (or `.failed`) and stamps
+    /// `analyzedAt`/`analyzerVersion`. A snapshot is fully analyzed only when
+    /// every member item is `.done`.
+    public var analysisState: AnalysisState = .pending
+    public var analyzedAt: Date?
+    public var analyzerVersion: String?
+
+    // Decode tolerates missing analysisState/analyzedAt/analyzerVersion so a
+    // payload that pre-dated the field still round-trips (defaults to
+    // `.pending`). Synthesized Codable wouldn't do this — it requires every
+    // non-optional key — so we hand-roll the relevant `Decodable.init`.
+    private enum CodingKeys: String, CodingKey {
+        case id, path, name, category, size, modifiedAt, sha256
+        case insideBundle, owningBundlePath, fileBlobRef
+        case executable, application, launchService, framework, mlModel
+        case icon, manPage, localization, dyldCache, script, plist
+        case tags, context, relationships
+        case analysisState, analyzedAt, analyzerVersion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.path = try c.decode(String.self, forKey: .path)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.category = try c.decode(ItemCategory.self, forKey: .category)
+        self.size = try c.decode(Int64.self, forKey: .size)
+        self.modifiedAt = try c.decodeIfPresent(Date.self, forKey: .modifiedAt)
+        self.sha256 = try c.decodeIfPresent(String.self, forKey: .sha256)
+        self.insideBundle = try c.decode(Bool.self, forKey: .insideBundle)
+        self.owningBundlePath = try c.decodeIfPresent(String.self, forKey: .owningBundlePath)
+        self.fileBlobRef = try c.decodeIfPresent(String.self, forKey: .fileBlobRef)
+        self.executable = try c.decodeIfPresent(ExecutableInfo.self, forKey: .executable)
+        self.application = try c.decodeIfPresent(AppBundleInfo.self, forKey: .application)
+        self.launchService = try c.decodeIfPresent(LaunchServiceInfo.self, forKey: .launchService)
+        self.framework = try c.decodeIfPresent(FrameworkInfo.self, forKey: .framework)
+        self.mlModel = try c.decodeIfPresent(MLModelInfo.self, forKey: .mlModel)
+        self.icon = try c.decodeIfPresent(IconInfo.self, forKey: .icon)
+        self.manPage = try c.decodeIfPresent(ManPageInfo.self, forKey: .manPage)
+        self.localization = try c.decodeIfPresent(LocalizationInfo.self, forKey: .localization)
+        self.dyldCache = try c.decodeIfPresent(DyldCacheInfo.self, forKey: .dyldCache)
+        self.script = try c.decodeIfPresent(ScriptInfo.self, forKey: .script)
+        self.plist = try c.decodeIfPresent(PlistInfo.self, forKey: .plist)
+        self.tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
+        self.context = try c.decodeIfPresent(String.self, forKey: .context)
+        self.relationships = try c.decodeIfPresent([Relationship].self, forKey: .relationships) ?? []
+        self.analysisState = try c.decodeIfPresent(AnalysisState.self, forKey: .analysisState) ?? .pending
+        self.analyzedAt = try c.decodeIfPresent(Date.self, forKey: .analyzedAt)
+        self.analyzerVersion = try c.decodeIfPresent(String.self, forKey: .analyzerVersion)
+    }
+
     public init(
         id: UUID,
         path: String,
@@ -135,7 +190,10 @@ public nonisolated struct ScanItem: Codable, Identifiable, Hashable, Sendable {
         plist: PlistInfo? = nil,
         tags: [String] = [],
         context: String? = nil,
-        relationships: [Relationship] = []
+        relationships: [Relationship] = [],
+        analysisState: AnalysisState = .pending,
+        analyzedAt: Date? = nil,
+        analyzerVersion: String? = nil
     ) {
         self.id = id
         self.path = path
@@ -161,6 +219,9 @@ public nonisolated struct ScanItem: Codable, Identifiable, Hashable, Sendable {
         self.tags = tags
         self.context = context
         self.relationships = relationships
+        self.analysisState = analysisState
+        self.analyzedAt = analyzedAt
+        self.analyzerVersion = analyzerVersion
     }
 }
 
@@ -574,6 +635,8 @@ public nonisolated struct ItemHeader: Sendable, Hashable, Identifiable {
     public var isCrossPlatformTool: Bool
     public var isFatBinary: Bool
     public var isPrivateFramework: Bool
+    public var fileBlobRef: String?
+    public var analysisState: AnalysisState
 
     public init(from item: ScanItem) {
         self.id = item.id
@@ -601,6 +664,8 @@ public nonisolated struct ItemHeader: Sendable, Hashable, Identifiable {
         self.isCrossPlatformTool  = item.executable?.isCrossPlatformTool ?? false
         self.isFatBinary          = item.executable?.isFatBinary ?? false
         self.isPrivateFramework   = item.framework?.isPrivate ?? false
+        self.fileBlobRef          = item.fileBlobRef
+        self.analysisState        = item.analysisState
     }
 
     public func withId(_ newId: UUID) -> ItemHeader {

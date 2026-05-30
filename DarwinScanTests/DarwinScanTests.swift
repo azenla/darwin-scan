@@ -60,7 +60,7 @@ struct ScanSessionTests {
         let session = try ScanSession.createNew(at: url)
         #expect(session.bundleURL == url)
         #expect(session.store.database != nil)
-        #expect(session.store.items.isEmpty)
+        #expect(session.store.itemCount == 0)
         var isDir: ObjCBool = false
         #expect(FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir))
         #expect(isDir.boolValue)
@@ -79,7 +79,7 @@ struct ScanSessionTests {
         }
     }
 
-    @Test func createThenOpenRoundTripsContent() throws {
+    @Test func createThenOpenRoundTripsContent() async throws {
         let url = makeTempBundleURL()
         defer { try? FileManager.default.removeItem(at: url) }
 
@@ -97,7 +97,7 @@ struct ScanSessionTests {
             sipStatus: nil,
             capturedAt: Date(timeIntervalSince1970: 1_700_000_000)
         )
-        session.store.beginSnapshot(systemInfo: session.store.systemInfo)
+        session.store.beginImport(source: .currentSystem, sourceRef: "test", systemInfo: session.store.systemInfo)
         let items: [ScanItem] = (0..<4).map { i in
             ScanItem(
                 id: UUID(),
@@ -111,12 +111,15 @@ struct ScanSessionTests {
             )
         }
         session.store.ingest(items)
-        session.store.completeCurrentSnapshot()
+        session.store.completeImport()
         session.checkpoint()
 
         // Reopen as a fresh session and confirm the items round-trip.
+        // `ScanSession.open` is now two-phase; populate explicitly so the
+        // synchronous test can assert against `store.items`.
         let reopened = try ScanSession.open(at: url)
-        #expect(reopened.store.items.count == items.count)
+        await reopened.populateInitialView()
+        #expect(reopened.store.itemCount == items.count)
         #expect(reopened.store.counts()[.executable] == 2)
         #expect(reopened.store.counts()[.framework] == 2)
         #expect(reopened.store.systemInfo?.productVersion == "26.5")
@@ -150,41 +153,40 @@ struct ScanControllerTests {
         return opts
     }
 
-    @Test func startScanIngestsItemsAndFlipsRunningState() async throws {
+    @Test func startImportIngestsItemsAndFlipsRunningState() async throws {
         let url = try makeBundle()
         defer { try? FileManager.default.removeItem(at: url) }
         let session = try ScanSession.open(at: url)
         let controller = ScanController()
+        let options = fastOptions(roots: ["/bin"])
+        let source = CurrentSystemSource(options: options)
         #expect(!controller.isRunning)
-        controller.startScan(options: fastOptions(roots: ["/bin"]),
-                             ingestInto: session.store)
+        controller.startImport(source: source, options: options, into: session.store)
         #expect(controller.isRunning)
 
         let deadline = Date().addingTimeInterval(20)
         while controller.isRunning && Date() < deadline {
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
-        #expect(!controller.isRunning, "scan should finish before deadline")
-        #expect(session.store.items.count > 0, "should ingest at least one item from /bin")
-        #expect((session.store.counts()[.executable] ?? 0) > 0)
+        #expect(!controller.isRunning, "import should finish before deadline")
+        #expect(session.store.itemCount > 0, "should ingest at least one item from /bin")
+        // After import every item is `.unanalyzed` — analysis is the second phase.
+        #expect(session.store.counts()[.unanalyzed] ?? 0 > 0)
         #expect(session.store.systemInfo != nil)
         #expect(session.store.lastScanCompleted != nil)
         #expect(controller.progress.phase == .done)
     }
 
-    @Test func startScanIsIgnoredWhileAnotherScanIsRunning() async throws {
+    @Test func startImportIsIgnoredWhileAnotherIsRunning() async throws {
         let url = try makeBundle()
         defer { try? FileManager.default.removeItem(at: url) }
         let session = try ScanSession.open(at: url)
         let controller = ScanController()
-        controller.startScan(options: fastOptions(roots: ["/bin"]),
-                             ingestInto: session.store)
+        let options = fastOptions(roots: ["/bin"])
+        controller.startImport(source: CurrentSystemSource(options: options), options: options, into: session.store)
         let startedAt = controller.progress.startedAt
         #expect(controller.isRunning)
-        // Second start while running must be a no-op — the original
-        // progress.startedAt should not change.
-        controller.startScan(options: fastOptions(roots: ["/bin"]),
-                             ingestInto: session.store)
+        controller.startImport(source: CurrentSystemSource(options: options), options: options, into: session.store)
         #expect(controller.progress.startedAt == startedAt)
 
         let deadline = Date().addingTimeInterval(20)
@@ -193,13 +195,13 @@ struct ScanControllerTests {
         }
     }
 
-    @Test func cancelStopsAScanInProgress() async throws {
+    @Test func cancelStopsAnImportInProgress() async throws {
         let url = try makeBundle()
         defer { try? FileManager.default.removeItem(at: url) }
         let session = try ScanSession.open(at: url)
         let controller = ScanController()
-        controller.startScan(options: fastOptions(roots: ["/usr"]),
-                             ingestInto: session.store)
+        let options = fastOptions(roots: ["/usr"])
+        controller.startImport(source: CurrentSystemSource(options: options), options: options, into: session.store)
         #expect(controller.isRunning)
         try? await Task.sleep(nanoseconds: 100_000_000)
         controller.cancel()

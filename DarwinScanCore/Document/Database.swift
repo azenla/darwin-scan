@@ -2,87 +2,71 @@ import Foundation
 import SQLite3
 import os.lock
 
-/// SQLite manifest for a `.darwinscan` bundle. Schema v2 (bundle format v4) —
-/// incompatible with the previous JSON/v3 layouts; old bundles fail to open.
+/// SQLite manifest for a `.darwinscan` bundle. **Schema v6** — incompatible
+/// with everything that came before; older bundles fail to open with a clear
+/// re-scan error rather than attempting in-place migration.
 ///
-/// ## Why the rewrite
-///
-/// The old layout stuffed the whole `ScanItem` into a JSON `payload` blob with
-/// only `category` and `owning_bundle_path` indexed. Anything else cost an
-/// O(N) decode pass through the JSON. The new layout promotes every field a
-/// query is likely to filter or sort on to a real column with an index, and
-/// adds dedicated tables for symbols, tags, architectures, relationships,
-/// blobs, snapshots, plus FTS5 virtual tables for full-text search over
-/// symbols and extracted strings.
+/// v6 introduces the **two-phase model**: import (fast — find + capture file
+/// bytes) and analysis (re-runnable — classify + extract symbols, strings,
+/// bundle metadata). Both phases write through the same `Database` handle,
+/// and re-running analysis on a snapshot is a first-class operation rather
+/// than a re-scan.
 ///
 /// ## Tables
 ///
-/// | Table             | Purpose                                                            |
-/// |-------------------|--------------------------------------------------------------------|
-/// | `meta`            | Key/value bag: schema_version, last-scan timestamps                |
-/// | `snapshots`       | Append-only scan history. Latest row is the "current" snapshot.    |
-/// | `snapshot_items`  | Membership: which items belong to which snapshot.                  |
-/// | `items`           | One row per (path, sha256). Hot fields as columns, rest as payload.|
-/// | `tags`            | Free-form tag chips, one row per (item, tag).                      |
-/// | `architectures`   | Mach-O architectures, one row per (item, arch).                    |
-/// | `relationships`   | Outgoing graph edges (linksDylib / ownedByBundle / etc).           |
-/// | `symbols`         | Function / Obj-C class / Swift class names per item.               |
-/// | `symbols_fts`     | FTS5 virtual table mirroring `symbols.name` + `symbols.demangled`. |
-/// | `strings_fts`     | FTS5 virtual table holding `/usr/bin/strings` output per item.     |
-/// | `blobs`           | Registry of content-addressed blobs stored on disk under `blobs/`. |
-///
-/// All non-FTS tables are written through prepared statements. The FTS tables
-/// are populated by the inspector pipeline (symbols by `SymbolInspector`,
-/// strings by `StringsExtractor`) — Database doesn't try to mirror them off
-/// the `symbols`/blob tables via triggers because the source data lives off
-/// the SQLite row (strings text is in a blob file).
+/// | Table             | Purpose |
+/// |-------------------|---------|
+/// | `meta`            | Key/value bag. |
+/// | `snapshots`       | One row per `import` operation. Carries source provenance (current OS or IPSW) and analysis bookkeeping. |
+/// | `snapshot_items`  | Membership: which items belong to which snapshot. |
+/// | `items`           | One row per (path, sha256). Identity is deterministic. Analysis state lives here so per-item re-analysis is cheap to track. |
+/// | `tags`            | Free-form tag chips. Rebuilt during analysis. |
+/// | `architectures`   | Mach-O arch lookup. Rebuilt during analysis. |
+/// | `relationships`   | Outgoing graph edges. Rebuilt during analysis. |
+/// | `symbols`         | Function / class / undefined-import rows. Rebuilt during analysis. |
+/// | `symbols_fts`     | FTS5 mirror of `symbols.name` + `symbols.demangled`. |
+/// | `strings_fts`     | FTS5 contentless index over per-item strings dumps. |
+/// | `blobs`           | Registry of every blob in `blobs/<prefix>/`. |
 ///
 /// ## Concurrency
 ///
 /// `Database` is `final class @unchecked Sendable` because it carries an
-/// `OpaquePointer` (sqlite3*) plus a pile of prepared statements. Writes are
-/// serialized through an internal `os_unfair_lock`. Reads are also gated
-/// through the lock so transactions don't interleave. SQLite is compiled
-/// `SERIALIZED` on Apple platforms; the lock is belt-and-suspenders.
+/// `OpaquePointer` plus prepared statements. Writes are serialized through
+/// an internal `os_unfair_lock`.
 public nonisolated final class Database: @unchecked Sendable {
     /// Bump when schema changes. Persisted under `meta.schema_version`.
-    public static let currentSchemaVersion: Int = 3
+    public static let currentSchemaVersion: Int = 6
+    /// Current analyzer version stamped on items + snapshots when analysis
+    /// completes. Treated opaquely; the UI shows it as-is and the analyzer
+    /// uses it to decide whether a snapshot needs re-analysis after a
+    /// `darwin-scan` upgrade.
+    public static let currentAnalyzerVersion: String = "1"
 
     private var db: OpaquePointer?
     private var lock = os_unfair_lock_s()
-
-    // Prepared statements — cached for the connection lifetime.
     private var stmts: PreparedStatements = .init()
 
     private struct PreparedStatements {
         var upsertItem: OpaquePointer?
+        var updateItemAnalysis: OpaquePointer?
         var deleteItem: OpaquePointer?
-        var clearItems: OpaquePointer?
         var allItems: OpaquePointer?
         var itemByID: OpaquePointer?
-        var itemByPath: OpaquePointer?
 
         var deleteTagsForItem: OpaquePointer?
         var insertTag: OpaquePointer?
-
         var deleteArchsForItem: OpaquePointer?
         var insertArch: OpaquePointer?
-
         var deleteRelsForItem: OpaquePointer?
         var insertRel: OpaquePointer?
         var outgoingTargets: OpaquePointer?
 
         var insertSymbol: OpaquePointer?
         var deleteSymbolsForItem: OpaquePointer?
-        var clearSymbols: OpaquePointer?
 
         var insertBlob: OpaquePointer?
-        var clearBlobs: OpaquePointer?
-
         var insertSnapshot: OpaquePointer?
         var insertSnapshotItem: OpaquePointer?
-        var clearSnapshots: OpaquePointer?
-        var clearSnapshotItems: OpaquePointer?
 
         var insertStringsFTS: OpaquePointer?
         var deleteStringsFTSForItem: OpaquePointer?
@@ -112,11 +96,11 @@ public nonisolated final class Database: @unchecked Sendable {
 
         public var description: String {
             switch self {
-            case .open(let m):           return "Database.open: \(m)"
-            case .prepare(let m):        return "Database.prepare: \(m)"
-            case .step(let m):           return "Database.step: \(m)"
-            case .schemaTooOld(let v):   return "Database: schema v\(v) is from a prior version of DarwinScan and is not supported. Bundle format v5 (schema v\(Database.currentSchemaVersion)) is required — re-scan to produce a new bundle."
-            case .schemaTooNew(let v):   return "Database: schema v\(v) is from a newer DarwinScan than this build supports."
+            case .open(let m):         return "Database.open: \(m)"
+            case .prepare(let m):      return "Database.prepare: \(m)"
+            case .step(let m):         return "Database.step: \(m)"
+            case .schemaTooOld(let v): return "Database: schema v\(v) is from a prior DarwinScan and is not supported. Bundle format v6 (schema v\(Database.currentSchemaVersion)) is required — re-import to produce a new bundle."
+            case .schemaTooNew(let v): return "Database: schema v\(v) is from a newer DarwinScan than this build supports."
             }
         }
     }
@@ -136,7 +120,7 @@ public nonisolated final class Database: @unchecked Sendable {
         try execRaw("PRAGMA synchronous=NORMAL;")
         try execRaw("PRAGMA foreign_keys=OFF;")
         try execRaw("PRAGMA temp_store=MEMORY;")
-        try execRaw("PRAGMA cache_size=-32000;") // 32 MB page cache
+        try execRaw("PRAGMA cache_size=-32000;")
 
         try runDDL()
         try prepareStatements()
@@ -145,26 +129,20 @@ public nonisolated final class Database: @unchecked Sendable {
 
     deinit {
         finalizeAllStatements()
-        if let db {
-            sqlite3_close_v2(db)
-        }
+        if let db { sqlite3_close_v2(db) }
     }
 
     public func close() {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         finalizeAllStatements()
-        if let db {
-            sqlite3_close_v2(db)
-        }
+        if let db { sqlite3_close_v2(db) }
         db = nil
     }
 
     // MARK: - Items
 
     public func upsertItem(_ item: ScanItem) throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         try beginTransaction()
         do {
             try upsertItemLocked(item)
@@ -175,36 +153,56 @@ public nonisolated final class Database: @unchecked Sendable {
         }
     }
 
-    /// Bulk insert/update in a single transaction. A scan flush is ~256 items;
-    /// running each upsert as its own transaction would dominate write time.
     public func upsertItems(_ items: [ScanItem]) throws {
         guard !items.isEmpty else { return }
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         try beginTransaction()
         do {
-            for item in items {
-                try upsertItemLocked(item)
-            }
+            for item in items { try upsertItemLocked(item) }
             try commitTransaction()
         } catch {
             try? rollbackTransaction()
             throw error
+        }
+    }
+
+    /// Stamp the analysis state of a single item. Used by the analyzer after
+    /// it finishes the per-category inspectors so the snapshot's overall
+    /// progress can be derived from member items.
+    public func setItemAnalysisState(
+        itemID: UUID,
+        state: AnalysisState,
+        analyzedAt: Date?,
+        analyzerVersion: String?
+    ) throws {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        try bindAndStep(stmts.updateItemAnalysis, label: "updateItemAnalysis") { stmt in
+            sqlite3_bind_text(stmt, 1, state.rawValue, -1, SQLITE_TRANSIENT)
+            if let analyzedAt {
+                sqlite3_bind_double(stmt, 2, analyzedAt.timeIntervalSince1970)
+            } else {
+                sqlite3_bind_null(stmt, 2)
+            }
+            if let analyzerVersion {
+                sqlite3_bind_text(stmt, 3, analyzerVersion, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(stmt, 3)
+            }
+            sqlite3_bind_text(stmt, 4, itemID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
         }
     }
 
     public func deleteItem(id: UUID) throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         let key = id.uuidString.lowercased()
         try beginTransaction()
         do {
-            try bindAndStep(stmts.deleteTagsForItem, label: "deleteTagsForItem") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
-            try bindAndStep(stmts.deleteArchsForItem, label: "deleteArchsForItem") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
-            try bindAndStep(stmts.deleteRelsForItem, label: "deleteRelsForItem") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
-            try bindAndStep(stmts.deleteSymbolsForItem, label: "deleteSymbolsForItem") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
-            try bindAndStep(stmts.deleteStringsFTSForItem, label: "deleteStringsFTSForItem") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
-            try bindAndStep(stmts.deleteItem, label: "deleteItem") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try bindAndStep(stmts.deleteTagsForItem, label: "delTags") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try bindAndStep(stmts.deleteArchsForItem, label: "delArchs") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try bindAndStep(stmts.deleteRelsForItem, label: "delRels") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try bindAndStep(stmts.deleteSymbolsForItem, label: "delSymbols") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try bindAndStep(stmts.deleteStringsFTSForItem, label: "delStrFTS") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try bindAndStep(stmts.deleteItem, label: "delItem") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
             try commitTransaction()
         } catch {
             try? rollbackTransaction()
@@ -212,135 +210,68 @@ public nonisolated final class Database: @unchecked Sendable {
         }
     }
 
-    public func clearItems() throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+    /// Drop the analysis-derived rows for an item without touching the item
+    /// itself — symbols, strings_fts, tags, architectures, relationships. The
+    /// analyzer calls this before re-running inspectors so stale output from
+    /// a previous analysis doesn't accumulate.
+    public func clearAnalysisOutputForItem(_ itemID: UUID) throws {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        let key = itemID.uuidString.lowercased()
         try beginTransaction()
         do {
-            try execLocked("DELETE FROM tags;")
-            try execLocked("DELETE FROM architectures;")
-            try execLocked("DELETE FROM relationships;")
-            // `DELETE FROM symbols` fires the AFTER DELETE trigger that
-            // removes matching rowids from symbols_fts, so we don't need an
-            // explicit FTS5 'delete-all' command for the symbol index.
-            try execLocked("DELETE FROM symbols;")
-            // strings_fts is contentless — rows have no source table that a
-            // trigger could mirror. Drop+recreate is the only safe global
-            // clear, and the cheapest way to do it within a transaction.
-            try execLocked("DROP TABLE strings_fts;")
-            try execLocked("""
-                CREATE VIRTUAL TABLE strings_fts USING fts5(
-                    item_id UNINDEXED,
-                    item_path UNINDEXED,
-                    content,
-                    tokenize='unicode61'
-                );
-                """)
-            try execLocked("DELETE FROM blobs;")
-            try execLocked("DELETE FROM snapshot_items;")
-            try execLocked("DELETE FROM snapshots;")
-            try execLocked("DELETE FROM items;")
+            try bindAndStep(stmts.deleteTagsForItem, label: "delTags") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try bindAndStep(stmts.deleteArchsForItem, label: "delArchs") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try bindAndStep(stmts.deleteRelsForItem, label: "delRels") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try bindAndStep(stmts.deleteSymbolsForItem, label: "delSymbols") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try bindAndStep(stmts.deleteStringsFTSForItem, label: "delStrFTS") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
             try commitTransaction()
-            // Rebuilding strings_fts invalidates the prepared statement that
-            // points at the previous virtual table — re-prepare it.
-            try reprepareStringsFTSStatements()
         } catch {
             try? rollbackTransaction()
             throw error
         }
-    }
-
-    private func reprepareStringsFTSStatements() throws {
-        if let p = stmts.insertStringsFTS { sqlite3_finalize(p) }
-        if let p = stmts.deleteStringsFTSForItem { sqlite3_finalize(p) }
-        stmts.insertStringsFTS = try prepare("INSERT INTO strings_fts(item_id, item_path, content) VALUES (?, ?, ?)")
-        stmts.deleteStringsFTSForItem = try prepare("DELETE FROM strings_fts WHERE item_id = ?")
     }
 
     public func item(id: UUID) throws -> ScanItem? {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let stmt = stmts.itemByID else { throw DBError.prepare("itemByID statement nil") }
-        sqlite3_reset(stmt)
-        sqlite3_clear_bindings(stmt)
-        // After reading and returning, the prepared statement must be
-        // reset before the function exits — leaving it in SQLITE_ROW state
-        // keeps a read cursor open, which makes the next WAL checkpoint
-        // fail with SQLITE_LOCKED. (Same fix applies to every other
-        // single-row prepared-statement read below.)
-        defer { sqlite3_reset(stmt) }
+        sqlite3_reset(stmt); sqlite3_clear_bindings(stmt); defer { sqlite3_reset(stmt) }
         sqlite3_bind_text(stmt, 1, id.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
         let rc = sqlite3_step(stmt)
         if rc == SQLITE_DONE { return nil }
-        guard rc == SQLITE_ROW else {
-            throw DBError.step("itemByID sqlite3_step -> \(rc): \(lastError())")
-        }
-        return try decodePayloadColumn(stmt: stmt, column: 0)
-    }
-
-    public func item(atPath path: String) throws -> ScanItem? {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-        guard let stmt = stmts.itemByPath else { throw DBError.prepare("itemByPath statement nil") }
-        sqlite3_reset(stmt)
-        sqlite3_clear_bindings(stmt)
-        defer { sqlite3_reset(stmt) }
-        sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
-        let rc = sqlite3_step(stmt)
-        if rc == SQLITE_DONE { return nil }
-        guard rc == SQLITE_ROW else {
-            throw DBError.step("itemByPath sqlite3_step -> \(rc): \(lastError())")
-        }
+        guard rc == SQLITE_ROW else { throw DBError.step("itemByID -> \(rc): \(lastError())") }
         return try decodePayloadColumn(stmt: stmt, column: 0)
     }
 
     public func outgoingTargets(sourceID: UUID) throws -> [String] {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let stmt = stmts.outgoingTargets else { throw DBError.prepare("outgoingTargets statement nil") }
-        sqlite3_reset(stmt)
-        sqlite3_clear_bindings(stmt)
-        defer { sqlite3_reset(stmt) }
+        sqlite3_reset(stmt); sqlite3_clear_bindings(stmt); defer { sqlite3_reset(stmt) }
         sqlite3_bind_text(stmt, 1, sourceID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
         var results: [String] = []
         while true {
             let rc = sqlite3_step(stmt)
             if rc == SQLITE_DONE { break }
-            guard rc == SQLITE_ROW else {
-                throw DBError.step("outgoingTargets sqlite3_step -> \(rc): \(lastError())")
-            }
-            if let cstr = sqlite3_column_text(stmt, 0) {
-                results.append(String(cString: cstr))
-            }
+            guard rc == SQLITE_ROW else { throw DBError.step("outgoingTargets -> \(rc): \(lastError())") }
+            if let c = sqlite3_column_text(stmt, 0) { results.append(String(cString: c)) }
         }
         return results
     }
 
-    /// Streams every item row back as a `ScanItem`. Called once on document
-    /// open; for very large scans we could switch this to a cursor-based
-    /// generator but the JSON decode dominates anyway.
     public func allItems() throws -> [ScanItem] {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let stmt = stmts.allItems else { throw DBError.prepare("allItems statement nil") }
-        sqlite3_reset(stmt)
-        defer { sqlite3_reset(stmt) }
+        sqlite3_reset(stmt); defer { sqlite3_reset(stmt) }
         var result: [ScanItem] = []
         result.reserveCapacity(1024)
         while true {
             let rc = sqlite3_step(stmt)
             if rc == SQLITE_DONE { break }
-            guard rc == SQLITE_ROW else {
-                throw DBError.step("allItems sqlite3_step -> \(rc): \(lastError())")
-            }
+            guard rc == SQLITE_ROW else { throw DBError.step("allItems -> \(rc): \(lastError())") }
             do {
                 if let item = try decodePayloadColumn(stmt: stmt, column: 0) {
                     result.append(item)
                 }
             } catch {
-                // Skip rows that don't decode — schema drift inside the JSON
-                // payload would be the only plausible cause and we'd rather
-                // show partial data than refuse the whole bundle.
                 print("[Database] Skipping undecodable item row: \(error)")
             }
         }
@@ -349,20 +280,17 @@ public nonisolated final class Database: @unchecked Sendable {
 
     // MARK: - Symbols
 
-    /// Bulk insert symbols for an item. Symbols are append-only per (item, name,
-    /// kind) — re-scanning replaces the lot via `deleteSymbols(forItem:)`.
     public func insertSymbols(_ rows: [SymbolRow]) throws {
         guard !rows.isEmpty else { return }
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         try beginTransaction()
         do {
             for row in rows {
                 try bindAndStep(stmts.insertSymbol, label: "insertSymbol") { stmt in
                     sqlite3_bind_text(stmt, 1, row.itemID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
                     sqlite3_bind_text(stmt, 2, row.name, -1, SQLITE_TRANSIENT)
-                    if let dem = row.demangled {
-                        sqlite3_bind_text(stmt, 3, dem, -1, SQLITE_TRANSIENT)
+                    if let d = row.demangled {
+                        sqlite3_bind_text(stmt, 3, d, -1, SQLITE_TRANSIENT)
                     } else {
                         sqlite3_bind_null(stmt, 3)
                     }
@@ -382,88 +310,62 @@ public nonisolated final class Database: @unchecked Sendable {
     }
 
     public func deleteSymbols(forItem itemID: UUID) throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         try bindAndStep(stmts.deleteSymbolsForItem, label: "deleteSymbolsForItem") { stmt in
             sqlite3_bind_text(stmt, 1, itemID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
         }
     }
 
     public func symbolCount(forItem itemID: UUID) throws -> Int {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { return 0 }
-        var stmt: OpaquePointer?
-        defer { if let stmt { sqlite3_finalize(stmt) } }
-        let sql = "SELECT COUNT(*) FROM symbols WHERE item_id = ?;"
-        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK, let stmt else {
-            throw DBError.prepare("symbolCount prepare -> \(rc): \(lastError())")
-        }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM symbols WHERE item_id = ?;", -1, &stmt, nil)
+        guard rc == SQLITE_OK, let stmt else { throw DBError.prepare("symbolCount -> \(rc)") }
         sqlite3_bind_text(stmt, 1, itemID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
-        let stepRC = sqlite3_step(stmt)
-        guard stepRC == SQLITE_ROW else { return 0 }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
-    /// All symbols for a single item, used by the detail view.
     public func symbols(forItem itemID: UUID, limit: Int = 5000) throws -> [SymbolRow] {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { return [] }
-        var stmt: OpaquePointer?
-        defer { if let stmt { sqlite3_finalize(stmt) } }
-        let sql = "SELECT name, demangled, kind, library_ordinal FROM symbols WHERE item_id = ? ORDER BY kind, name LIMIT ?;"
-        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK, let stmt else {
-            throw DBError.prepare("symbols(forItem) prepare -> \(rc): \(lastError())")
-        }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let rc = sqlite3_prepare_v2(db, "SELECT name, demangled, kind, library_ordinal FROM symbols WHERE item_id = ? ORDER BY kind, name LIMIT ?;", -1, &stmt, nil)
+        guard rc == SQLITE_OK, let stmt else { throw DBError.prepare("symbols(forItem) -> \(rc)") }
         sqlite3_bind_text(stmt, 1, itemID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 2, Int32(limit))
         var out: [SymbolRow] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let nameC = sqlite3_column_text(stmt, 0) else { continue }
             let name = String(cString: nameC)
-            let demangled: String? = sqlite3_column_text(stmt, 1).map { String(cString: $0) }
+            let dem: String? = sqlite3_column_text(stmt, 1).map { String(cString: $0) }
             guard let kindC = sqlite3_column_text(stmt, 2),
                   let kind = SymbolRow.Kind(rawValue: String(cString: kindC)) else { continue }
-            let ord: Int? = (sqlite3_column_type(stmt, 3) == SQLITE_NULL)
-                ? nil
-                : Int(sqlite3_column_int(stmt, 3))
-            out.append(SymbolRow(itemID: itemID, name: name, demangled: demangled, kind: kind, libraryOrdinal: ord))
+            let ord: Int? = sqlite3_column_type(stmt, 3) == SQLITE_NULL ? nil : Int(sqlite3_column_int(stmt, 3))
+            out.append(SymbolRow(itemID: itemID, name: name, demangled: dem, kind: kind, libraryOrdinal: ord))
         }
         return out
     }
 
-    /// FTS5 symbol search. `query` is a raw FTS5 MATCH expression — callers
-    /// are responsible for escaping (`SearchQuery` builds these). Returns
-    /// `(itemID, name, kind)` triples, ordered by FTS rank.
     public func searchSymbols(query: String, limit: Int = 500) throws -> [SymbolHit] {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { return [] }
-        var stmt: OpaquePointer?
-        defer { if let stmt { sqlite3_finalize(stmt) } }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
         let sql = """
             SELECT symbols.item_id, symbols.name, symbols.demangled, symbols.kind
-            FROM symbols_fts
-            JOIN symbols ON symbols.id = symbols_fts.rowid
-            WHERE symbols_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?;
+            FROM symbols_fts JOIN symbols ON symbols.id = symbols_fts.rowid
+            WHERE symbols_fts MATCH ? ORDER BY rank LIMIT ?;
             """
         let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK, let stmt else {
-            throw DBError.prepare("searchSymbols prepare -> \(rc): \(lastError())")
-        }
+        guard rc == SQLITE_OK, let stmt else { throw DBError.prepare("searchSymbols -> \(rc)") }
         sqlite3_bind_text(stmt, 1, query, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 2, Int32(limit))
         var out: [SymbolHit] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let idC = sqlite3_column_text(stmt, 0),
                   let nameC = sqlite3_column_text(stmt, 1) else { continue }
-            let idStr = String(cString: idC)
-            guard let id = UUID(uuidString: idStr) else { continue }
+            guard let id = UUID(uuidString: String(cString: idC)) else { continue }
             let name = String(cString: nameC)
             let dem: String? = sqlite3_column_text(stmt, 2).map { String(cString: $0) }
             let kindStr: String = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "function"
@@ -475,12 +377,8 @@ public nonisolated final class Database: @unchecked Sendable {
 
     // MARK: - Strings FTS
 
-    /// Insert a strings-dump chunk into `strings_fts`. The blob bytes live in
-    /// the BlobStore; this just lets a query find which items had a given
-    /// substring in their strings dump.
     public func indexStrings(itemID: UUID, itemPath: String, content: String) throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         try bindAndStep(stmts.insertStringsFTS, label: "insertStringsFTS") { stmt in
             sqlite3_bind_text(stmt, 1, itemID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(stmt, 2, itemPath, -1, SQLITE_TRANSIENT)
@@ -488,24 +386,16 @@ public nonisolated final class Database: @unchecked Sendable {
         }
     }
 
-    /// FTS5 strings search. Returns `(itemID, itemPath, snippet)` triples.
     public func searchStrings(query: String, limit: Int = 200) throws -> [StringsHit] {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { return [] }
-        var stmt: OpaquePointer?
-        defer { if let stmt { sqlite3_finalize(stmt) } }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
         let sql = """
             SELECT item_id, item_path, snippet(strings_fts, 2, '«', '»', '…', 12)
-            FROM strings_fts
-            WHERE strings_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?;
+            FROM strings_fts WHERE strings_fts MATCH ? ORDER BY rank LIMIT ?;
             """
         let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK, let stmt else {
-            throw DBError.prepare("searchStrings prepare -> \(rc): \(lastError())")
-        }
+        guard rc == SQLITE_OK, let stmt else { throw DBError.prepare("searchStrings -> \(rc)") }
         sqlite3_bind_text(stmt, 1, query, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 2, Int32(limit))
         var out: [StringsHit] = []
@@ -522,8 +412,7 @@ public nonisolated final class Database: @unchecked Sendable {
     // MARK: - Blobs
 
     public func registerBlob(ref: String, sha256: String, size: Int, kind: String?) throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         try bindAndStep(stmts.insertBlob, label: "insertBlob") { stmt in
             sqlite3_bind_text(stmt, 1, ref, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(stmt, 2, sha256, -1, SQLITE_TRANSIENT)
@@ -538,72 +427,75 @@ public nonisolated final class Database: @unchecked Sendable {
 
     // MARK: - Snapshots
 
-    /// Create a new snapshot row. Pass `parentID` to chain off the previous
-    /// snapshot for incremental scans. `systemInfo` should be the captured
-    /// sw_vers / hardware / SIP-state blob (encoded JSON); it's stored on the
-    /// snapshot row so a future diff command can show "macOS 26.5.1 →
-    /// 26.5.2" even when no items changed enough to retain the snapshot.
-    /// Returns the new snapshot's id.
     @discardableResult
-    public func insertSnapshot(parentID: Int64?, label: String?, startedAt: Date, completedAt: Date?, systemInfo: Data? = nil) throws -> Int64 {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+    public func insertSnapshot(
+        parentID: Int64?,
+        label: String?,
+        sourceKind: SnapshotSourceKind,
+        sourceRef: String?,
+        startedAt: Date,
+        systemInfo: Data? = nil,
+        optionsJSON: Data? = nil
+    ) throws -> Int64 {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { throw DBError.prepare("db is nil") }
         try bindAndStep(stmts.insertSnapshot, label: "insertSnapshot") { stmt in
-            if let parentID {
-                sqlite3_bind_int64(stmt, 1, parentID)
-            } else {
-                sqlite3_bind_null(stmt, 1)
-            }
-            if let label {
-                sqlite3_bind_text(stmt, 2, label, -1, SQLITE_TRANSIENT)
-            } else {
-                sqlite3_bind_null(stmt, 2)
-            }
-            sqlite3_bind_double(stmt, 3, startedAt.timeIntervalSince1970)
-            if let completedAt {
-                sqlite3_bind_double(stmt, 4, completedAt.timeIntervalSince1970)
-            } else {
-                sqlite3_bind_null(stmt, 4)
-            }
-            if let systemInfo {
-                _ = systemInfo.withUnsafeBytes { raw -> Int32 in
-                    if let base = raw.baseAddress {
-                        return sqlite3_bind_blob(stmt, 5, base, Int32(systemInfo.count), SQLITE_TRANSIENT)
-                    } else {
-                        return sqlite3_bind_zeroblob(stmt, 5, 0)
-                    }
-                }
-            } else {
-                sqlite3_bind_null(stmt, 5)
-            }
+            if let parentID { sqlite3_bind_int64(stmt, 1, parentID) } else { sqlite3_bind_null(stmt, 1) }
+            if let label { sqlite3_bind_text(stmt, 2, label, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 2) }
+            sqlite3_bind_text(stmt, 3, sourceKind.rawValue, -1, SQLITE_TRANSIENT)
+            if let sourceRef { sqlite3_bind_text(stmt, 4, sourceRef, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 4) }
+            sqlite3_bind_double(stmt, 5, startedAt.timeIntervalSince1970)
+            sqlite3_bind_null(stmt, 6) // import_completed_at
+            sqlite3_bind_text(stmt, 7, ImportState.running.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 8, AnalysisState.none.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_null(stmt, 9)  // analyzed_at
+            sqlite3_bind_null(stmt, 10) // analyzer_version
+            bindOptBlob(stmt, 11, systemInfo)
+            bindOptBlob(stmt, 12, optionsJSON)
         }
         return sqlite3_last_insert_rowid(db)
     }
 
-    /// Remove a snapshot row and its membership entries. Used by the
-    /// "scan produced no changes — discard the empty snapshot" path. Items
-    /// shared with other snapshots stay in place; only this snapshot's
-    /// `snapshot_items` rows are dropped.
     public func deleteSnapshot(id: Int64) throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         try beginTransaction()
         do {
-            guard let db else { throw DBError.prepare("db is nil") }
-            var s1: OpaquePointer?; defer { if let s1 { sqlite3_finalize(s1) } }
-            let rc1 = sqlite3_prepare_v2(db, "DELETE FROM snapshot_items WHERE snapshot_id = ?;", -1, &s1, nil)
-            guard rc1 == SQLITE_OK, let s1 else { throw DBError.prepare("deleteSnapshot.items prepare -> \(rc1)") }
-            sqlite3_bind_int64(s1, 1, id)
-            let r1 = sqlite3_step(s1)
-            guard r1 == SQLITE_DONE else { throw DBError.step("deleteSnapshot.items step -> \(r1)") }
-
-            var s2: OpaquePointer?; defer { if let s2 { sqlite3_finalize(s2) } }
-            let rc2 = sqlite3_prepare_v2(db, "DELETE FROM snapshots WHERE id = ?;", -1, &s2, nil)
-            guard rc2 == SQLITE_OK, let s2 else { throw DBError.prepare("deleteSnapshot.row prepare -> \(rc2)") }
-            sqlite3_bind_int64(s2, 1, id)
-            let r2 = sqlite3_step(s2)
-            guard r2 == SQLITE_DONE else { throw DBError.step("deleteSnapshot.row step -> \(r2)") }
+            try execLocked("DELETE FROM snapshot_items WHERE snapshot_id = \(id);")
+            // Items orphaned by this delete — those whose only remaining
+            // snapshot membership was the one we just removed — should be
+            // cleaned up along with their analysis-derived rows.
+            try execLocked("""
+                DELETE FROM tags WHERE item_id IN (
+                    SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM snapshot_items)
+                );
+                """)
+            try execLocked("""
+                DELETE FROM architectures WHERE item_id IN (
+                    SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM snapshot_items)
+                );
+                """)
+            try execLocked("""
+                DELETE FROM relationships WHERE source_id IN (
+                    SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM snapshot_items)
+                );
+                """)
+            try execLocked("""
+                DELETE FROM symbols WHERE item_id IN (
+                    SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM snapshot_items)
+                );
+                """)
+            // strings_fts is contentless; we have no symbol-trigger equivalent
+            // to fire on item delete, so delete strings_fts rows by item_id
+            // directly before dropping the orphan items.
+            try execLocked("""
+                DELETE FROM strings_fts WHERE item_id IN (
+                    SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM snapshot_items)
+                );
+                """)
+            try execLocked("""
+                DELETE FROM items WHERE id NOT IN (SELECT item_id FROM snapshot_items);
+                """)
+            try execLocked("DELETE FROM snapshots WHERE id = \(id);")
             try commitTransaction()
         } catch {
             try? rollbackTransaction()
@@ -611,19 +503,9 @@ public nonisolated final class Database: @unchecked Sendable {
         }
     }
 
-    public func addItemToSnapshot(snapshotID: Int64, itemID: UUID) throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-        try bindAndStep(stmts.insertSnapshotItem, label: "insertSnapshotItem") { stmt in
-            sqlite3_bind_int64(stmt, 1, snapshotID)
-            sqlite3_bind_text(stmt, 2, itemID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
-        }
-    }
-
     public func addItemsToSnapshot(snapshotID: Int64, itemIDs: [UUID]) throws {
         guard !itemIDs.isEmpty else { return }
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         try beginTransaction()
         do {
             for itemID in itemIDs {
@@ -639,116 +521,406 @@ public nonisolated final class Database: @unchecked Sendable {
         }
     }
 
-    /// Mark a snapshot as completed. Idempotent — a re-call just overwrites
-    /// the timestamp, which is what you want when a scan resumes after a
-    /// crash and finishes the second time around.
-    public func completeSnapshot(id: Int64, at completedAt: Date) throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+    public func markImportComplete(snapshotID: Int64, at completedAt: Date) throws {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        try execRaw("""
+            UPDATE snapshots SET
+                import_completed_at = \(completedAt.timeIntervalSince1970),
+                import_state = '\(ImportState.done.rawValue)'
+            WHERE id = \(snapshotID);
+            """)
+    }
+
+    public func markSnapshotAnalysis(
+        snapshotID: Int64,
+        state: AnalysisState,
+        analyzedAt: Date?,
+        analyzerVersion: String?
+    ) throws {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { throw DBError.prepare("db is nil") }
-        var stmt: OpaquePointer?
-        defer { if let stmt { sqlite3_finalize(stmt) } }
-        let sql = "UPDATE snapshots SET completed_at = ? WHERE id = ?;"
-        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK, let stmt else {
-            throw DBError.prepare("completeSnapshot prepare -> \(rc)")
-        }
-        sqlite3_bind_double(stmt, 1, completedAt.timeIntervalSince1970)
-        sqlite3_bind_int64(stmt, 2, id)
-        let stepRC = sqlite3_step(stmt)
-        guard stepRC == SQLITE_DONE else {
-            throw DBError.step("completeSnapshot step -> \(stepRC)")
-        }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let rc = sqlite3_prepare_v2(db, """
+            UPDATE snapshots SET analysis_state = ?, analyzed_at = ?, analyzer_version = ?
+            WHERE id = ?;
+            """, -1, &stmt, nil)
+        guard rc == SQLITE_OK, let stmt else { throw DBError.prepare("markSnapshotAnalysis -> \(rc)") }
+        sqlite3_bind_text(stmt, 1, state.rawValue, -1, SQLITE_TRANSIENT)
+        if let analyzedAt { sqlite3_bind_double(stmt, 2, analyzedAt.timeIntervalSince1970) } else { sqlite3_bind_null(stmt, 2) }
+        if let analyzerVersion { sqlite3_bind_text(stmt, 3, analyzerVersion, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 3) }
+        sqlite3_bind_int64(stmt, 4, snapshotID)
+        let s = sqlite3_step(stmt)
+        guard s == SQLITE_DONE else { throw DBError.step("markSnapshotAnalysis -> \(s)") }
     }
 
-    /// Rowid of the most-recent snapshot, or nil for a fresh bundle.
     public func latestSnapshotID() throws -> Int64? {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { return nil }
-        var stmt: OpaquePointer?
-        defer { if let stmt { sqlite3_finalize(stmt) } }
-        let sql = "SELECT id FROM snapshots ORDER BY id DESC LIMIT 1;"
-        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK, let stmt else { return nil }
-        if sqlite3_step(stmt) == SQLITE_ROW {
-            return sqlite3_column_int64(stmt, 0)
-        }
-        return nil
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        guard sqlite3_prepare_v2(db, "SELECT id FROM snapshots ORDER BY id DESC LIMIT 1;", -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
+        return sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : nil
     }
 
-    /// Full snapshot history. Returned newest-first so the UI doesn't need
-    /// to reverse it. Used by future diff / history views.
     public func allSnapshots() throws -> [SnapshotRecord] {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { return [] }
-        var stmt: OpaquePointer?
-        defer { if let stmt { sqlite3_finalize(stmt) } }
-        let sql = "SELECT id, parent_id, label, started_at, completed_at, system_info FROM snapshots ORDER BY id DESC;"
-        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK, let stmt else { return [] }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = """
+            SELECT id, parent_id, label, source_kind, source_ref, started_at,
+                   import_completed_at, import_state, analysis_state,
+                   analyzed_at, analyzer_version, system_info
+            FROM snapshots ORDER BY id DESC;
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
         var out: [SnapshotRecord] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = sqlite3_column_int64(stmt, 0)
-            let parent: Int64? = (sqlite3_column_type(stmt, 1) == SQLITE_NULL) ? nil : sqlite3_column_int64(stmt, 1)
+            let parent: Int64? = sqlite3_column_type(stmt, 1) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 1)
             let label: String? = sqlite3_column_text(stmt, 2).map { String(cString: $0) }
-            let started = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3))
-            let completed: Date? = (sqlite3_column_type(stmt, 4) == SQLITE_NULL)
-                ? nil
-                : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
+            let sourceKindStr: String = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "currentSystem"
+            let sourceKind = SnapshotSourceKind(rawValue: sourceKindStr) ?? .currentSystem
+            let sourceRef: String? = sqlite3_column_text(stmt, 4).map { String(cString: $0) }
+            let started = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5))
+            let importCompleted: Date? = sqlite3_column_type(stmt, 6) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6))
+            let importStateStr: String = sqlite3_column_text(stmt, 7).map { String(cString: $0) } ?? "done"
+            let importState = ImportState(rawValue: importStateStr) ?? .done
+            let analysisStateStr: String = sqlite3_column_text(stmt, 8).map { String(cString: $0) } ?? "none"
+            let analysisState = AnalysisState(rawValue: analysisStateStr) ?? .none
+            let analyzedAt: Date? = sqlite3_column_type(stmt, 9) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 9))
+            let analyzerVersion: String? = sqlite3_column_text(stmt, 10).map { String(cString: $0) }
             var sysInfo: SystemInfo? = nil
-            if sqlite3_column_type(stmt, 5) != SQLITE_NULL,
-               let blob = sqlite3_column_blob(stmt, 5) {
-                let len = Int(sqlite3_column_bytes(stmt, 5))
+            if sqlite3_column_type(stmt, 11) != SQLITE_NULL,
+               let blob = sqlite3_column_blob(stmt, 11) {
+                let len = Int(sqlite3_column_bytes(stmt, 11))
                 let data = Data(bytes: blob, count: len)
                 sysInfo = try? decoder.decode(SystemInfo.self, from: data)
             }
-            out.append(SnapshotRecord(id: id, parentID: parent, label: label, startedAt: started, completedAt: completed, systemInfo: sysInfo))
+            out.append(SnapshotRecord(
+                id: id,
+                parentID: parent,
+                label: label,
+                sourceKind: sourceKind,
+                sourceRef: sourceRef,
+                startedAt: started,
+                importCompletedAt: importCompleted,
+                importState: importState,
+                analysisState: analysisState,
+                analyzedAt: analyzedAt,
+                analyzerVersion: analyzerVersion,
+                systemInfo: sysInfo
+            ))
         }
         return out
     }
 
-    /// Items belonging to a snapshot, hydrated from `items.payload` joined
-    /// on `snapshot_items`. Used by `ScanStore.load` to show "the latest
-    /// snapshot" rather than every version ever recorded.
-    public func itemsForSnapshot(_ snapshotID: Int64) throws -> [ScanItem] {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+    /// Standard column set every `ItemHeader` read pulls. Centralised so
+    /// callers (single-id lookup, in-snapshot listing, bundle-contents,
+    /// referenced-by) all share the same hydration logic.
+    private static let headerColumns = """
+        i.id, i.path, i.name, i.category, i.size, i.modified_at, i.sha256,
+        i.inside_bundle, i.owning_bundle_path, i.context,
+        i.macho_kind, i.macho_platform, i.macho_min_os,
+        i.macho_is_fat, i.macho_is_apple, i.macho_is_xplat, i.macho_usage,
+        i.bundle_identifier, i.language, i.is_private_bundle,
+        i.file_blob_ref, i.analysis_state
+        """
+
+    /// Build an `ItemHeader` from the columns at offset 0..21 of `stmt`.
+    /// Returns nil only when the id column couldn't be parsed.
+    private static func hydrateHeader(stmt: OpaquePointer) -> ItemHeader? {
+        guard let idC = sqlite3_column_text(stmt, 0),
+              let id = UUID(uuidString: String(cString: idC)) else { return nil }
+        let path: String = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+        let name: String = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+        let categoryStr: String = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "other"
+        let category = ItemCategory(rawValue: categoryStr) ?? .other
+        let size = sqlite3_column_int64(stmt, 4)
+        let mtime: Date? = sqlite3_column_type(stmt, 5) == SQLITE_NULL
+            ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5))
+        let sha: String? = sqlite3_column_text(stmt, 6).map { String(cString: $0) }
+        let insideBundle = sqlite3_column_int(stmt, 7) != 0
+        let owningBundle: String? = sqlite3_column_text(stmt, 8).map { String(cString: $0) }
+        let context: String? = sqlite3_column_text(stmt, 9).map { String(cString: $0) }
+        let machoPlatform: String? = sqlite3_column_text(stmt, 11).map { String(cString: $0) }
+        let machoMinOS: String? = sqlite3_column_text(stmt, 12).map { String(cString: $0) }
+        let isFat = sqlite3_column_int(stmt, 13) != 0
+        let isApple = sqlite3_column_int(stmt, 14) != 0
+        let isXplat = sqlite3_column_int(stmt, 15) != 0
+        let machoUsage: String? = sqlite3_column_text(stmt, 16).map { String(cString: $0) }
+        let bundleId: String? = sqlite3_column_text(stmt, 17).map { String(cString: $0) }
+        let language: String? = sqlite3_column_text(stmt, 18).map { String(cString: $0) }
+        let isPrivateBundle = sqlite3_column_int(stmt, 19) != 0
+        let fileBlobRef: String? = sqlite3_column_text(stmt, 20).map { String(cString: $0) }
+        let analysisStateStr: String = sqlite3_column_text(stmt, 21).map { String(cString: $0) } ?? "pending"
+        let analysisState = AnalysisState(rawValue: analysisStateStr) ?? .pending
+
+        var header = ItemHeader(from: ScanItem(
+            id: id, path: path, name: name, category: category, size: size,
+            modifiedAt: mtime, sha256: sha, insideBundle: insideBundle,
+            owningBundlePath: owningBundle, fileBlobRef: fileBlobRef,
+            tags: [], context: context, relationships: []
+        ))
+        header.platform = machoPlatform
+        header.minOS = machoMinOS
+        header.isFatBinary = isFat
+        header.isApple = isApple
+        header.isCrossPlatformTool = isXplat
+        header.usageLine = machoUsage
+        header.bundleIdentifier = bundleId
+        header.language = language
+        header.isPrivateFramework = isPrivateBundle
+        header.analysisState = analysisState
+        return header
+    }
+
+    /// Header lookup by path, scoped to a snapshot. `items.path` is not
+    /// unique (multi-version items share a path with different sha256s),
+    /// so the snapshot scope is what picks the right row.
+    public func itemHeader(atPath path: String, inSnapshot snapshotID: Int64) throws -> ItemHeader? {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return nil }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = """
+            SELECT \(Self.headerColumns)
+            FROM items i
+            JOIN snapshot_items si ON si.item_id = i.id
+            WHERE i.path = ? AND si.snapshot_id = ?
+            LIMIT 1;
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
+        sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 2, snapshotID)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return Self.hydrateHeader(stmt: stmt)
+    }
+
+    /// Single header by id, with the same column-only fast path everything
+    /// else uses.
+    public func itemHeader(id: UUID) throws -> ItemHeader? {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return nil }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = "SELECT \(Self.headerColumns) FROM items i WHERE i.id = ?;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
+        sqlite3_bind_text(stmt, 1, id.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return Self.hydrateHeader(stmt: stmt)
+    }
+
+    /// Bulk fetch of headers for a known id set. Returns a map so callers
+    /// can render rows in their own preferred order without paying a
+    /// round-trip per row. SQL `IN` lists are size-limited; we chunk at
+    /// 256.
+    public func itemHeaders(forIDs ids: [UUID]) throws -> [UUID: ItemHeader] {
+        guard !ids.isEmpty else { return [:] }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return [:] }
+        var out: [UUID: ItemHeader] = [:]
+        out.reserveCapacity(ids.count)
+        var idx = 0
+        let chunkSize = 256
+        while idx < ids.count {
+            let end = min(idx + chunkSize, ids.count)
+            let placeholders = Array(repeating: "?", count: end - idx).joined(separator: ",")
+            let sql = "SELECT \(Self.headerColumns) FROM items i WHERE i.id IN (\(placeholders));"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { idx = end; continue }
+            defer { sqlite3_finalize(s) }
+            for (offset, id) in ids[idx..<end].enumerated() {
+                sqlite3_bind_text(s, Int32(offset + 1), id.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
+            }
+            while sqlite3_step(s) == SQLITE_ROW {
+                if let h = Self.hydrateHeader(stmt: s) { out[h.id] = h }
+            }
+            idx = end
+        }
+        return out
+    }
+
+    /// Stream every header in a snapshot through `body`. Used by the
+    /// list view to filter without materialising the full header array.
+    /// `body` MUST NOT call other Database methods — the cursor holds the
+    /// connection lock for the duration of the walk (re-entry deadlocks).
+    public func forEachHeader(
+        inSnapshot snapshotID: Int64,
+        category: ItemCategory? = nil,
+        body: (ItemHeader) -> Bool
+    ) throws {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let categoryFilter = category != nil ? "AND i.category = ?" : ""
+        let sql = """
+            SELECT \(Self.headerColumns)
+            FROM items i
+            JOIN snapshot_items si ON si.item_id = i.id
+            WHERE si.snapshot_id = ? \(categoryFilter)
+            ORDER BY i.name COLLATE NOCASE, i.path COLLATE NOCASE;
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return }
+        sqlite3_bind_int64(stmt, 1, snapshotID)
+        if let category {
+            sqlite3_bind_text(stmt, 2, category.rawValue, -1, SQLITE_TRANSIENT)
+        }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let h = Self.hydrateHeader(stmt: stmt) else { continue }
+            if !body(h) { break }
+        }
+    }
+
+    /// Count of items per category in a snapshot. Done via SQL GROUP BY so
+    /// the sidebar's badge counts don't require an in-memory walk of all
+    /// items. Single query, returns at most `ItemCategory.allCases.count`
+    /// rows.
+    public func categoryCounts(inSnapshot snapshotID: Int64) throws -> [ItemCategory: Int] {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return [:] }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = """
+            SELECT i.category, COUNT(*)
+            FROM items i
+            JOIN snapshot_items si ON si.item_id = i.id
+            WHERE si.snapshot_id = ?
+            GROUP BY i.category;
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [:] }
+        sqlite3_bind_int64(stmt, 1, snapshotID)
+        var out: [ItemCategory: Int] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let categoryC = sqlite3_column_text(stmt, 0) else { continue }
+            let categoryStr = String(cString: categoryC)
+            guard let category = ItemCategory(rawValue: categoryStr) else { continue }
+            out[category] = Int(sqlite3_column_int64(stmt, 1))
+        }
+        return out
+    }
+
+    /// Headers whose items live inside a given bundle. SQL is keyed on the
+    /// `owning_bundle_path` column which has an index. Used by the detail
+    /// view's "contents" section; previous in-memory equivalent was
+    /// `ScanStore.itemsByOwningBundle` which alone consumed ~50 MB on a
+    /// /System snapshot.
+    public func headers(inBundleAtPath bundlePath: String, inSnapshot snapshotID: Int64) throws -> [ItemHeader] {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { return [] }
-        var stmt: OpaquePointer?
-        defer { if let stmt { sqlite3_finalize(stmt) } }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = """
+            SELECT \(Self.headerColumns)
+            FROM items i
+            JOIN snapshot_items si ON si.item_id = i.id
+            WHERE si.snapshot_id = ? AND i.owning_bundle_path = ?
+            ORDER BY i.path COLLATE NOCASE;
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+        sqlite3_bind_int64(stmt, 1, snapshotID)
+        sqlite3_bind_text(stmt, 2, bundlePath, -1, SQLITE_TRANSIENT)
+        var out: [ItemHeader] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let h = Self.hydrateHeader(stmt: stmt) { out.append(h) }
+        }
+        return out
+    }
+
+    /// Headers that reference a given path via an outgoing relationship —
+    /// the "Referenced By" panel in the detail view. Bounded by `limit`,
+    /// plus an unbounded count for the "+N more" badge.
+    public func headersReferencing(path: String, inSnapshot snapshotID: Int64, limit: Int) throws -> (total: Int, headers: [ItemHeader]) {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return (0, []) }
+        // Count first (fast — rel_target_path_idx covers this).
+        var countStmt: OpaquePointer?; defer { if let countStmt { sqlite3_finalize(countStmt) } }
+        let countSQL = """
+            SELECT COUNT(DISTINCT r.source_id)
+            FROM relationships r
+            JOIN snapshot_items si ON si.item_id = r.source_id
+            WHERE r.target_path = ? AND si.snapshot_id = ?;
+            """
+        var total = 0
+        if sqlite3_prepare_v2(db, countSQL, -1, &countStmt, nil) == SQLITE_OK, let cs = countStmt {
+            sqlite3_bind_text(cs, 1, path, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(cs, 2, snapshotID)
+            if sqlite3_step(cs) == SQLITE_ROW { total = Int(sqlite3_column_int64(cs, 0)) }
+        }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = """
+            SELECT \(Self.headerColumns)
+            FROM items i
+            JOIN relationships r ON r.source_id = i.id
+            JOIN snapshot_items si ON si.item_id = i.id
+            WHERE r.target_path = ? AND si.snapshot_id = ?
+            GROUP BY i.id
+            ORDER BY i.path COLLATE NOCASE
+            LIMIT ?;
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return (total, []) }
+        sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 2, snapshotID)
+        sqlite3_bind_int(stmt, 3, Int32(limit))
+        var out: [ItemHeader] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let h = Self.hydrateHeader(stmt: stmt) { out.append(h) }
+        }
+        return (total, out)
+    }
+
+    /// Member item IDs for a snapshot, as an ordered array. Used by the
+    /// analyzer (and any other code that wants to walk a snapshot one
+    /// item at a time without paying the cost of decoding every payload
+    /// up front). 16 B/item — bounded even for /System-scale snapshots.
+    public func orderedItemIDs(inSnapshot snapshotID: Int64) throws -> [UUID] {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return [] }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = "SELECT item_id FROM snapshot_items WHERE snapshot_id = ? ORDER BY ROWID;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+        sqlite3_bind_int64(stmt, 1, snapshotID)
+        var out: [UUID] = []
+        out.reserveCapacity(1024)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let c = sqlite3_column_text(stmt, 0),
+                  let u = UUID(uuidString: String(cString: c)) else { continue }
+            out.append(u)
+        }
+        return out
+    }
+
+    /// Number of items in a snapshot — without materializing any payload.
+    public func itemCountInSnapshot(_ snapshotID: Int64) throws -> Int {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return 0 }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM snapshot_items WHERE snapshot_id = ?;", -1, &stmt, nil) == SQLITE_OK, let stmt else { return 0 }
+        sqlite3_bind_int64(stmt, 1, snapshotID)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    public func itemsForSnapshot(_ snapshotID: Int64) throws -> [ScanItem] {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return [] }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
         let sql = """
             SELECT i.payload FROM items i
             JOIN snapshot_items si ON si.item_id = i.id
             WHERE si.snapshot_id = ?;
             """
-        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK, let stmt else { return [] }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
         sqlite3_bind_int64(stmt, 1, snapshotID)
         var out: [ScanItem] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let blob = sqlite3_column_blob(stmt, 0) else { continue }
             let len = Int(sqlite3_column_bytes(stmt, 0))
             let data = Data(bytes: blob, count: len)
-            if let item = try? decoder.decode(ScanItem.self, from: data) {
-                out.append(item)
-            }
+            if let item = try? decoder.decode(ScanItem.self, from: data) { out.append(item) }
         }
         return out
     }
 
-    /// Set membership of a snapshot: the item IDs of everything it contains.
-    /// Future diff code: `itemsInSnapshot(a) symmetric-difference itemsInSnapshot(b)`.
     public func itemsInSnapshot(_ snapshotID: Int64) throws -> Set<UUID> {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { return [] }
-        var stmt: OpaquePointer?
-        defer { if let stmt { sqlite3_finalize(stmt) } }
-        let sql = "SELECT item_id FROM snapshot_items WHERE snapshot_id = ?;"
-        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK, let stmt else { return [] }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        guard sqlite3_prepare_v2(db, "SELECT item_id FROM snapshot_items WHERE snapshot_id = ?;", -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
         sqlite3_bind_int64(stmt, 1, snapshotID)
         var out: Set<UUID> = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -760,34 +932,54 @@ public nonisolated final class Database: @unchecked Sendable {
         return out
     }
 
+    /// Snapshot membership joined with each item's per-row analysis state.
+    /// The analyzer uses this to figure out which rows still need work for a
+    /// given snapshot (pending or failed) without paying a full payload
+    /// decode per item.
+    public func analysisStatesInSnapshot(_ snapshotID: Int64) throws -> [(UUID, AnalysisState)] {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let db else { return [] }
+        var stmt: OpaquePointer?; defer { if let stmt { sqlite3_finalize(stmt) } }
+        let sql = """
+            SELECT i.id, i.analysis_state FROM items i
+            JOIN snapshot_items si ON si.item_id = i.id
+            WHERE si.snapshot_id = ?;
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+        sqlite3_bind_int64(stmt, 1, snapshotID)
+        var out: [(UUID, AnalysisState)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let idC = sqlite3_column_text(stmt, 0),
+                  let id = UUID(uuidString: String(cString: idC)) else { continue }
+            let stateStr: String = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "pending"
+            let state = AnalysisState(rawValue: stateStr) ?? .pending
+            out.append((id, state))
+        }
+        return out
+    }
+
     // MARK: - Meta
 
     public func setMeta(_ key: String, json: Data) throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         try setMetaLocked(key: key, blob: json)
     }
 
     public func meta(_ key: String) throws -> Data? {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let stmt = stmts.getMeta else { return nil }
-        sqlite3_reset(stmt)
-        defer { sqlite3_reset(stmt) }
+        sqlite3_reset(stmt); defer { sqlite3_reset(stmt) }
         sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
         let rc = sqlite3_step(stmt)
         if rc == SQLITE_DONE { return nil }
-        guard rc == SQLITE_ROW else {
-            throw DBError.step("meta sqlite3_step -> \(rc): \(lastError())")
-        }
+        guard rc == SQLITE_ROW else { throw DBError.step("meta -> \(rc)") }
         guard let blob = sqlite3_column_blob(stmt, 0) else { return nil }
         let len = Int(sqlite3_column_bytes(stmt, 0))
         return Data(bytes: blob, count: len)
     }
 
     public func setMeta<T: Encodable>(_ key: String, value: T) throws {
-        let data = try encoder.encode(value)
-        try setMeta(key, json: data)
+        try setMeta(key, json: try encoder.encode(value))
     }
 
     public func meta<T: Decodable>(_ key: String, as: T.Type) throws -> T? {
@@ -795,16 +987,11 @@ public nonisolated final class Database: @unchecked Sendable {
         return try decoder.decode(T.self, from: data)
     }
 
-    // MARK: - Checkpoint
-
     public func checkpoint() throws {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         guard let db else { return }
         let rc = sqlite3_wal_checkpoint_v2(db, nil, SQLITE_CHECKPOINT_TRUNCATE, nil, nil)
-        guard rc == SQLITE_OK else {
-            throw DBError.step("wal_checkpoint -> \(rc): \(lastError())")
-        }
+        guard rc == SQLITE_OK else { throw DBError.step("wal_checkpoint -> \(rc)") }
     }
 
     // MARK: - Locked helpers
@@ -846,18 +1033,24 @@ public nonisolated final class Database: @unchecked Sendable {
             bindOptText(stmt, 26, item.application?.iconRef ?? item.icon?.previewBlobRef)
             bindOptText(stmt, 27, item.executable?.stringsBlobRef)
             bindOptText(stmt, 28, item.fileBlobRef)
+            sqlite3_bind_text(stmt, 29, item.analysisState.rawValue, -1, SQLITE_TRANSIENT)
+            if let a = item.analyzedAt {
+                sqlite3_bind_double(stmt, 30, a.timeIntervalSince1970)
+            } else {
+                sqlite3_bind_null(stmt, 30)
+            }
+            bindOptText(stmt, 31, item.analyzerVersion)
             _ = payload.withUnsafeBytes { raw -> Int32 in
                 if let base = raw.baseAddress {
-                    return sqlite3_bind_blob(stmt, 29, base, Int32(payload.count), SQLITE_TRANSIENT)
+                    return sqlite3_bind_blob(stmt, 32, base, Int32(payload.count), SQLITE_TRANSIENT)
                 } else {
-                    return sqlite3_bind_zeroblob(stmt, 29, 0)
+                    return sqlite3_bind_zeroblob(stmt, 32, 0)
                 }
             }
         }
 
-        // Per-item child rows: rebuild rather than diff. Cheaper for our
-        // typical N (≤ ~40 tags/archs/relationships per item).
-        try bindAndStep(stmts.deleteTagsForItem, label: "deleteTagsForItem") { stmt in
+        // Per-item child rows: rebuild rather than diff.
+        try bindAndStep(stmts.deleteTagsForItem, label: "delTags") { stmt in
             sqlite3_bind_text(stmt, 1, idKey, -1, SQLITE_TRANSIENT)
         }
         for tag in item.tags {
@@ -866,8 +1059,7 @@ public nonisolated final class Database: @unchecked Sendable {
                 sqlite3_bind_text(stmt, 2, tag, -1, SQLITE_TRANSIENT)
             }
         }
-
-        try bindAndStep(stmts.deleteArchsForItem, label: "deleteArchsForItem") { stmt in
+        try bindAndStep(stmts.deleteArchsForItem, label: "delArchs") { stmt in
             sqlite3_bind_text(stmt, 1, idKey, -1, SQLITE_TRANSIENT)
         }
         for arch in item.executable?.architectures ?? [] {
@@ -876,8 +1068,7 @@ public nonisolated final class Database: @unchecked Sendable {
                 sqlite3_bind_text(stmt, 2, arch, -1, SQLITE_TRANSIENT)
             }
         }
-
-        try bindAndStep(stmts.deleteRelsForItem, label: "deleteRelsForItem") { stmt in
+        try bindAndStep(stmts.deleteRelsForItem, label: "delRels") { stmt in
             sqlite3_bind_text(stmt, 1, idKey, -1, SQLITE_TRANSIENT)
         }
         for rel in item.relationships {
@@ -885,7 +1076,7 @@ public nonisolated final class Database: @unchecked Sendable {
                 sqlite3_bind_text(stmt, 1, idKey, -1, SQLITE_TRANSIENT)
                 sqlite3_bind_text(stmt, 2, rel.kind.rawValue, -1, SQLITE_TRANSIENT)
                 sqlite3_bind_text(stmt, 3, rel.targetPath, -1, SQLITE_TRANSIENT)
-                sqlite3_bind_null(stmt, 4) // target_id resolved at scan-finalize time
+                sqlite3_bind_null(stmt, 4)
                 if let note = rel.note {
                     sqlite3_bind_text(stmt, 5, note, -1, SQLITE_TRANSIENT)
                 } else {
@@ -928,9 +1119,16 @@ public nonisolated final class Database: @unchecked Sendable {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 parent_id INTEGER,
                 label TEXT,
+                source_kind TEXT NOT NULL DEFAULT 'currentSystem',
+                source_ref TEXT,
                 started_at REAL NOT NULL,
-                completed_at REAL,
+                import_completed_at REAL,
+                import_state TEXT NOT NULL DEFAULT 'running',
+                analysis_state TEXT NOT NULL DEFAULT 'none',
+                analyzed_at REAL,
+                analyzer_version TEXT,
                 system_info BLOB,
+                options BLOB,
                 FOREIGN KEY (parent_id) REFERENCES snapshots(id)
             );
 
@@ -963,18 +1161,22 @@ public nonisolated final class Database: @unchecked Sendable {
                 icon_blob_ref TEXT,
                 strings_blob_ref TEXT,
                 file_blob_ref TEXT,
+                analysis_state TEXT NOT NULL DEFAULT 'pending',
+                analyzed_at REAL,
+                analyzer_version TEXT,
                 payload BLOB NOT NULL
             );
-            -- items.path is NOT UNIQUE: multi-version items live here. Two
-            -- rows can share a path if their content (sha256) differs, with
-            -- a different deterministic id distinguishing them. The current
-            -- snapshot's snapshot_items entry decides which one a UI shows.
-            CREATE INDEX IF NOT EXISTS items_path_idx               ON items(path);
-            CREATE INDEX IF NOT EXISTS items_category_idx           ON items(category);
-            CREATE INDEX IF NOT EXISTS items_owning_bundle_idx      ON items(owning_bundle_path);
-            CREATE INDEX IF NOT EXISTS items_sha256_idx             ON items(sha256);
-            CREATE INDEX IF NOT EXISTS items_bundle_id_idx          ON items(bundle_identifier);
-            CREATE INDEX IF NOT EXISTS items_language_idx           ON items(language);
+            CREATE INDEX IF NOT EXISTS items_path_idx           ON items(path);
+            CREATE INDEX IF NOT EXISTS items_category_idx       ON items(category);
+            CREATE INDEX IF NOT EXISTS items_owning_bundle_idx  ON items(owning_bundle_path);
+            CREATE INDEX IF NOT EXISTS items_sha256_idx         ON items(sha256);
+            CREATE INDEX IF NOT EXISTS items_bundle_id_idx      ON items(bundle_identifier);
+            CREATE INDEX IF NOT EXISTS items_language_idx       ON items(language);
+            CREATE INDEX IF NOT EXISTS items_analysis_idx       ON items(analysis_state);
+            -- COLLATE NOCASE so the list view's ORDER BY name doesn't fall
+            -- back to a table scan + sort. Same shape as the queries in
+            -- `forEachHeader` / `headers(inBundleAtPath:)`.
+            CREATE INDEX IF NOT EXISTS items_name_nocase_idx     ON items(name COLLATE NOCASE);
 
             CREATE TABLE IF NOT EXISTS snapshot_items (
                 snapshot_id INTEGER NOT NULL,
@@ -1029,55 +1231,30 @@ public nonisolated final class Database: @unchecked Sendable {
             CREATE INDEX IF NOT EXISTS blobs_sha256_idx ON blobs(sha256);
             """)
 
-        // FTS5 virtual tables.
-        //
-        // - `symbols_fts` uses `content='symbols'` so its rowid maps 1:1 with
-        //   the symbols table. We populate it via triggers (sqlite handles the
-        //   rebuild on DELETE inside the AFTER DELETE trigger using the
-        //   `delete` command).
-        // - `strings_fts` is contentless (`content=''`) because the source
-        //   strings text lives in a blob file on disk; SQLite stores only the
-        //   inverted index and `item_id`/`item_path` snippets.
         try execRaw("""
             CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
-                name,
-                demangled,
-                content='symbols',
-                content_rowid='id',
-                tokenize='unicode61'
+                name, demangled, content='symbols', content_rowid='id', tokenize='unicode61'
             );
-
             CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-                INSERT INTO symbols_fts(rowid, name, demangled)
-                VALUES (new.id, new.name, new.demangled);
+                INSERT INTO symbols_fts(rowid, name, demangled) VALUES (new.id, new.name, new.demangled);
             END;
-
             CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-                INSERT INTO symbols_fts(symbols_fts, rowid, name, demangled)
-                VALUES ('delete', old.id, old.name, old.demangled);
+                INSERT INTO symbols_fts(symbols_fts, rowid, name, demangled) VALUES ('delete', old.id, old.name, old.demangled);
             END;
-
             CREATE VIRTUAL TABLE IF NOT EXISTS strings_fts USING fts5(
-                item_id UNINDEXED,
-                item_path UNINDEXED,
-                content,
-                tokenize='unicode61'
+                item_id UNINDEXED, item_path UNINDEXED, content, tokenize='unicode61'
             );
             """)
     }
 
     private func writeOrCheckSchemaVersion() throws {
-        // If meta is empty we own the schema; stamp the current version.
-        // Otherwise verify it matches — older bundles fail loudly so the user
-        // knows the format changed.
         if let raw = try? meta("schema_version"),
            let str = String(data: raw, encoding: .utf8),
            let v = Int(str.trimmingCharacters(in: .whitespacesAndNewlines)) {
             if v < Self.currentSchemaVersion { throw DBError.schemaTooOld(v) }
             if v > Self.currentSchemaVersion { throw DBError.schemaTooNew(v) }
         } else {
-            let bytes = Data("\(Self.currentSchemaVersion)".utf8)
-            try setMeta("schema_version", json: bytes)
+            try setMeta("schema_version", json: Data("\(Self.currentSchemaVersion)".utf8))
         }
     }
 
@@ -1091,8 +1268,8 @@ public nonisolated final class Database: @unchecked Sendable {
                 bundle_identifier, bundle_short_version, bundle_version,
                 bundle_display_name, bundle_exec_name, is_private_bundle,
                 language, icon_blob_ref, strings_blob_ref, file_blob_ref,
-                payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                analysis_state, analyzed_at, analyzer_version, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 path=excluded.path, name=excluded.name, category=excluded.category,
                 size=excluded.size, modified_at=excluded.modified_at, sha256=excluded.sha256,
@@ -1112,35 +1289,38 @@ public nonisolated final class Database: @unchecked Sendable {
                 icon_blob_ref=excluded.icon_blob_ref,
                 strings_blob_ref=excluded.strings_blob_ref,
                 file_blob_ref=excluded.file_blob_ref,
+                analysis_state=excluded.analysis_state,
+                analyzed_at=excluded.analyzed_at,
+                analyzer_version=excluded.analyzer_version,
                 payload=excluded.payload
             """)
+        stmts.updateItemAnalysis = try prepare("""
+            UPDATE items SET analysis_state = ?, analyzed_at = ?, analyzer_version = ? WHERE id = ?;
+            """)
         stmts.deleteItem = try prepare("DELETE FROM items WHERE id = ?")
-        stmts.clearItems = try prepare("DELETE FROM items")
         stmts.allItems = try prepare("SELECT payload FROM items")
         stmts.itemByID = try prepare("SELECT payload FROM items WHERE id = ?")
-        stmts.itemByPath = try prepare("SELECT payload FROM items WHERE path = ?")
 
         stmts.deleteTagsForItem = try prepare("DELETE FROM tags WHERE item_id = ?")
         stmts.insertTag = try prepare("INSERT OR IGNORE INTO tags (item_id, tag) VALUES (?, ?)")
-
         stmts.deleteArchsForItem = try prepare("DELETE FROM architectures WHERE item_id = ?")
         stmts.insertArch = try prepare("INSERT OR IGNORE INTO architectures (item_id, arch) VALUES (?, ?)")
-
         stmts.deleteRelsForItem = try prepare("DELETE FROM relationships WHERE source_id = ?")
         stmts.insertRel = try prepare("INSERT OR REPLACE INTO relationships (source_id, kind, target_path, target_id, note) VALUES (?, ?, ?, ?, ?)")
         stmts.outgoingTargets = try prepare("SELECT target_path FROM relationships WHERE source_id = ?")
 
         stmts.insertSymbol = try prepare("INSERT INTO symbols (item_id, name, demangled, kind, library_ordinal) VALUES (?, ?, ?, ?, ?)")
         stmts.deleteSymbolsForItem = try prepare("DELETE FROM symbols WHERE item_id = ?")
-        stmts.clearSymbols = try prepare("DELETE FROM symbols")
 
         stmts.insertBlob = try prepare("INSERT OR REPLACE INTO blobs (ref, sha256, size, kind) VALUES (?, ?, ?, ?)")
-        stmts.clearBlobs = try prepare("DELETE FROM blobs")
-
-        stmts.insertSnapshot = try prepare("INSERT INTO snapshots (parent_id, label, started_at, completed_at, system_info) VALUES (?, ?, ?, ?, ?)")
+        stmts.insertSnapshot = try prepare("""
+            INSERT INTO snapshots (
+                parent_id, label, source_kind, source_ref, started_at,
+                import_completed_at, import_state, analysis_state,
+                analyzed_at, analyzer_version, system_info, options
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """)
         stmts.insertSnapshotItem = try prepare("INSERT OR IGNORE INTO snapshot_items (snapshot_id, item_id) VALUES (?, ?)")
-        stmts.clearSnapshots = try prepare("DELETE FROM snapshots")
-        stmts.clearSnapshotItems = try prepare("DELETE FROM snapshot_items")
 
         stmts.insertStringsFTS = try prepare("INSERT INTO strings_fts(item_id, item_path, content) VALUES (?, ?, ?)")
         stmts.deleteStringsFTSForItem = try prepare("DELETE FROM strings_fts WHERE item_id = ?")
@@ -1152,9 +1332,7 @@ public nonisolated final class Database: @unchecked Sendable {
     private func finalizeAllStatements() {
         let mirror = Mirror(reflecting: stmts)
         for child in mirror.children {
-            if let p = child.value as? OpaquePointer {
-                sqlite3_finalize(p)
-            }
+            if let p = child.value as? OpaquePointer { sqlite3_finalize(p) }
         }
         stmts = .init()
     }
@@ -1173,12 +1351,11 @@ public nonisolated final class Database: @unchecked Sendable {
 
     private func bindAndStep(_ stmt: OpaquePointer?, label: String, bind: (OpaquePointer) -> Void) throws {
         guard let stmt else { throw DBError.prepare("\(label) statement nil") }
-        sqlite3_reset(stmt)
-        sqlite3_clear_bindings(stmt)
+        sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
         bind(stmt)
         let rc = sqlite3_step(stmt)
         guard rc == SQLITE_DONE || rc == SQLITE_ROW else {
-            throw DBError.step("\(label) sqlite3_step -> \(rc): \(lastError())")
+            throw DBError.step("\(label) -> \(rc): \(lastError())")
         }
     }
 
@@ -1193,16 +1370,10 @@ public nonisolated final class Database: @unchecked Sendable {
         }
     }
 
-    /// Like `execRaw` but assumes the lock is already held — for use inside
-    /// transactions in already-locked code paths.
-    private func execLocked(_ sql: String) throws {
-        try execRaw(sql)
-    }
-
+    private func execLocked(_ sql: String) throws { try execRaw(sql) }
     private func beginTransaction() throws { try execRaw("BEGIN IMMEDIATE TRANSACTION;") }
     private func commitTransaction() throws { try execRaw("COMMIT;") }
     private func rollbackTransaction() throws { try execRaw("ROLLBACK;") }
-
     private func lastError() -> String {
         guard let db else { return "no db" }
         return String(cString: sqlite3_errmsg(db))
@@ -1219,28 +1390,34 @@ nonisolated private func bindOptText(_ stmt: OpaquePointer, _ idx: Int32, _ s: S
     }
 }
 
+nonisolated private func bindOptBlob(_ stmt: OpaquePointer, _ idx: Int32, _ b: Data?) {
+    guard let b else { sqlite3_bind_null(stmt, idx); return }
+    _ = b.withUnsafeBytes { raw -> Int32 in
+        if let base = raw.baseAddress {
+            return sqlite3_bind_blob(stmt, idx, base, Int32(b.count), SQLITE_TRANSIENT)
+        }
+        return sqlite3_bind_zeroblob(stmt, idx, 0)
+    }
+}
+
 // MARK: - Public row types
 
-/// Row in the `symbols` table. Inspector code builds these and hands them to
-/// `Database.insertSymbols(_:)`.
 public nonisolated struct SymbolRow: Sendable, Hashable {
     public enum Kind: String, Codable, Sendable, Hashable {
-        case function          // LC_SYMTAB / dyld export trie function symbol
-        case data              // LC_SYMTAB data symbol
-        case objcClass         // `_OBJC_CLASS_$_Foo` or `__objc_classname` entry
-        case objcMetaClass     // `_OBJC_METACLASS_$_Foo`
-        case objcProtocol      // `__objc_protolist` entry
-        case swiftClass        // demangles to a Swift class
-        case swiftStruct       // demangles to a Swift struct/enum/protocol
-        case undefined         // imported (external) symbol
+        case function
+        case data
+        case objcClass
+        case objcMetaClass
+        case objcProtocol
+        case swiftClass
+        case swiftStruct
+        case undefined
     }
-
     public var itemID: UUID
     public var name: String
     public var demangled: String?
     public var kind: Kind
     public var libraryOrdinal: Int?
-
     public init(itemID: UUID, name: String, demangled: String? = nil, kind: Kind, libraryOrdinal: Int? = nil) {
         self.itemID = itemID
         self.name = name
@@ -1250,7 +1427,6 @@ public nonisolated struct SymbolRow: Sendable, Hashable {
     }
 }
 
-/// FTS hit returned by `Database.searchSymbols(query:)`.
 public nonisolated struct SymbolHit: Sendable, Hashable {
     public var itemID: UUID
     public var name: String
@@ -1258,31 +1434,96 @@ public nonisolated struct SymbolHit: Sendable, Hashable {
     public var kind: SymbolRow.Kind
 }
 
-/// FTS hit returned by `Database.searchStrings(query:)`.
 public nonisolated struct StringsHit: Sendable, Hashable {
     public var itemID: UUID
     public var itemPath: String
     public var snippet: String
 }
 
-/// Snapshot history row. Each scan run produces one of these; `parentID`
-/// chains to the previous run, enabling a future diff UI to walk the
-/// chain backwards. `label` is reserved for user-supplied names (e.g.
-/// "macOS 26.5 GM") once the UI exposes a rename affordance — the scan
-/// pipeline never sets it directly.
+/// Where a snapshot's content came from. Stored on the `snapshots` row so the
+/// UI can show "macOS 26.5.1 (this Mac)" vs "iPhone15,2_26.5.1_…ipsw".
+public nonisolated enum SnapshotSourceKind: String, Codable, Sendable, Hashable, CaseIterable {
+    case currentSystem
+    case ipsw
+
+    public var displayName: String {
+        switch self {
+        case .currentSystem: return "Current System"
+        case .ipsw:          return "IPSW"
+        }
+    }
+
+    public var systemImageName: String {
+        switch self {
+        case .currentSystem: return "desktopcomputer"
+        case .ipsw:          return "shippingbox"
+        }
+    }
+}
+
+/// State of the import phase for a snapshot. Distinguishes "we're mid-import"
+/// from "import done, ready for analysis."
+public nonisolated enum ImportState: String, Codable, Sendable, Hashable, CaseIterable {
+    case running
+    case done
+    case failed
+}
+
+/// Per-item and per-snapshot analysis bookkeeping. Items default to
+/// `.pending` when imported; the analyzer flips them to `.done` or `.failed`.
+/// A snapshot is `.done` only when every member item is `.done`.
+public nonisolated enum AnalysisState: String, Codable, Sendable, Hashable, CaseIterable {
+    case none      // snapshot only: analysis never started
+    case pending   // item only: import done, analysis not yet run
+    case partial   // snapshot only: some items analyzed, others pending/failed
+    case running   // snapshot only: analyzer currently working through this snapshot
+    case done      // all members analyzed at current analyzer version
+    case failed    // analysis attempted but errored
+}
+
 public nonisolated struct SnapshotRecord: Sendable, Hashable, Identifiable {
     public var id: Int64
     public var parentID: Int64?
     public var label: String?
+    public var sourceKind: SnapshotSourceKind
+    public var sourceRef: String?
     public var startedAt: Date
-    public var completedAt: Date?
-    /// sw_vers + uname + hardware info captured at scan start. Nil for
-    /// pre-v3 snapshot rows.
+    public var importCompletedAt: Date?
+    public var importState: ImportState
+    public var analysisState: AnalysisState
+    public var analyzedAt: Date?
+    public var analyzerVersion: String?
     public var systemInfo: SystemInfo?
+
+    public init(
+        id: Int64,
+        parentID: Int64?,
+        label: String?,
+        sourceKind: SnapshotSourceKind,
+        sourceRef: String?,
+        startedAt: Date,
+        importCompletedAt: Date?,
+        importState: ImportState,
+        analysisState: AnalysisState,
+        analyzedAt: Date?,
+        analyzerVersion: String?,
+        systemInfo: SystemInfo?
+    ) {
+        self.id = id
+        self.parentID = parentID
+        self.label = label
+        self.sourceKind = sourceKind
+        self.sourceRef = sourceRef
+        self.startedAt = startedAt
+        self.importCompletedAt = importCompletedAt
+        self.importState = importState
+        self.analysisState = analysisState
+        self.analyzedAt = analyzedAt
+        self.analyzerVersion = analyzerVersion
+        self.systemInfo = systemInfo
+    }
 }
 
-// SQLite's SQLITE_TRANSIENT macro isn't bridged to Swift — declare the
-// equivalent destructor manually. Tells SQLite to copy bound values.
 nonisolated let SQLITE_TRANSIENT = unsafeBitCast(
     OpaquePointer(bitPattern: -1),
     to: sqlite3_destructor_type.self

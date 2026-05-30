@@ -11,22 +11,21 @@ struct WelcomeView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            Image(systemName: "magnifyingglass.circle")
+            Image(systemName: "shippingbox.and.arrow.backward")
                 .font(.system(size: 64))
                 .foregroundStyle(.tint)
-            Text("Ready to scan")
-                .font(.title2)
-                .bold()
-            Text("Run a system scan to populate this bundle with everything interesting in /System, /bin, /sbin, and /usr.")
+            Text("Add the first snapshot")
+                .font(.title2).bold()
+            Text("Import the current system or an IPSW. The bundle can hold many snapshots — chain two IPSWs to diff a macOS upgrade, or rescan over time.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
-                .frame(maxWidth: 480)
+                .frame(maxWidth: 520)
             Button(action: onScan) {
-                Label("Run System Scan", systemImage: "play.fill")
+                Label("Add Snapshot…", systemImage: "plus.rectangle.on.rectangle")
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            Text("User data (/Users, /Applications, /Library) is never read.")
+            Text("Import captures file bytes. Analysis is a separate phase you can re-run anytime.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
         }

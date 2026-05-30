@@ -1,47 +1,23 @@
 import Foundation
 import Observation
+import os.lock
 
-/// In-memory store for one open document. SQLite (`data.db`) is the persistent
-/// source of truth for full `ScanItem` payloads; this class keeps a slim
-/// `ItemHeader` for every item in memory plus a handful of derived indexes so
-/// search, lists, and sidebar counts don't pay per-row disk reads.
+/// In-memory façade over the bundle's SQLite database. Holds **no** copy of
+/// the items themselves — every per-item access goes through `Database`,
+/// with a small LRU cache (`HeaderCache`) so the list view's scroll never
+/// pays a hot-loop SQL roundtrip.
 ///
-/// ## Tiering
-///
-/// - **Always in RAM** — one `ItemHeader` per item (~200-300 B). The header
-///   carries every field the list, sidebar, and search engine consult, so a
-///   global filter over hundreds of thousands of items never has to round-trip
-///   through SQLite.
-/// - **On demand** — full `ScanItem` (with relationships, full executable
-///   info, etc.). Fetched via `fullItem(id:)` when the detail view opens.
-///   A typical session touches a few dozen items here, not the whole store.
-///
-/// This is the "SQLite primary, in-memory working set" architecture flagged in
-/// CLAUDE.md. For a /System scan it's ~5-10× less RAM than holding full
-/// `ScanItem` values for every row.
-///
-/// ## Indexes
-///
-/// Three derived indexes are maintained incrementally on every upsert:
-///
-/// - `categoryCounts: [ItemCategory: Int]` — sidebar count badges in O(1).
-/// - `pathReferencedBy: [String: [UUID]]` — inverse adjacency: for each
-///   `targetPath` mentioned in any item's relationships, the list of items
-///   pointing at it. Powers "Referenced By" in O(1).
-/// - `itemsByOwningBundle: [String: [UUID]]` — bundle contents.
-///
-/// All three are reset along with `items`/`itemsByPath`/`itemHeaders` in
-/// `reset()` and rebuilt on document load. They are NOT persisted.
-///
-/// ## Path-collision upserts
-///
-/// When a rescan touches a path that already has an item, the in-memory
-/// `ItemHeader` doesn't carry the previous outgoing relationships (those are
-/// only in SQLite). We query `Database.outgoingTargets(sourceID:)` right before
-/// the upsert to know which paths to scrub from `pathReferencedBy`. For
-/// initial scans nothing collides, so this query never fires.
+/// The previous design mirrored every item's `ItemHeader` into a
+/// `[UUID: ItemHeader]` dict + maintained two reverse indexes
+/// (`pathReferencedBy`, `itemsByOwningBundle`). For a /System-scale
+/// snapshot (470k items) that working set alone exceeded **500 MB** of
+/// heap, and the app crashed at ~4 GB once the rest of SwiftUI's working
+/// state was layered on. The SQL-backed shape uses ~8 MB for the same
+/// snapshot.
 @Observable
 public nonisolated final class ScanStore {
+    // MARK: - Document metadata (persisted)
+
     public var systemInfo: SystemInfo? {
         didSet { persistMeta("system_info", value: systemInfo) }
     }
@@ -55,242 +31,184 @@ public nonisolated final class ScanStore {
         didSet { persistMeta("last_scan_completed", value: lastScanCompleted) }
     }
 
-    /// In-memory map of all items, slim form. Full payloads come from SQLite
-    /// via `fullItem(id:)`.
-    public private(set) var items: [UUID: ItemHeader] = [:]
-    public private(set) var itemsByPath: [String: UUID] = [:]
+    // MARK: - Active-snapshot derived state (small, recomputed on switch)
 
-    // Derived indexes — invariants enforced by upsert/remove.
+    /// Snapshot the in-memory view currently reflects. Nil for empty
+    /// bundles or while a fresh import is mid-flight.
+    public private(set) var activeSnapshotID: Int64?
+    /// Per-category counts for the active snapshot. Derived from
+    /// `Database.categoryCounts(inSnapshot:)`. Updated on
+    /// `setActiveSnapshot(_:)` and when import/analysis finishes.
     public private(set) var categoryCounts: [ItemCategory: Int] = [:]
-    public private(set) var pathReferencedBy: [String: [UUID]] = [:]
-    public private(set) var itemsByOwningBundle: [String: [UUID]] = [:]
+    /// Total item count for the active snapshot. Cached so the sidebar's
+    /// "All Items" badge doesn't pay a SQL roundtrip on every render.
+    public private(set) var itemCount: Int = 0
 
-    /// Bundle-backed blob store. `init()` defers to a temp scratch dir for
-    /// API consumers (tests, ad-hoc callers) and is replaced by
-    /// `attachBundle(blobsDirectory:)` when a document opens an actual
-    /// `.darwinscan` bundle from disk.
+    // MARK: - Backing stores
+
     public private(set) var blobStore: BlobStore
-
-    /// Optional persistent backing. When attached, every mutation is mirrored
-    /// to SQLite so the on-disk `data.db` stays current.
     public private(set) var database: Database?
-
-    /// Where the attached `data.db` lives on disk. `ScanPackage.makeFileWrapper`
-    /// needs this to stream the file into the saved bundle. Set alongside
-    /// `attachDatabase`.
     public var databaseURL: URL?
 
-    /// Active snapshot ID for the in-progress scan. nil when no scan is
-    /// running. `ingest` mirrors items into `snapshot_items(snapshotID, item)`
-    /// when this is set so the new snapshot's membership is recorded.
-    public private(set) var currentSnapshotID: Int64?
+    // MARK: - Import bookkeeping
 
-    /// Snapshot ID of the previous scan (the parent of `currentSnapshotID`),
-    /// if any. Used by `diffAgainstParent()` to decide whether the
-    /// in-progress scan actually changed anything.
-    public private(set) var parentSnapshotID: Int64?
+    public private(set) var importingSnapshotID: Int64?
+    public private(set) var importParentSnapshotID: Int64?
 
-    /// Read-only snapshot history, newest-first. Loaded lazily by the
-    /// `snapshotHistory()` call and cached until `beginSnapshot` invalidates.
+    // MARK: - Caching
+
+    /// Small LRU cache over `ItemHeader` lookups so the list view's
+    /// virtualised scroll doesn't issue a SQL query per row redraw.
+    /// 5000 entries × ~250 B = ~1.2 MB — negligible.
+    private let headerCache = HeaderCache(capacity: 5000)
+
+    /// Snapshot history is read often but mutates rarely; we cache the
+    /// last fetch and invalidate on import/delete.
     private var cachedHistory: [SnapshotRecord]?
 
+    // MARK: - Lifecycle
+
     public init() {
-        // Spin a temporary scratch dir for the blob store. Production callers
-        // immediately replace it with `attachBundle(blobsDirectory:)` once
-        // they know the on-disk bundle location; tests and ad-hoc callers
-        // pick up the scratch dir as-is.
         let temp = FileManager.default.temporaryDirectory
             .appendingPathComponent("darwinscan-scratch", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         self.blobStore = BlobStore(rootDirectory: temp)
     }
 
-    /// Attach (or detach) the persistent database. Called by the document
-    /// open path once it has the `data.db` URL inside the bundle.
-    /// Subsequent `upsert`/`ingest`/`reset` calls write through.
     public func attachDatabase(_ db: Database?) {
         self.database = db
+        headerCache.clear()
     }
 
-    /// Point the store at a `.darwinscan` bundle's `blobs/` directory.
-    /// Replaces the temporary scratch BlobStore created in `init()`. Called
-    /// by `ScanPackage.openInPlace` and the new-bundle flow before the
-    /// scanner starts writing.
     public func attachBundle(blobsDirectory: URL) {
         self.blobStore = BlobStore(rootDirectory: blobsDirectory)
     }
 
-    /// Encode a single meta value to the attached database. Failures are
-    /// logged but non-fatal — losing one metadata write shouldn't abort a
-    /// scan in progress. Skipped when no database is attached or the value
-    /// is nil (we currently persist the *last set* value; a future migration
-    /// can add explicit deletes if we need them).
     private func persistMeta<T: Encodable>(_ key: String, value: T?) {
         guard let database, let value else { return }
-        do {
-            try database.setMeta(key, value: value)
-        } catch {
-            print("[ScanStore] persistMeta(\(key)) failed: \(error)")
-        }
+        do { try database.setMeta(key, value: value) }
+        catch { print("[ScanStore] persistMeta(\(key)) failed: \(error)") }
     }
 
-    // MARK: - Mutation
-
-    /// Clear the in-memory state so a new scan starts from a clean slate.
-    /// Does NOT clear the SQLite database — items from previous snapshots
-    /// stay around so the diff against parent can run, and so deterministic
-    /// upserts (same id → same row) reuse existing storage.
-    ///
-    /// For the "user wants to truly wipe this document" gesture, delete the
-    /// `.darwinscan` bundle on disk and start over.
     public func reset() {
-        items.removeAll()
-        itemsByPath.removeAll()
         categoryCounts.removeAll()
-        pathReferencedBy.removeAll()
-        itemsByOwningBundle.removeAll()
+        itemCount = 0
         systemInfo = nil
         lastScanStarted = nil
         lastScanCompleted = nil
-        currentSnapshotID = nil
-        parentSnapshotID = nil
+        activeSnapshotID = nil
+        importingSnapshotID = nil
+        importParentSnapshotID = nil
         cachedHistory = nil
-    }
-
-    /// Repopulate the in-memory view from the latest snapshot's items.
-    /// Used by `ScanController` after `discardCurrentSnapshot()` so the
-    /// view returns to the parent snapshot's state instead of remaining
-    /// half-populated by the just-cancelled scan.
-    public func reloadFromLatestSnapshot() {
-        guard let database else {
-            reset()
-            return
-        }
-        let latest = (try? database.latestSnapshotID()) ?? nil
-        let loadedItems: [ScanItem]
-        if let id = latest {
-            loadedItems = (try? database.itemsForSnapshot(id)) ?? []
-        } else {
-            loadedItems = []
-        }
-        // Take the snapshot's recorded system_info too, so toolbar /
-        // SystemInfoView reflect the snapshot we're viewing.
-        let snapshot = (try? database.allSnapshots())?.first
-        let attached = self.database
-        self.database = nil
-        items.removeAll()
-        itemsByPath.removeAll()
-        categoryCounts.removeAll()
-        pathReferencedBy.removeAll()
-        itemsByOwningBundle.removeAll()
-        for item in loadedItems {
-            let header = ItemHeader(from: item)
-            self.items[item.id] = header
-            self.itemsByPath[item.path] = item.id
-            addIndexes(forID: item.id, header: header, relationships: item.relationships)
-        }
-        self.systemInfo = snapshot?.systemInfo
-        self.lastScanStarted = snapshot?.startedAt
-        self.lastScanCompleted = snapshot?.completedAt
-        self.database = attached
+        headerCache.clear()
     }
 
     // MARK: - Snapshot lifecycle
 
-    /// Open a new snapshot row in the database and stamp `currentSnapshotID`.
-    /// The next `ingest` will record per-item membership in this snapshot.
-    ///
-    /// Chains off the previous snapshot via `parent_id` so the history is a
-    /// single linked list. Captures `SystemInfo` (sw_vers, hardware, SIP
-    /// state) into the snapshot row so a future diff command can show OS-
-    /// level changes even when no scan items moved.
-    public func beginSnapshot(at startedAt: Date = Date(), label: String? = nil, systemInfo: SystemInfo? = nil) {
+    /// Swap the active snapshot. Replaces the small in-memory state
+    /// (categoryCounts, itemCount, systemInfo) without ever loading the
+    /// items themselves — everything else is fetched lazily from SQL.
+    public func setActiveSnapshot(_ snapshotID: Int64?) {
         guard let database else { return }
+        headerCache.clear()
+        if let snapshotID {
+            let record = (try? database.allSnapshots())?.first(where: { $0.id == snapshotID })
+            categoryCounts = (try? database.categoryCounts(inSnapshot: snapshotID)) ?? [:]
+            itemCount = (try? database.itemCountInSnapshot(snapshotID)) ?? 0
+            systemInfo = record?.systemInfo
+            lastScanStarted = record?.startedAt
+            lastScanCompleted = record?.importCompletedAt
+            activeSnapshotID = snapshotID
+        } else {
+            categoryCounts = [:]
+            itemCount = 0
+            systemInfo = nil
+            lastScanStarted = nil
+            lastScanCompleted = nil
+            activeSnapshotID = nil
+        }
+        cachedHistory = nil
+    }
+
+    /// Recompute the cached active-snapshot stats. Useful after the
+    /// analyzer mutates categories under the active snapshot — re-reading
+    /// counts is one SQL GROUP BY, not a full reload.
+    public func refreshActiveSnapshotStats() {
+        guard let database, let snapshotID = activeSnapshotID else { return }
+        categoryCounts = (try? database.categoryCounts(inSnapshot: snapshotID)) ?? [:]
+        itemCount = (try? database.itemCountInSnapshot(snapshotID)) ?? 0
+        headerCache.clear()
+    }
+
+    @discardableResult
+    public func beginImport(
+        source: SnapshotSourceKind,
+        sourceRef: String?,
+        startedAt: Date = Date(),
+        label: String? = nil,
+        systemInfo: SystemInfo? = nil,
+        options: ScanOptions? = nil
+    ) -> Int64? {
+        guard let database else { return nil }
         do {
             let parent = try database.latestSnapshotID()
-            let infoBytes: Data? = systemInfo.flatMap {
-                let encoder = JSONEncoder()
-                encoder.dateEncodingStrategy = .iso8601
-                return try? encoder.encode($0)
-            }
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            let infoBytes: Data? = systemInfo.flatMap { try? encoder.encode($0) }
+            let optsBytes: Data? = options.flatMap { try? encoder.encode($0) }
             let id = try database.insertSnapshot(
                 parentID: parent,
                 label: label,
+                sourceKind: source,
+                sourceRef: sourceRef,
                 startedAt: startedAt,
-                completedAt: nil,
-                systemInfo: infoBytes
+                systemInfo: infoBytes,
+                optionsJSON: optsBytes
             )
-            currentSnapshotID = id
-            parentSnapshotID = parent
+            importingSnapshotID = id
+            importParentSnapshotID = parent
+            activeSnapshotID = id
+            categoryCounts = [:]
+            itemCount = 0
+            headerCache.clear()
             cachedHistory = nil
+            return id
         } catch {
-            print("[ScanStore] beginSnapshot failed: \(error)")
+            print("[ScanStore] beginImport failed: \(error)")
+            return nil
         }
     }
 
-    /// Discard the in-progress snapshot — delete its `snapshots` row and
-    /// `snapshot_items` membership. Used by the "no changes since previous
-    /// snapshot" finalization path. Items themselves stay in `items` (other
-    /// snapshots may reference them); only the membership and the snapshot
-    /// row are removed.
-    public func discardCurrentSnapshot() {
-        guard let database, let id = currentSnapshotID else { return }
-        do {
-            try database.deleteSnapshot(id: id)
-        } catch {
-            print("[ScanStore] discardCurrentSnapshot failed: \(error)")
-        }
-        currentSnapshotID = nil
+    public func completeImport(at completedAt: Date = Date()) {
+        guard let database, let id = importingSnapshotID else { return }
+        do { try database.markImportComplete(snapshotID: id, at: completedAt) }
+        catch { print("[ScanStore] markImportComplete failed: \(error)") }
+        lastScanCompleted = completedAt
+        importingSnapshotID = nil
         cachedHistory = nil
+        // Items have landed in the active snapshot — refresh stats so the
+        // sidebar shows the post-import counts.
+        refreshActiveSnapshotStats()
     }
 
-    /// Snapshot diff: returns the (added, removed, changed) sets between
-    /// the current snapshot and its parent. "Changed" means same path, but
-    /// different content (deterministic id differs). Called by the scan
-    /// finalize path to decide whether to keep the new snapshot.
-    public func diffAgainstParent() -> (added: Set<UUID>, removed: Set<UUID>, changed: Set<String>)? {
-        guard let database,
-              let currentID = currentSnapshotID else { return nil }
-        let current = (try? database.itemsInSnapshot(currentID)) ?? []
-        guard let parentID = parentSnapshotID else {
-            // First snapshot in the bundle — everything is "added".
-            return (added: current, removed: [], changed: [])
-        }
-        let parent = (try? database.itemsInSnapshot(parentID)) ?? []
-        let added = current.subtracting(parent)
-        let removed = parent.subtracting(current)
-        // Walk added+removed and look for path collisions — those are
-        // content changes at the same path.
-        var addedByPath: [String: UUID] = [:]
-        for id in added {
-            if let h = items[id] { addedByPath[h.path] = id }
-        }
-        var removedByPath: [String: UUID] = [:]
-        for id in removed {
-            // Removed IDs are no longer in the in-memory store. Look them
-            // up by joining `items` directly.
-            if let item = try? database.item(id: id) {
-                removedByPath[item.path] = id
-            }
-        }
-        var changed: Set<String> = []
-        for (path, _) in addedByPath where removedByPath[path] != nil {
-            changed.insert(path)
-        }
-        return (added, removed, changed)
-    }
-
-    /// Mark the current snapshot as finished. No-op if no snapshot is open.
-    public func completeCurrentSnapshot(at completedAt: Date = Date()) {
-        guard let database, let id = currentSnapshotID else { return }
-        do {
-            try database.completeSnapshot(id: id, at: completedAt)
-        } catch {
-            print("[ScanStore] completeSnapshot failed: \(error)")
-        }
+    public func deleteSnapshot(_ snapshotID: Int64) {
+        guard let database else { return }
+        do { try database.deleteSnapshot(id: snapshotID) }
+        catch { print("[ScanStore] deleteSnapshot failed: \(error)"); return }
         cachedHistory = nil
-        // Leave currentSnapshotID set — a saved bundle should still report
-        // "this is the latest snapshot". reset() is what clears it.
+        if activeSnapshotID == snapshotID {
+            let fallback = (try? database.latestSnapshotID()) ?? nil
+            setActiveSnapshot(fallback)
+        }
+    }
+
+    public func discardCurrentImport() {
+        guard let id = importingSnapshotID else { return }
+        deleteSnapshot(id)
+        importingSnapshotID = nil
+        if let parent = importParentSnapshotID {
+            setActiveSnapshot(parent)
+        }
     }
 
     public func snapshotHistory() -> [SnapshotRecord] {
@@ -301,206 +219,68 @@ public nonisolated final class ScanStore {
         return history
     }
 
-    /// Finalize the in-progress snapshot: compute the diff against the
-    /// parent snapshot, discard the new row if nothing changed, otherwise
-    /// stamp completed_at and keep it. Returns a summary so the caller can
-    /// surface "wrote N items, X added / Y changed / Z removed" or
-    /// "discarded — nothing changed since previous scan."
-    ///
-    /// "Nothing changed" means the deterministic id sets for the current
-    /// and parent snapshots are identical. Per the identity rules: same
-    /// (path, sha256) → same id; any byte-level change yields a new id at
-    /// the same path. So set equality is a true content equality check
-    /// for hashed files. Unhashed files use random UUIDs and therefore
-    /// always look "different" — disable hashing only when you don't care
-    /// about cross-scan diff.
-    @discardableResult
-    public func finalizeScan(at completedAt: Date = Date()) -> FinalizeResult {
-        guard let database, let currentID = currentSnapshotID else {
-            return FinalizeResult(kind: .noSnapshot, added: 0, removed: 0, changed: 0)
-        }
-        let diff = diffAgainstParent() ?? (added: [], removed: [], changed: [])
-        let unchanged = diff.added.isEmpty && diff.removed.isEmpty && diff.changed.isEmpty
-        if unchanged && parentSnapshotID != nil {
-            // Identical to parent — discard the new snapshot row + items
-            // membership. The parent snapshot remains the latest.
-            discardCurrentSnapshot()
-            return FinalizeResult(kind: .discarded, added: 0, removed: 0, changed: 0)
-        }
-        do {
-            try database.completeSnapshot(id: currentID, at: completedAt)
-        } catch {
-            print("[ScanStore] completeSnapshot failed: \(error)")
-        }
-        lastScanCompleted = completedAt
-        cachedHistory = nil
-        return FinalizeResult(
-            kind: .kept,
-            added: diff.added.count,
-            removed: diff.removed.count,
-            changed: diff.changed.count
-        )
-    }
+    public func invalidateSnapshotHistory() { cachedHistory = nil }
 
-    public struct FinalizeResult: Sendable, Hashable {
-        public enum Kind: String, Sendable, Hashable {
-            case noSnapshot  // beginSnapshot was never called
-            case kept        // snapshot retained because something changed
-            case discarded   // identical to parent — row removed
-        }
-        public let kind: Kind
-        public let added: Int
-        public let removed: Int
-        public let changed: Int
-    }
+    // MARK: - Item upsert (called from the import pipeline)
 
     public func upsert(_ item: ScanItem) {
-        let written: ScanItem
-        if let existingID = itemsByPath[item.path], let existing = items[existingID] {
-            // Update path: tear down derived edges of the old item, then add
-            // back for the new one. The UUID stays — keeps UI selection stable.
-            // Outgoing targets aren't in the in-memory header, so query SQLite
-            // for the previous edges before we overwrite them.
-            let oldTargets = (try? database?.outgoingTargets(sourceID: existingID)) ?? []
-            removeIndexes(forID: existingID, header: existing, outgoingTargets: oldTargets)
-            let updated = item.withId(existingID)
-            let header = ItemHeader(from: updated)
-            items[existingID] = header
-            addIndexes(forID: existingID, header: header, relationships: updated.relationships)
-            written = updated
-        } else {
-            let header = ItemHeader(from: item)
-            items[item.id] = header
-            itemsByPath[item.path] = item.id
-            addIndexes(forID: item.id, header: header, relationships: item.relationships)
-            written = item
-        }
-        if let database {
-            do { try database.upsertItem(written) } catch {
-                print("[ScanStore] database.upsertItem failed: \(error)")
-            }
-        }
+        guard let database else { return }
+        do { try database.upsertItem(item) }
+        catch { print("[ScanStore] database.upsertItem failed: \(error)") }
+        headerCache.invalidate(item.id)
     }
 
-    /// Bulk insert from a scan. The throttled scanner calls this once per
-    /// batch (≈ every 250 ms), so we get one SwiftUI re-render per flush.
-    ///
-    /// Persists the batch in a single SQLite transaction. We collect the
-    /// post-merge items separately so the database always sees the same UUIDs
-    /// the in-memory store uses (path collisions reuse the existing id).
-    ///
-    /// Path-collision callers must also call `clearSymbolsForReingest(_:)`
-    /// for any UUID being overwritten — symbol rows are keyed by item_id,
-    /// and stale rows from the prior scan would otherwise accumulate.
+    /// Bulk ingest from the importer. Writes items to SQLite, records
+    /// snapshot membership, and bumps the cached counts so the sidebar's
+    /// per-category badges keep up during a live import.
     public func ingest(_ produced: [ScanItem]) {
-        // The production scan pipelines call `beginSnapshot()` explicitly
-        // before `ingest()` so the new snapshot's `system_info` is captured
-        // and the parent chain is set. Direct-API callers (tests, future
-        // tooling) might forget, so we lazily start a snapshot here — the
-        // alternative is silently dropping items on the floor when no
-        // snapshot is open.
-        if currentSnapshotID == nil, database != nil {
-            // Carry the pre-set `systemInfo` (if any) into the snapshot row
-            // so direct-API callers who do `store.systemInfo = ...` followed
-            // by `store.ingest(...)` get their sw_vers preserved across
-            // save/load. Production paths set systemInfo via their own
-            // beginSnapshot(systemInfo:) call before ingest is reached.
-            beginSnapshot(systemInfo: self.systemInfo)
+        guard let database, !produced.isEmpty else { return }
+        do { try database.upsertItems(produced) }
+        catch { print("[ScanStore] database.upsertItems failed: \(error)") }
+        if let snapshotID = importingSnapshotID {
+            let ids = produced.map(\.id)
+            do { try database.addItemsToSnapshot(snapshotID: snapshotID, itemIDs: ids) }
+            catch { print("[ScanStore] addItemsToSnapshot failed: \(error)") }
         }
-        // Apply to memory first, capturing the actually-stored rows so the
-        // database mirrors the same UUIDs.
-        var persisted: [ScanItem] = []
-        persisted.reserveCapacity(produced.count)
+        // Incrementally bump the cached counts so the sidebar reflects the
+        // import as it runs. Costs one increment per produced item — cheap
+        // compared to the SQL writes that just landed.
         for item in produced {
-            let stored: ScanItem
-            if let existingID = itemsByPath[item.path], let existing = items[existingID] {
-                let oldTargets = (try? database?.outgoingTargets(sourceID: existingID)) ?? []
-                removeIndexes(forID: existingID, header: existing, outgoingTargets: oldTargets)
-                let updated = item.withId(existingID)
-                let header = ItemHeader(from: updated)
-                items[existingID] = header
-                addIndexes(forID: existingID, header: header, relationships: updated.relationships)
-                stored = updated
-            } else {
-                let header = ItemHeader(from: item)
-                items[item.id] = header
-                itemsByPath[item.path] = item.id
-                addIndexes(forID: item.id, header: header, relationships: item.relationships)
-                stored = item
-            }
-            persisted.append(stored)
-        }
-        if let database {
-            do { try database.upsertItems(persisted) } catch {
-                print("[ScanStore] database.upsertItems failed: \(error)")
-            }
-            // Record membership in the active snapshot so the bundle
-            // history captures exactly which items belonged to this scan.
-            if let snapshotID = currentSnapshotID {
-                let ids = persisted.map(\.id)
-                do { try database.addItemsToSnapshot(snapshotID: snapshotID, itemIDs: ids) } catch {
-                    print("[ScanStore] addItemsToSnapshot failed: \(error)")
-                }
-            }
+            categoryCounts[item.category, default: 0] += 1
+            itemCount += 1
+            headerCache.invalidate(item.id)
         }
     }
 
-    /// Index update for a newly-added item. Takes the relationships separately
-    /// because the in-memory `ItemHeader` deliberately doesn't carry them — the
-    /// caller has the full `ScanItem` at upsert time and passes them through.
-    private func addIndexes(forID id: UUID, header: ItemHeader, relationships: [Relationship]) {
-        categoryCounts[header.category, default: 0] += 1
-        for rel in relationships {
-            pathReferencedBy[rel.targetPath, default: []].append(id)
-        }
-        if let owning = header.owningBundlePath {
-            itemsByOwningBundle[owning, default: []].append(id)
-        }
-    }
+    // MARK: - Analysis bookkeeping
 
-    /// Index teardown for an item being replaced. `outgoingTargets` comes
-    /// from SQLite via `Database.outgoingTargets(sourceID:)` since the
-    /// in-memory header doesn't carry them.
-    private func removeIndexes(forID id: UUID, header: ItemHeader, outgoingTargets: [String]) {
-        categoryCounts[header.category, default: 0] -= 1
-        for target in outgoingTargets {
-            pathReferencedBy[target]?.removeAll { $0 == id }
-            if pathReferencedBy[target]?.isEmpty == true {
-                pathReferencedBy.removeValue(forKey: target)
+    /// Apply an analyzer's output to a single item. Clears prior derived
+    /// rows, writes the refined payload, updates the cached counts so the
+    /// category badge moves immediately, and invalidates the header cache.
+    public func applyAnalysis(_ refined: ScanItem, symbols: [SymbolRow]) {
+        guard let database else { return }
+        // Adjust cached counts: subtract old category, add new (we look up
+        // the old header from cache or SQL).
+        if let old = headerCache.get(refined.id) ?? (try? database.itemHeader(id: refined.id)) {
+            if old.category != refined.category {
+                categoryCounts[old.category, default: 0] -= 1
+                categoryCounts[refined.category, default: 0] += 1
             }
         }
-        if let owning = header.owningBundlePath {
-            itemsByOwningBundle[owning]?.removeAll { $0 == id }
-            if itemsByOwningBundle[owning]?.isEmpty == true {
-                itemsByOwningBundle.removeValue(forKey: owning)
-            }
+        try? database.clearAnalysisOutputForItem(refined.id)
+        try? database.upsertItem(refined)
+        if !symbols.isEmpty {
+            try? database.insertSymbols(symbols)
         }
+        headerCache.invalidate(refined.id)
     }
 
-    // MARK: - Blob access
-
-    public func blob(forRef ref: String) -> Data? {
-        blobStore.data(forRef: ref)
-    }
-
-    // MARK: - Symbol persistence
-
-    /// Bulk-insert symbol rows produced by `SymbolInspector`. The worker
-    /// batches these alongside items so the cost is amortised across
-    /// hundreds of rows per transaction. Failures are logged and swallowed
-    /// — a missing batch of symbols shouldn't abort a scan.
     public func insertSymbols(_ rows: [SymbolRow]) {
         guard !rows.isEmpty, let database else { return }
-        do {
-            try database.insertSymbols(rows)
-        } catch {
-            print("[ScanStore] database.insertSymbols failed: \(error)")
-        }
+        do { try database.insertSymbols(rows) }
+        catch { print("[ScanStore] insertSymbols failed: \(error)") }
     }
 
-    /// On-demand fetch of all symbols for a single item, used by the
-    /// detail view. Capped at 5000 by Database; UI shows a "more" affordance
-    /// when truncated.
     public func symbols(forItem itemID: UUID) -> [SymbolRow] {
         guard let database else { return [] }
         return (try? database.symbols(forItem: itemID)) ?? []
@@ -511,161 +291,209 @@ public nonisolated final class ScanStore {
         return (try? database.symbolCount(forItem: itemID)) ?? 0
     }
 
-    /// Drop symbols for an item that's about to be reingested at the same
-    /// path with a fresh sha256. Called by the path-collision branch in the
-    /// scan sink before `insertSymbols` for the new content runs.
-    public func clearSymbolsForReingest(_ itemID: UUID) {
-        guard let database else { return }
-        do { try database.deleteSymbols(forItem: itemID) } catch {
-            print("[ScanStore] deleteSymbols failed: \(error)")
-        }
-    }
-
-    /// Global symbol FTS search. Used by the symbol search field once the
-    /// UI is wired up.
     public func searchSymbols(_ query: String, limit: Int = 500) -> [SymbolHit] {
         guard let database, !query.isEmpty else { return [] }
         return (try? database.searchSymbols(query: query, limit: limit)) ?? []
     }
 
-    // MARK: - Queries
+    // MARK: - Blob access
 
-    public func items(in category: ItemCategory) -> [ItemHeader] {
-        items.values.filter { $0.category == category }
-    }
+    public func blob(forRef ref: String) -> Data? { blobStore.data(forRef: ref) }
 
+    // MARK: - SQL-backed item access (the hot read path)
+
+    /// Header lookup by canonical path within the active snapshot. SQL-
+    /// backed via the `items_path_idx` index; used by the linked-libraries
+    /// resolver in the detail view.
     public func item(atPath path: String) -> ItemHeader? {
-        guard let id = itemsByPath[path] else { return nil }
-        return items[id]
+        itemHeader(atPath: path)
     }
 
-    /// Fetch the full `ScanItem` payload for `id` from SQLite. Synchronous
-    /// (Database holds an internal lock; reads are ~ms) — call from
-    /// `MainActor` only. Returns `nil` if no database is attached or the
-    /// row was deleted between header insert and this call.
-    ///
-    /// Detail views use this in a `.task(id:)` so the load happens as the
-    /// selection changes, not on every body re-render.
+    public func itemHeader(atPath path: String) -> ItemHeader? {
+        guard let database, let snapshotID = activeSnapshotID else { return nil }
+        guard let header = try? database.itemHeader(atPath: path, inSnapshot: snapshotID) else { return nil }
+        headerCache.set(header.id, header)
+        return header
+    }
+
+    /// Single-header lookup. Backed by SQL via the column-only fast path,
+    /// with a 5000-entry LRU cache so virtualized list scrolling doesn't
+    /// pay a roundtrip per visible row.
+    public func itemHeader(id: UUID) -> ItemHeader? {
+        if let cached = headerCache.get(id) { return cached }
+        guard let database else { return nil }
+        guard let header = try? database.itemHeader(id: id) else { return nil }
+        headerCache.set(id, header)
+        return header
+    }
+
+    /// Bulk fetch for callers that already know which IDs they need.
+    /// Drops anything already cached into the result and only SQL-fetches
+    /// the misses, then warms the cache with the new entries.
+    public func itemHeaders(forIDs ids: [UUID]) -> [UUID: ItemHeader] {
+        guard let database, !ids.isEmpty else { return [:] }
+        var out: [UUID: ItemHeader] = [:]
+        out.reserveCapacity(ids.count)
+        var misses: [UUID] = []
+        for id in ids {
+            if let cached = headerCache.get(id) {
+                out[id] = cached
+            } else {
+                misses.append(id)
+            }
+        }
+        if !misses.isEmpty,
+           let fetched = try? database.itemHeaders(forIDs: misses) {
+            for (id, h) in fetched {
+                out[id] = h
+                headerCache.set(id, h)
+            }
+        }
+        return out
+    }
+
     public func fullItem(id: UUID) -> ScanItem? {
         guard let database else { return nil }
         return try? database.item(id: id)
     }
 
-    /// Headers that reference this path via outgoing relationships.
-    /// O(1) lookup + O(K) materialization where K is the incoming degree.
-    public func incomingReferences(toPath path: String) -> [ItemHeader] {
-        guard let ids = pathReferencedBy[path] else { return [] }
-        return ids.compactMap { items[$0] }
-    }
+    // MARK: - SQL-backed list queries
 
-    /// Same as `incomingReferences(toPath:)` but materializes at most `limit`
-    /// items and returns the total count separately. The detail view only
-    /// renders the first 64; without this, viewing a popular dylib (libSystem,
-    /// CoreFoundation, …) allocated a header for every binary that linked it
-    /// just to slice it down to 64 rows.
-    public func incomingReferencesPrefix(toPath path: String, limit: Int) -> (total: Int, items: [ItemHeader]) {
-        guard let ids = pathReferencedBy[path] else { return (0, []) }
-        let prefix = ids.prefix(limit).compactMap { items[$0] }
-        return (ids.count, prefix)
-    }
-
-    /// Headers whose `owningBundlePath` is this path. O(1) + O(K).
+    /// Headers that own the given path as `owningBundlePath` in the active
+    /// snapshot. SQL-backed; bounded by an index. Replaces the in-memory
+    /// `itemsByOwningBundle` index (which alone consumed ~50 MB on a
+    /// /System snapshot).
     public func contents(ofBundleAtPath bundlePath: String) -> [ItemHeader] {
-        guard let ids = itemsByOwningBundle[bundlePath] else { return [] }
-        return ids.compactMap { items[$0] }
+        guard let database, let snapshotID = activeSnapshotID else { return [] }
+        return (try? database.headers(inBundleAtPath: bundlePath, inSnapshot: snapshotID)) ?? []
     }
 
-    /// Legacy plain-text search retained for the simple-search code path.
-    /// The richer `SearchQuery`-based filter lives in `Search/SearchQuery.swift`.
-    public func search(_ query: String, scope: ItemCategory? = nil) -> [ItemHeader] {
-        let q = query.lowercased()
-        guard !q.isEmpty else {
-            if let s = scope { return items(in: s) }
-            return Array(items.values)
-        }
-        return items.values.filter { header in
-            if let s = scope, header.category != s { return false }
-            if header.lowercasedName.contains(q) { return true }
-            if header.path.lowercased().contains(q) { return true }
-            if let context = header.context?.lowercased(), context.contains(q) { return true }
-            if header.tags.contains(where: { $0.lowercased().contains(q) }) { return true }
-            if let usage = header.usageLine?.lowercased(), usage.contains(q) { return true }
-            if let label = header.launchServiceLabel?.lowercased(), label.contains(q) { return true }
-            if let bundleId = header.bundleIdentifier?.lowercased(), bundleId.contains(q) { return true }
-            return false
-        }
+    /// Items that reference `path` via an outgoing relationship. Single
+    /// SQL query with limit + count. Replaces the in-memory
+    /// `pathReferencedBy` index — previously the worst memory offender
+    /// (470k items × ~10 relationships = several million entries).
+    public func incomingReferences(toPath path: String) -> [ItemHeader] {
+        guard let database, let snapshotID = activeSnapshotID else { return [] }
+        let result = (try? database.headersReferencing(path: path, inSnapshot: snapshotID, limit: 10_000))
+            ?? (total: 0, headers: [])
+        return result.headers
     }
 
-    /// Index-backed counts — drives sidebar without recomputation.
-    public func counts() -> [ItemCategory: Int] {
-        var counts: [ItemCategory: Int] = [:]
-        for category in ItemCategory.allCases {
-            counts[category] = categoryCounts[category] ?? 0
-        }
-        return counts
+    public func incomingReferencesPrefix(toPath path: String, limit: Int) -> (total: Int, items: [ItemHeader]) {
+        guard let database, let snapshotID = activeSnapshotID else { return (0, []) }
+        let result = (try? database.headersReferencing(path: path, inSnapshot: snapshotID, limit: limit))
+            ?? (total: 0, headers: [])
+        return (result.total, result.headers)
     }
 
-    // MARK: - Load
-
-    /// Replace the store's contents wholesale. Used when opening a document
-    /// (where rows come from `Database.allItems()` and the database is also
-    /// attached, so we suppress mirror-writes here) and historically by the
-    /// legacy JSON loader. Pass `mirrorToDatabase: true` to also seed an
-    /// attached database — useful when migrating a legacy JSON bundle on open.
-    public func load(
-        items: [ScanItem],
-        systemInfo: SystemInfo?,
-        options: ScanOptions?,
-        lastScanStarted: Date?,
-        lastScanCompleted: Date?,
-        mirrorToDatabase: Bool = false
+    /// Stream every header in the active snapshot, optionally filtered by
+    /// category. The list view uses this for its filter+sort pass without
+    /// ever materialising all headers in memory. `body` returns `false` to
+    /// stop the walk early.
+    public func forEachHeader(
+        category: ItemCategory? = nil,
+        _ body: (ItemHeader) -> Bool
     ) {
-        // Temporarily detach the database during the rebuild so we don't write
-        // every item back to a database we just read it from.
-        let attached = self.database
-        self.database = nil
-        reset()
-        for item in items {
-            // Build the slim header for in-memory storage, but feed indexes
-            // from the full ScanItem (we still have it locally) so we don't
-            // need a per-item SQLite query for relationships during load.
-            let header = ItemHeader(from: item)
-            self.items[item.id] = header
-            self.itemsByPath[item.path] = item.id
-            addIndexes(forID: item.id, header: header, relationships: item.relationships)
-        }
-        self.systemInfo = systemInfo
-        if let options { self.options = options }
-        self.lastScanStarted = lastScanStarted
-        self.lastScanCompleted = lastScanCompleted
-        self.database = attached
-
-        if mirrorToDatabase, let attached {
-            do {
-                try attached.upsertItems(items)
-                if let systemInfo {
-                    try attached.setMeta("system_info", value: systemInfo)
-                }
-                if let options {
-                    try attached.setMeta("options", value: options)
-                }
-                if let lastScanStarted {
-                    try attached.setMeta("last_scan_started", value: lastScanStarted)
-                }
-                if let lastScanCompleted {
-                    try attached.setMeta("last_scan_completed", value: lastScanCompleted)
-                }
-            } catch {
-                print("[ScanStore] mirrorToDatabase failed: \(error)")
-            }
+        guard let database, let snapshotID = activeSnapshotID else { return }
+        do {
+            try database.forEachHeader(inSnapshot: snapshotID, category: category, body: body)
+        } catch {
+            print("[ScanStore] forEachHeader failed: \(error)")
         }
     }
+
+    /// Stream all headers in active snapshot, no filter.
+    public func forEachHeader(_ body: (ItemHeader) -> Bool) {
+        forEachHeader(category: nil, body)
+    }
+
+    // MARK: - Counts façade
+
+    public func counts() -> [ItemCategory: Int] { categoryCounts }
 }
 
-nonisolated private extension ScanItem {
-    func withId(_ newId: UUID) -> ScanItem {
-        var copy = self
-        copy.id = newId
-        return copy
+// MARK: - Header LRU cache
+
+/// Tiny LRU cache keyed by `UUID`. Backed by a doubly-linked list inside a
+/// dictionary keyed on UUID — O(1) hit/miss/insert. Synchronised via an
+/// `os_unfair_lock` so concurrent reads from background tasks are safe.
+private final class HeaderCache: @unchecked Sendable {
+    private struct Node {
+        var prev: UUID?
+        var next: UUID?
+        var value: ItemHeader
+    }
+    private var map: [UUID: Node] = [:]
+    private var head: UUID?  // most recently used
+    private var tail: UUID?  // least recently used
+    private let capacity: Int
+    private var lock = os_unfair_lock_s()
+
+    init(capacity: Int) {
+        self.capacity = capacity
+        self.map.reserveCapacity(capacity + 16)
+    }
+
+    func get(_ id: UUID) -> ItemHeader? {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        guard let node = map[id] else { return nil }
+        moveToFrontLocked(id, node: node)
+        return node.value
+    }
+
+    func set(_ id: UUID, _ value: ItemHeader) {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        if var existing = map[id] {
+            existing.value = value
+            map[id] = existing
+            moveToFrontLocked(id, node: existing)
+            return
+        }
+        map[id] = Node(prev: nil, next: head, value: value)
+        if let oldHead = head { map[oldHead]?.prev = id }
+        head = id
+        if tail == nil { tail = id }
+        if map.count > capacity { evictTailLocked() }
+    }
+
+    func invalidate(_ id: UUID) {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        removeLocked(id)
+    }
+
+    func clear() {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        map.removeAll(keepingCapacity: true)
+        head = nil
+        tail = nil
+    }
+
+    private func moveToFrontLocked(_ id: UUID, node: Node) {
+        guard head != id else { return }
+        // Unlink
+        if let prev = node.prev { map[prev]?.next = node.next }
+        if let next = node.next { map[next]?.prev = node.prev }
+        if tail == id { tail = node.prev }
+        // Insert at head
+        var updated = node
+        updated.prev = nil
+        updated.next = head
+        map[id] = updated
+        if let oldHead = head { map[oldHead]?.prev = id }
+        head = id
+        if tail == nil { tail = id }
+    }
+
+    private func removeLocked(_ id: UUID) {
+        guard let node = map.removeValue(forKey: id) else { return }
+        if let prev = node.prev { map[prev]?.next = node.next }
+        if let next = node.next { map[next]?.prev = node.prev }
+        if head == id { head = node.next }
+        if tail == id { tail = node.prev }
+    }
+
+    private func evictTailLocked() {
+        guard let id = tail else { return }
+        removeLocked(id)
     }
 }

@@ -20,7 +20,9 @@ public nonisolated struct ScanProgress: Sendable, Equatable {
     public enum Phase: String, Sendable, Equatable {
         case idle
         case enumerating
-        case inspecting
+        case importing
+        case analyzing
+        case inspecting  // legacy alias for analyzing
         case writing
         case done
         case failed

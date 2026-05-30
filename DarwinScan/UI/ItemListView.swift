@@ -12,12 +12,10 @@ struct ItemListView: View {
     @State private var showHelp: Bool = false
 
     /// Cached filter+sort result, stored as IDs only. Recomputed by `.task`
-    /// when `ListInputs` changes — *not* on row clicks. We deliberately keep
-    /// only `[UUID]` here (16 B/item) rather than `[ScanItem]` (~1 KB/item):
-    /// the actual item is fetched from `store.items` at row-render time, so
-    /// we never carry a second full copy of the manifest in memory. On a
-    /// /System "All Items" scan that's the difference between ~100 MB and
-    /// ~2 MB for this view's state.
+    /// when `ListInputs` changes — *not* on row clicks. The store never
+    /// keeps all headers in memory; per-row hydration goes via
+    /// `store.itemHeader(id:)` which is SQL-backed + LRU-cached, so the
+    /// only persistent state for the list is this `[UUID]`.
     @State private var filteredItemIDs: [UUID] = []
     @State private var displayedFilters: [SearchQuery.Filter] = []
     @State private var isRecomputing: Bool = false
@@ -45,14 +43,16 @@ struct ItemListView: View {
                     if !displayedFilters.isEmpty {
                         FilterChipsBar(filters: displayedFilters)
                     }
-                    List(filteredItemIDs, id: \.self, selection: $itemSelection) { id in
-                        if let header = store.items[id] {
-                            NavigationLink(value: id) {
-                                ItemRow(header: header)
-                            }
-                        }
-                    }
-                    .listStyle(.inset)
+                    // NSTableView-backed: only the visible rows are
+                    // realised regardless of `filteredItemIDs.count`. The
+                    // SwiftUI `List(...)` initialiser allocates an
+                    // AttributeGraph node per id and exhausts the graph's
+                    // data space well before 470k items.
+                    ItemTableView(
+                        ids: filteredItemIDs,
+                        selection: $itemSelection,
+                        store: store
+                    )
                 }
                 .searchable(text: $rawSearchText, prompt: searchPrompt)
             }
@@ -61,7 +61,7 @@ struct ItemListView: View {
         .navigationSubtitle(subtitle)
         .task(id: ListInputs(searchText: rawSearchText,
                              selection: selection,
-                             itemCount: store.items.count)) {
+                             itemCount: store.itemCount)) {
             await recompute()
         }
         .toolbar {
@@ -105,16 +105,20 @@ struct ItemListView: View {
         return n == 1 ? "1 match" : "\(n) matches"
     }
 
-    /// Chunked: snapshot just the IDs (16 B/item), then project in 4 K-item
-    /// chunks with `Task.yield()` between them so the UI stays responsive
-    /// even on a /System "All Items" walk. The dict-key snapshot also makes
-    /// the projection robust to scan batches mutating `store.items` during
-    /// our yields — we look items up by id at use time rather than holding
-    /// a live dictionary iterator across suspension points.
+    /// Stream headers out of SQLite (already ORDER BY name COLLATE NOCASE
+    /// via an index), apply the search filter in memory, and keep only
+    /// the matching IDs. No full-snapshot header set is ever materialised
+    /// — peak memory is bounded by the result size plus one in-flight
+    /// header at a time.
     ///
-    /// Memory profile: the only second copy in flight is `[UUID]` (~16 B/item)
-    /// plus the keyed tuple array (~64 B/item) being built. No full
-    /// `[ScanItem]` snapshot is ever materialised.
+    /// Memory profile, /System scan (~470k items):
+    /// - filteredItemIDs: ≤ N_matches × 16 B (≤ 7.5 MB for All Items).
+    /// - in-flight header during walk: ~250 B.
+    ///
+    /// Previously the equivalent path snapshotted every header into a
+    /// `[(UUID, String, String)]` tuple array and sorted that on a
+    /// detached task — ~140 MB for a /System scan, before the heap
+    /// counted the in-memory items dict itself.
     private func recompute() async {
         if case .systemInfo = selection {
             filteredItemIDs = []
@@ -123,46 +127,24 @@ struct ItemListView: View {
         }
         let query = SearchQuery.parse(rawSearchText)
         let scopeFilter = scope
-
-        // Resolve FTS-backed filters (`symbol:` / `strings:`) into a Set of
-        // allowed item IDs before the per-header filter pass runs. This
-        // does the SQLite work once per query change instead of N times
-        // per row.
         let allowedFTS: Set<UUID>? = query.resolveFTSItemIDs(against: store)
 
-        let ids = Array(store.items.keys)
-        let estimated = scopeFilter.map { store.categoryCounts[$0] ?? 0 } ?? ids.count
-        var keyed: [(UUID, String, String)] = []
-        keyed.reserveCapacity(estimated)
-
-        let chunkSize = 4096
-        var i = 0
-        while i < ids.count {
-            if Task.isCancelled { return }
-            let end = min(i + chunkSize, ids.count)
-            for j in i..<end {
-                guard let header = store.items[ids[j]] else { continue }
-                if let s = scopeFilter, header.category != s { continue }
-                if let allowed = allowedFTS, !allowed.contains(header.id) { continue }
-                if !query.isEmpty && !query.matches(header) { continue }
-                // `lowercasedName` was pre-computed at header-build time, so
-                // we don't pay a `String.lowercased()` allocation here.
-                keyed.append((header.id, header.lowercasedName, header.path))
+        let isCancelled = { Task.isCancelled }
+        let store = self.store
+        // SQL ORDER BY name keeps us out of the sort step entirely for
+        // the common case. The detached task isolates the streaming +
+        // filter from MainActor; only the final `[UUID]` crosses back.
+        let result: [UUID] = await Task.detached(priority: .userInitiated) {
+            var ids: [UUID] = []
+            ids.reserveCapacity(scopeFilter.map { store.categoryCounts[$0] ?? 0 } ?? min(store.itemCount, 65_536))
+            store.forEachHeader(category: scopeFilter) { header in
+                if isCancelled() { return false }
+                if let allowed = allowedFTS, !allowed.contains(header.id) { return true }
+                if !query.isEmpty && !query.matches(header) { return true }
+                ids.append(header.id)
+                return true
             }
-            i = end
-            if i < ids.count { await Task.yield() }
-        }
-
-        if Task.isCancelled { return }
-        isRecomputing = true
-        let toSort = keyed
-        let result = await Task.detached(priority: .userInitiated) { () -> [UUID] in
-            var local = toSort
-            local.sort { lhs, rhs in
-                if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
-                return lhs.2 < rhs.2
-            }
-            return local.map { $0.0 }
+            return ids
         }.value
         if Task.isCancelled { return }
         filteredItemIDs = result
@@ -370,7 +352,7 @@ struct SnapshotDetailView: View {
             if let record {
                 snapshotCard(record: record, parent: parent)
                 if let info = record.systemInfo {
-                    osCard(info: info)
+                    osCard(info: info, sourceKind: record.sourceKind)
                 }
                 if let parent {
                     diffCard(current: record, parent: parent)
@@ -388,23 +370,36 @@ struct SnapshotDetailView: View {
     }
 
     private func snapshotCard(record: SnapshotRecord, parent: SnapshotRecord?) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        // Title: "IPSW · UniversalMac_…" for IPSW snapshots, else "Image #N".
+        // The friendly label produced by the source provider lives on
+        // `record.label`; fall back to a generic "Image #N" so the column
+        // never reads "Snapshot #1" for a real IPSW.
+        let title: String = record.label ?? "Image #\(record.id)"
+        return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 12).fill(.tint.opacity(0.15))
-                    Image(systemName: "clock.arrow.circlepath")
+                    Image(systemName: record.sourceKind.systemImageName)
                         .font(.system(size: 28))
                         .foregroundStyle(.tint)
                 }
                 .frame(width: 56, height: 56)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Snapshot #\(record.id)").font(.title2).bold()
-                    Text(record.startedAt, format: .dateTime)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    if record.completedAt == nil {
+                    Text(title).font(.title2).bold().lineLimit(2)
+                    HStack(spacing: 6) {
+                        Text(record.sourceKind.displayName)
+                            .font(.caption)
+                            .foregroundStyle(.tint)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(.tint.opacity(0.12)))
+                        Text(record.startedAt, format: .dateTime)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    if record.importCompletedAt == nil {
                         Text("In progress").font(.caption).foregroundStyle(.orange)
-                    } else if let completed = record.completedAt {
+                    } else if let completed = record.importCompletedAt {
                         Text("Completed \(completed, format: .dateTime)")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
@@ -434,33 +429,66 @@ struct SnapshotDetailView: View {
         )
     }
 
-    private func osCard(info: SystemInfo) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "macpro.gen3").foregroundStyle(.tint)
-                Text("System").font(.headline)
-                Spacer()
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                if let p = info.productName, let v = info.productVersion {
-                    LabeledContent("OS", value: "\(p) \(v)")
+    @ViewBuilder
+    private func osCard(info: SystemInfo, sourceKind: SnapshotSourceKind) -> some View {
+        switch sourceKind {
+        case .currentSystem:
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "macpro.gen3").foregroundStyle(.tint)
+                    Text("System").font(.headline)
+                    Spacer()
                 }
-                if let b = info.productBuildVersion { LabeledContent("Build", value: b) }
-                if let h = info.hardwareModel { LabeledContent("Model", value: h) }
-                if let cpu = info.cpuBrand { LabeledContent("CPU", value: cpu) }
-                if !info.architectures.isEmpty {
-                    LabeledContent("Arch", value: info.architectures.joined(separator: ", "))
+                VStack(alignment: .leading, spacing: 4) {
+                    if let p = info.productName, let v = info.productVersion {
+                        LabeledContent("OS", value: "\(p) \(v)")
+                    }
+                    if let b = info.productBuildVersion { LabeledContent("Build", value: b) }
+                    if let h = info.hardwareModel { LabeledContent("Model", value: h) }
+                    if let cpu = info.cpuBrand { LabeledContent("CPU", value: cpu) }
+                    if !info.architectures.isEmpty {
+                        LabeledContent("Arch", value: info.architectures.joined(separator: ", "))
+                    }
+                    if let sip = info.sipStatus { LabeledContent("SIP", value: sip) }
                 }
-                if let sip = info.sipStatus { LabeledContent("SIP", value: sip) }
+                .font(.callout)
             }
-            .font(.callout)
+            .padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(nsColor: .windowBackgroundColor))
+                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
+            )
+        case .ipsw:
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "shippingbox").foregroundStyle(.tint)
+                    Text("Build Info").font(.headline)
+                    Spacer()
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    if let v = info.productVersion {
+                        LabeledContent("macOS", value: v)
+                    }
+                    if let b = info.productBuildVersion { LabeledContent("Build", value: b) }
+                    if let train = info.buildTrain { LabeledContent("Train", value: train) }
+                    if !info.architectures.isEmpty {
+                        LabeledContent("Arch", value: info.architectures.joined(separator: ", "))
+                    }
+                }
+                .font(.callout)
+                if let devices = info.supportedProductTypes, !devices.isEmpty {
+                    Divider().padding(.vertical, 2)
+                    SupportedDevicesView(devices: devices)
+                }
+            }
+            .padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(nsColor: .windowBackgroundColor))
+                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
+            )
         }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(nsColor: .windowBackgroundColor))
-                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
-        )
     }
 
     private func diffCard(current: SnapshotRecord, parent: SnapshotRecord) -> some View {
@@ -515,5 +543,100 @@ struct SnapshotDetailView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 8).fill(color.opacity(0.08)))
+    }
+}
+
+/// Compact "Supported Devices" list with a show-all toggle so the IPSW
+/// build-info card doesn't blow up vertically for a Universal Mac release
+/// (those list 50+ identifiers).
+private struct SupportedDevicesView: View {
+    let devices: [String]
+    @State private var expanded: Bool = false
+
+    private var visibleCount: Int { expanded ? devices.count : min(devices.count, 6) }
+    private var visible: [String] { Array(devices.prefix(visibleCount)) }
+    private var hiddenCount: Int { max(0, devices.count - visibleCount) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "macbook.and.iphone").foregroundStyle(.secondary).imageScale(.small)
+                Text("Supported Devices").font(.callout).bold()
+                Spacer()
+                Text("\(devices.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            FlowLayout(spacing: 6, runSpacing: 4) {
+                ForEach(visible, id: \.self) { device in
+                    Text(device)
+                        .font(.caption.monospaced())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.secondary.opacity(0.12)))
+                }
+                if hiddenCount > 0 {
+                    Button {
+                        expanded = true
+                    } label: {
+                        Text("+\(hiddenCount) more")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                } else if expanded && devices.count > 6 {
+                    Button {
+                        expanded = false
+                    } label: {
+                        Text("show fewer")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+        }
+    }
+}
+
+/// Minimal flow layout (chips wrap to the next row). Used by
+/// `SupportedDevicesView` so the model-identifier chips pack densely.
+private struct FlowLayout: Layout {
+    let spacing: CGFloat
+    let runSpacing: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var maxX: CGFloat = 0
+        for s in subviews {
+            let size = s.sizeThatFits(.unspecified)
+            if x + size.width > maxWidth, x > 0 {
+                x = 0
+                y += rowHeight + runSpacing
+                rowHeight = 0
+            }
+            x += size.width + spacing
+            maxX = max(maxX, x - spacing)
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: maxX, height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+        for s in subviews {
+            let size = s.sizeThatFits(.unspecified)
+            if x + size.width > bounds.maxX, x > bounds.minX {
+                x = bounds.minX
+                y += rowHeight + runSpacing
+                rowHeight = 0
+            }
+            s.place(at: CGPoint(x: x, y: y), proposal: .unspecified)
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
     }
 }
