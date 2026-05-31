@@ -68,7 +68,6 @@ public nonisolated struct AnalysisPipeline: Sendable {
         // compute them without per-item context.
         item.insideBundle = isInsideBundle(item.path)
         item.owningBundlePath = owningBundle(item.path)
-        let path = item.path
         let filename = item.name
         let ext = (filename as NSString).pathExtension.lowercased()
         // Materialise a URL the legacy inspectors can read. Prefer the

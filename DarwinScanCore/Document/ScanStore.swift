@@ -417,7 +417,9 @@ public nonisolated final class ScanStore {
 /// Tiny LRU cache keyed by `UUID`. Backed by a doubly-linked list inside a
 /// dictionary keyed on UUID — O(1) hit/miss/insert. Synchronised via an
 /// `os_unfair_lock` so concurrent reads from background tasks are safe.
-private final class HeaderCache: @unchecked Sendable {
+/// Explicitly `nonisolated` (overriding the project default of MainActor) so
+/// the nonisolated `ScanStore` can mutate it from any thread it lives on.
+private nonisolated final class HeaderCache: @unchecked Sendable {
     private struct Node {
         var prev: UUID?
         var next: UUID?

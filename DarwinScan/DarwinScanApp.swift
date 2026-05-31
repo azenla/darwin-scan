@@ -198,11 +198,7 @@ final class SessionRegistry {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = fallbackTitle
-        if let described = (error as? CustomStringConvertible)?.description {
-            alert.informativeText = described
-        } else {
-            alert.informativeText = error.localizedDescription
-        }
+        alert.informativeText = (error as CustomStringConvertible).description
         alert.runModal()
     }
 }
@@ -223,7 +219,7 @@ struct FailedToOpenView: View {
                 .font(.title3)
                 .bold()
             if let error {
-                Text((error as? CustomStringConvertible)?.description ?? error.localizedDescription)
+                Text((error as CustomStringConvertible).description)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)

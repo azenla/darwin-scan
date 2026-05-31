@@ -31,7 +31,7 @@ import Observation
 /// writer to `refs` itself. Concurrent writes from inspector tasks land in
 /// distinct content-addressed paths and are safe on APFS.
 @Observable
-public nonisolated final class BlobStore {
+public nonisolated final class BlobStore: @unchecked Sendable {
     /// Every ref we know about. The bytes live at `blobURL(forRef:)`.
     public private(set) var refs: Set<String> = []
 

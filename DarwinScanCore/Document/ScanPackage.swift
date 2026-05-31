@@ -106,14 +106,14 @@ public enum ScanPackage {
     }
 
     /// Populate the in-memory view from the latest snapshot. Heavy for big
-    /// bundles (~ms per thousand headers) — callers should run this off
-    /// MainActor and stamp a loading flag in their UI until it returns.
-    /// Safe to call multiple times; idempotent.
-    public static func populateActiveSnapshot(store: ScanStore) throws {
+    /// bundles (~ms per thousand headers) — `nonisolated` because callers
+    /// (`ScanSession.populateInitialView`) drive it through `Task.detached`
+    /// to keep MainActor responsive. Safe to call multiple times; idempotent.
+    public nonisolated static func populateActiveSnapshot(store: ScanStore) throws {
         try populateInMemoryView(store: store)
     }
 
-    private static func populateInMemoryView(store: ScanStore) throws {
+    private nonisolated static func populateInMemoryView(store: ScanStore) throws {
         guard let db = store.database else { return }
         // SQL-first: we don't load any item headers up front. Only the
         // active snapshot id, system info, options, and per-category

@@ -203,7 +203,7 @@ struct ContentView: View {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Couldn't start import"
-        alert.informativeText = (error as? CustomStringConvertible)?.description ?? error.localizedDescription
+        alert.informativeText = (error as CustomStringConvertible).description
         alert.runModal()
     }
 }

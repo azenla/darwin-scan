@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import DarwinScanCore
 
 /// Bottom toolbar shown while a scan is running.
@@ -228,7 +229,9 @@ struct NewSnapshotSheet: View {
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        panel.allowedFileTypes = ["ipsw"]
+        if let ipsw = UTType(filenameExtension: "ipsw") {
+            panel.allowedContentTypes = [ipsw]
+        }
         if panel.runModal() == .OK, let url = panel.url {
             ipswURL = url
         }
