@@ -208,7 +208,10 @@ public nonisolated enum DyldCacheInspector {
             imagesOffset = imagesOffsetOld
             imagesCount = imagesCountOld
         }
-        guard imagesCount > 0, imagesOffset > 0 else { return [] }
+        // `imagesCount` comes straight from the cache header. A real cache
+        // has a few thousand images; reject absurd values before they size a
+        // multi-GB `read(upToCount:)` and a matching `reserveCapacity`.
+        guard imagesCount > 0, imagesCount <= 1_000_000, imagesOffset > 0 else { return [] }
 
         // Read the entire image array in one shot. Each entry is 32 bytes
         // (`dyld_cache_image_info`). 4096 images × 32 = 128 KB, fits

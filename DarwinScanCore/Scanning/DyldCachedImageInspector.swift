@@ -79,8 +79,14 @@ public nonisolated enum DyldCachedImageInspector {
             guard nameOffset > 0 else { return nil }
             guard let loc = layout.locate(vmAddress: linkeditVMAddress) else { return nil }
             guard let data = ensureMapped(url: loc.url) else { return nil }
-            let absoluteOffset = Int(stroff) + nameOffset
-            guard absoluteOffset > 0, absoluteOffset < data.count else { return nil }
+            // `stroff` is taken verbatim from the image's LC_SYMTAB and is
+            // therefore attacker-controlled in a malformed cache. Compute the
+            // absolute offset with overflow-checked UInt64 math — `Int(stroff)`
+            // would trap for stroff > Int.max, and `Int + Int` traps on
+            // overflow *before* any range guard could reject it.
+            let (sum, overflowed) = stroff.addingReportingOverflow(UInt64(nameOffset))
+            guard !overflowed, sum < UInt64(data.count) else { return nil }
+            let absoluteOffset = Int(sum)
             let base = data.startIndex.advanced(by: absoluteOffset)
             var end = base
             let dataEnd = data.endIndex

@@ -164,9 +164,17 @@ public nonisolated struct MachOInspector: Sendable {
         let isBig = (magic == FAT_CIGAM || magic == FAT_CIGAM_64)
         let is64  = (magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64)
         guard leadingBytes.count >= 8 else { return nil }
-        let nfat = leadingBytes.readUInt32(at: 4, bigEndian: isBig)
+        // `nfat_arch` is attacker-controlled (a UInt32 read straight from the
+        // file). Left unclamped it drives both a `read(upToCount:)` sized at
+        // `Int(nfat) * entrySize` (up to ~137 GB) and a `0..<Int(nfat)` loop
+        // that appends an arch per iteration — billions of iterations and an
+        // unbounded allocation on a crafted binary. Real universal binaries
+        // ship a handful of slices; cap well above any plausible value.
+        let nfatRaw = leadingBytes.readUInt32(at: 4, bigEndian: isBig)
+        guard nfatRaw > 0 else { return nil }
+        let nfat = min(Int(nfatRaw), 64)
         let entrySize = is64 ? 32 : 20
-        let needed = 8 + Int(nfat) * entrySize
+        let needed = 8 + nfat * entrySize
         let header: Data
         if leadingBytes.count >= needed {
             header = leadingBytes
@@ -179,8 +187,9 @@ public nonisolated struct MachOInspector: Sendable {
             } catch { return nil }
         }
         var archs: [CPUArch] = []
+        archs.reserveCapacity(nfat)
         var firstSliceOffset: UInt64 = 0
-        for i in 0..<Int(nfat) {
+        for i in 0..<nfat {
             let base = 8 + i * entrySize
             let cputype     = header.readUInt32(at: base + 0, bigEndian: isBig)
             let cpusubtype  = header.readUInt32(at: base + 4, bigEndian: isBig)
