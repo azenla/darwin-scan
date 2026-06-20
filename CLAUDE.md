@@ -176,18 +176,40 @@ User-state paths (`/Users`, `/Applications`, `/Library`, `/Volumes`,
 ## Concurrency
 
 - `ScanController` is `@Observable @MainActor`.
-- `ScanStore`, `BlobStore`, `Database`, every model and inspector are
-  `nonisolated`.
-- `Database` is `@unchecked Sendable` with an internal `os_unfair_lock`.
+- `ScanStore`, `BlobStore`, `Database`, `SQLiteConnection`, every model
+  and inspector are `nonisolated`.
+- **`Database` is a connection pool, not a single locked handle.** One
+  **writer** connection (all mutations, serialized by `writeLock`) plus a
+  **pool of read-only connections** leased per query (`withReader` /
+  `withWriter`). In WAL mode SQLite runs one writer concurrent with many
+  readers, so UI reads (header listing, scroll lookups, FTS search) run in
+  parallel with each other *and* with background analysis — nothing
+  serializes behind one global mutex. Each `SQLiteConnection` is
+  single-threaded-at-a-time (writer behind the lock; each reader leased to
+  one caller), so its prepared-statement cache + JSON coders need no extra
+  synchronization.
+- **Analysis is parallel.** `AnalysisWorker.run` drives a bounded
+  `TaskGroup` (`maxConcurrent ≈ cores − 1`): per-item read + inspect runs
+  across cores on reader connections; writes serialize on the writer.
+  Progress aggregation stays on the actor. `analyzeOne` is a `nonisolated
+  static` so it runs off the actor/MainActor.
+- Shared mutable state the parallel analyzer touches is locked:
+  `BlobStore.refs` (`os_unfair_lock`) and
+  `DyldCachedImageInspector.SharedStringTable.mapped` (`NSLock`). Both were
+  `@unchecked Sendable` with unsynchronized mutation before — fix any new
+  shared state the same way before reading/writing it from worker tasks.
 - Worker pipelines run on `actor`s; results cross back via
   `@Sendable @MainActor` sinks.
 - FTS5 strings writes are issued directly from the worker, bypassing
   the main actor — tokenising a 10 MB dump on MainActor would stall the
   UI.
+- UI detail rows that need a DB lookup (linked libraries, "referenced by")
+  resolve in `.task` with `@State`, never synchronously in `body`.
 
 If you see a "main actor-isolated X in a synchronous nonisolated
 context" warning, the fix is almost always `nonisolated` on the
-declaration.
+declaration (this is why `SQLiteConnection` is `nonisolated` — its readers
+run on background threads).
 
 ## Inspectors (analysis phase)
 
@@ -232,8 +254,9 @@ to re-run analysis.
 
 1. Add the field to the relevant `Info` struct (rides in `payload`
    automatically).
-2. Promote to a real column: add to the `items` DDL in `runDDL()` and
-   to the bind list in `upsertItemLocked`.
+2. Promote to a real column: add to the `items` DDL in `Database.ddlCore`
+   and to the bind list in `upsertItemLocked` (and the `upsertItemSQL`
+   column/placeholder list).
 3. Decide if it needs an index — anything on the LHS of a hot `WHERE`
    probably does.
 4. Bump `Database.currentSchemaVersion` and
@@ -242,6 +265,13 @@ to re-run analysis.
 
 ## Known follow-ups
 
+- **Parallelize the dyld inner image loop.** The per-item analysis loop is
+  parallel, but a single dyld_shared_cache item still extracts its ~3000
+  images serially inside one task (it's one long-running task among many).
+  `SharedStringTable` is now thread-safe and the per-symbol path no longer
+  touches its shared dict, so the inner loop can be parallelized — mind
+  oversubscription against the outer `TaskGroup` (don't nest unbounded
+  parallelism).
 - **AEA decryption with FCS keys.** `IPSWSource` tries `aea decrypt`
   with no key (works for unencrypted payloads). Modern Apple Silicon
   IPSWs ship AEA payloads whose keys live on Apple's signing servers.
@@ -298,7 +328,16 @@ Conventions:
 - **Bundle = live working copy.** No session cache dir, no save-time
   copy. Writes land in the bundle directory as the scanner produces
   them; Save is a WAL checkpoint.
+- **Connection pool over one locked handle.** `Database` keeps SQLite as
+  the engine (FTS5, relational joins, ACID, single-file portability all
+  fit) but stopped funnelling every call through one `os_unfair_lock`-ed
+  connection. One writer + a WAL reader pool is what lets the UI stay
+  responsive during analysis. Engine swap (DuckDB / Tantivy) was
+  considered and rejected for now — see the git history of this file.
+- **Single-pass import.** Files are hashed *while* being captured into the
+  blob store (`BlobWriter.captureHashing`), not read twice.
 - **Sendable / actor isolation gotcha.** `SWIFT_DEFAULT_ACTOR_ISOLATION
   = MainActor` makes every model type implicitly `@MainActor` — that
   blocks the nonisolated `Database` from using their `Codable`
-  conformances. Every model is therefore explicitly `nonisolated`.
+  conformances. Every model (and `SQLiteConnection`) is therefore
+  explicitly `nonisolated`.
