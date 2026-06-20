@@ -21,6 +21,21 @@ public nonisolated struct AnalysisOutput: Sendable {
     }
 }
 
+/// Thread-safe accumulator for parallel dyld-cache image extraction. Each
+/// image is independent, so workers append their results under a lock rather
+/// than threading per-index buffers through the `concurrentPerform` closure.
+nonisolated final class DyldImageCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var items: [ScanItem] = []
+    private(set) var symbols: [SymbolRow] = []
+    func reserve(_ n: Int) { items.reserveCapacity(n) }
+    func add(item: ScanItem, symbols syms: [SymbolRow]) {
+        lock.lock(); defer { lock.unlock() }
+        items.append(item)
+        if !syms.isEmpty { symbols.append(contentsOf: syms) }
+    }
+}
+
 /// Stateless inspector dispatcher run during the **analysis** phase. Reads
 /// bytes from the blob store (preferred — the bundle is the source of truth)
 /// and falls back to the live filesystem only when an item has no
@@ -189,26 +204,41 @@ public nonisolated struct AnalysisPipeline: Sendable {
                 let cacheArch = info.architecture ?? "?"
                 let layout = options.extractSymbols ? DyldCacheLayout.load(mainCacheURL: url) : nil
                 let strtab = layout.map { DyldCachedImageInspector.SharedStringTable(layout: $0) }
-                additionalItems.reserveCapacity(images.count)
-                for image in images {
-                    let virtual = buildVirtualImageItem(image: image, cachePath: path, cacheName: filename, cacheArch: cacheArch)
-                    additionalItems.append(virtual)
+
+                // Extract every image in parallel — this is the single most
+                // expensive analysis step (a /System cache has ~3000 images).
+                // Each image is independent; SharedStringTable is thread-safe
+                // (its mmap dict is locked and resolved once per image), and
+                // `database.indexStrings` serializes on the writer. Results
+                // merge into the collector under its lock.
+                let collector = DyldImageCollector()
+                collector.reserve(images.count)
+                let imageArr = images
+                let pipeline = self
+                let db = database
+                let extractStrings = options.extractStrings
+                let minLen = options.stringsMinLength
+                DispatchQueue.concurrentPerform(iterations: imageArr.count) { i in
+                    let image = imageArr[i]
+                    let virtual = pipeline.buildVirtualImageItem(image: image, cachePath: path, cacheName: filename, cacheArch: cacheArch)
+                    var syms: [SymbolRow] = []
                     if let layout, let strtab,
                        let result = DyldCachedImageInspector.extract(
-                           layout: layout,
-                           sharedStrtab: strtab,
-                           imageAddress: image.address,
-                           itemID: virtual.id
+                           layout: layout, sharedStrtab: strtab,
+                           imageAddress: image.address, itemID: virtual.id
                        ) {
-                        additionalSymbols.append(contentsOf: result.symbols)
-                        if options.extractStrings, let cstr = result.cstringBytes, let database {
-                            let text = DyldCachedImageInspector.cstringTokensText(cstr, minLength: options.stringsMinLength)
+                        syms = result.symbols
+                        if extractStrings, let cstr = result.cstringBytes, let db {
+                            let text = DyldCachedImageInspector.cstringTokensText(cstr, minLength: minLen)
                             if !text.isEmpty {
-                                try? database.indexStrings(itemID: virtual.id, itemPath: virtual.path, content: text)
+                                try? db.indexStrings(itemID: virtual.id, itemPath: virtual.path, content: text)
                             }
                         }
                     }
+                    collector.add(item: virtual, symbols: syms)
                 }
+                additionalItems = collector.items
+                additionalSymbols = collector.symbols
             }
             return AnalysisOutput(item: stampDone(refined), additionalItems: additionalItems, additionalSymbols: additionalSymbols)
         }
@@ -620,84 +650,85 @@ public actor AnalysisWorker {
         var lastEmit = Date()
         let emitInterval: TimeInterval = 0.15
 
-        // Analyze items concurrently. The CPU/IO-heavy part — reading the
-        // item, parsing Mach-O, extracting symbols/strings — runs across
-        // `maxConcurrent` tasks on pooled reader connections; the writes
-        // (`applyAnalysis`) serialize internally on the single writer. Progress
-        // aggregation stays here on the actor, so no shared mutable state
-        // crosses task boundaries. Memory stays bounded: at most
-        // `maxConcurrent` items (plus their outputs) are ever in flight.
-        await withTaskGroup(of: AnalyzedSummary?.self) { group in
+        // Producer/consumer. `maxConcurrent` tasks read + inspect items in
+        // parallel (the slow part — Mach-O parse, symbol/string extraction —
+        // on pooled reader connections). The consumer here on the actor
+        // accumulates finished outputs and commits them in batches: the single
+        // writer is serial, so committing N at a time keeps it from becoming
+        // the bottleneck when per-item inspection is cheap (the bulk case).
+        let writeBatchSize = 64
+        var pending: [AnalysisWrite] = []
+        pending.reserveCapacity(writeBatchSize)
+        var recentPaths: [String] = []   // rolling window for the queue UI
+        var active = 0                    // outstanding analyze tasks
+
+        func flush() {
+            guard !pending.isEmpty else { return }
+            try? database.applyAnalysisBatch(
+                pending, snapshotID: snapshotID,
+                analyzedAt: Date(), analyzerVersion: Database.currentAnalyzerVersion
+            )
+            pending.removeAll(keepingCapacity: true)
+        }
+
+        await withTaskGroup(of: AnalysisOutput?.self) { group in
             var iterator = ids.makeIterator()
-            var primed = 0
-            while primed < maxConcurrent, let id = iterator.next() {
+            while active < maxConcurrent, let id = iterator.next() {
                 let itemID = id
-                group.addTask {
-                    Self.analyzeOne(itemID, pipeline: pipeline, database: database, snapshotID: snapshotID)
-                }
-                primed += 1
+                group.addTask { Self.readAndAnalyze(itemID, pipeline: pipeline, database: database) }
+                active += 1
             }
 
-            while let summary = await group.next() {
-                if let summary {
+            while let output = await group.next() {
+                active -= 1
+                if let output {
+                    pending.append(AnalysisWrite(
+                        item: output.item, symbols: output.symbols,
+                        additionalItems: output.additionalItems, additionalSymbols: output.additionalSymbols
+                    ))
                     processed += 1
                     progress.filesInspected = processed
-                    progress.perCategoryCounts[summary.category, default: 0] += 1
-                    let n = Date()
-                    if n.timeIntervalSince(lastEmit) >= emitInterval {
-                        lastEmit = n
-                        progress.inFlightPaths = [summary.path]
-                        await progressSink(progress)
-                    }
+                    progress.perCategoryCounts[output.item.category, default: 0] += 1
+                    recentPaths.insert(output.item.path, at: 0)
+                    if recentPaths.count > maxConcurrent { recentPaths.removeLast() }
+                    if pending.count >= writeBatchSize { flush() }
                 }
                 // Keep the window full until the input is drained or cancelled.
                 if !Task.isCancelled, let id = iterator.next() {
                     let itemID = id
-                    group.addTask {
-                        Self.analyzeOne(itemID, pipeline: pipeline, database: database, snapshotID: snapshotID)
-                    }
+                    group.addTask { Self.readAndAnalyze(itemID, pipeline: pipeline, database: database) }
+                    active += 1
+                }
+                let n = Date()
+                if n.timeIntervalSince(lastEmit) >= emitInterval {
+                    lastEmit = n
+                    progress.activeWorkers = active
+                    progress.inFlightPaths = recentPaths
+                    await progressSink(progress)
                 }
             }
+            flush()
         }
 
         progress.phase = .done
         progress.inFlightPaths = []
+        progress.activeWorkers = 0
         await progressSink(progress)
     }
 
-    /// Read, analyze, and persist one item. Pure with respect to the worker's
-    /// own state (it returns a small summary for progress), so it is safe to
-    /// run on many tasks at once: reads use the database's reader pool, the
-    /// write serializes on the single writer, and the inspectors hold no
-    /// shared mutable state. `nonisolated` so it runs off the actor/MainActor.
-    private nonisolated static func analyzeOne(
+    /// Read + inspect one item (no write). Pure and `nonisolated`, so it runs
+    /// off the actor across many tasks at once; reads use the reader pool and
+    /// the inspectors hold no shared mutable state. The actor batches the
+    /// returned outputs into the single writer.
+    private nonisolated static func readAndAnalyze(
         _ id: UUID,
         pipeline: AnalysisPipeline,
-        database: Database,
-        snapshotID: Int64
-    ) -> AnalyzedSummary? {
+        database: Database
+    ) -> AnalysisOutput? {
         if Task.isCancelled { return nil }
         guard let item = try? database.item(id: id) else { return nil }
-        let output = pipeline.analyze(item: item)
-        // One transaction per item (clear + upsert + stamp + symbols +
-        // additional items) instead of four-plus separate COMMITs.
-        try? database.applyAnalysis(
-            item: output.item,
-            symbols: output.symbols,
-            additionalItems: output.additionalItems,
-            additionalSymbols: output.additionalSymbols,
-            snapshotID: snapshotID,
-            analyzedAt: Date(),
-            analyzerVersion: Database.currentAnalyzerVersion
-        )
-        return AnalyzedSummary(category: output.item.category, path: item.path)
+        return pipeline.analyze(item: item)
     }
-}
-
-/// Minimal per-item result carried back to the worker for progress.
-private nonisolated struct AnalyzedSummary: Sendable {
-    let category: ItemCategory
-    let path: String
 }
 
 // MARK: - Reference data

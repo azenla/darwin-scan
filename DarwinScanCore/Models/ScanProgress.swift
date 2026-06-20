@@ -15,6 +15,10 @@ public nonisolated struct ScanProgress: Sendable, Equatable {
     public var perCategoryCounts: [ItemCategory: Int] = [:]
     public var inFlightPaths: [String] = []
     public var workerCount: Int = 0
+    /// How many workers are actually busy right now. Distinct from
+    /// `inFlightPaths.count`: the analyzer shows a rolling window of recent
+    /// paths for context but reports its true in-flight task count here.
+    public var activeWorkers: Int = 0
     public var lastError: String?
 
     public enum Phase: String, Sendable, Equatable {
@@ -38,6 +42,7 @@ public nonisolated struct ScanProgress: Sendable, Equatable {
         perCategoryCounts: [ItemCategory: Int] = [:],
         inFlightPaths: [String] = [],
         workerCount: Int = 0,
+        activeWorkers: Int = 0,
         lastError: String? = nil
     ) {
         self.phase = phase
@@ -49,6 +54,7 @@ public nonisolated struct ScanProgress: Sendable, Equatable {
         self.perCategoryCounts = perCategoryCounts
         self.inFlightPaths = inFlightPaths
         self.workerCount = workerCount
+        self.activeWorkers = activeWorkers
         self.lastError = lastError
     }
 }

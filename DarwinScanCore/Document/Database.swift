@@ -246,27 +246,66 @@ public nonisolated final class Database: @unchecked Sendable {
         analyzedAt: Date,
         analyzerVersion: String
     ) throws {
+        try applyAnalysisBatch(
+            [AnalysisWrite(item: item, symbols: symbols, additionalItems: additionalItems, additionalSymbols: additionalSymbols)],
+            snapshotID: snapshotID, analyzedAt: analyzedAt, analyzerVersion: analyzerVersion
+        )
+    }
+
+    /// Apply many items' analysis output in **one** transaction. The parallel
+    /// analyzer reads + inspects items across cores (slow part) and hands the
+    /// finished outputs here in batches; committing N at a time amortizes the
+    /// per-item BEGIN/COMMIT + writeLock so the single-writer path keeps up
+    /// with the parallel producers instead of becoming the bottleneck.
+    public func applyAnalysisBatch(
+        _ writes: [AnalysisWrite],
+        snapshotID: Int64,
+        analyzedAt: Date,
+        analyzerVersion: String
+    ) throws {
+        guard !writes.isEmpty else { return }
         try withWriter { conn in
             try conn.exec("BEGIN IMMEDIATE TRANSACTION;")
             do {
-                try clearAnalysisOutputLocked(key: item.id.uuidString.lowercased(), on: conn)
-                try upsertItemLocked(item, on: conn)
-                try stampAnalysisLocked(itemID: item.id, state: .done, analyzedAt: analyzedAt, analyzerVersion: analyzerVersion, on: conn)
-                for row in symbols { try insertSymbolLocked(row, on: conn) }
-                for extra in additionalItems {
-                    try upsertItemLocked(extra, on: conn)
-                    try write(conn, Self.insertSnapshotItemSQL, "insertSnapshotItem") { stmt in
-                        sqlite3_bind_int64(stmt, 1, snapshotID)
-                        sqlite3_bind_text(stmt, 2, extra.id.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
-                    }
+                for w in writes {
+                    try applyAnalysisLocked(
+                        item: w.item, symbols: w.symbols,
+                        additionalItems: w.additionalItems, additionalSymbols: w.additionalSymbols,
+                        snapshotID: snapshotID, analyzedAt: analyzedAt, analyzerVersion: analyzerVersion,
+                        on: conn
+                    )
                 }
-                for row in additionalSymbols { try insertSymbolLocked(row, on: conn) }
                 try conn.exec("COMMIT;")
             } catch {
                 try? conn.exec("ROLLBACK;")
                 throw error
             }
         }
+    }
+
+    /// One item's analysis writes. Caller holds the writer + an open txn.
+    private func applyAnalysisLocked(
+        item: ScanItem,
+        symbols: [SymbolRow],
+        additionalItems: [ScanItem],
+        additionalSymbols: [SymbolRow],
+        snapshotID: Int64,
+        analyzedAt: Date,
+        analyzerVersion: String,
+        on conn: SQLiteConnection
+    ) throws {
+        try clearAnalysisOutputLocked(key: item.id.uuidString.lowercased(), on: conn)
+        try upsertItemLocked(item, on: conn)
+        try stampAnalysisLocked(itemID: item.id, state: .done, analyzedAt: analyzedAt, analyzerVersion: analyzerVersion, on: conn)
+        for row in symbols { try insertSymbolLocked(row, on: conn) }
+        for extra in additionalItems {
+            try upsertItemLocked(extra, on: conn)
+            try write(conn, Self.insertSnapshotItemSQL, "insertSnapshotItem") { stmt in
+                sqlite3_bind_int64(stmt, 1, snapshotID)
+                sqlite3_bind_text(stmt, 2, extra.id.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
+            }
+        }
+        for row in additionalSymbols { try insertSymbolLocked(row, on: conn) }
     }
 
     // MARK: - Items (reads)
@@ -1425,6 +1464,22 @@ nonisolated private func bindOptBlob(_ stmt: OpaquePointer, _ idx: Int32, _ b: D
 }
 
 // MARK: - Public row types
+
+/// One item's analysis output, ready to persist. Lets the parallel analyzer
+/// hand finished work to `applyAnalysisBatch` without the storage layer
+/// depending on the Scanning-layer `AnalysisOutput` type.
+public nonisolated struct AnalysisWrite: Sendable {
+    public let item: ScanItem
+    public let symbols: [SymbolRow]
+    public let additionalItems: [ScanItem]
+    public let additionalSymbols: [SymbolRow]
+    public init(item: ScanItem, symbols: [SymbolRow], additionalItems: [ScanItem], additionalSymbols: [SymbolRow]) {
+        self.item = item
+        self.symbols = symbols
+        self.additionalItems = additionalItems
+        self.additionalSymbols = additionalSymbols
+    }
+}
 
 public nonisolated struct SymbolRow: Sendable, Hashable {
     public enum Kind: String, Codable, Sendable, Hashable {
