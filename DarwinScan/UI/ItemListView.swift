@@ -18,7 +18,13 @@ struct ItemListView: View {
     /// only persistent state for the list is this `[UUID]`.
     @State private var filteredItemIDs: [UUID] = []
     @State private var displayedFilters: [SearchQuery.Filter] = []
-    @State private var isRecomputing: Bool = false
+    /// Search text after debouncing. The expensive recompute keys off this,
+    /// not `rawSearchText`, so a burst of keystrokes triggers one walk.
+    @State private var debouncedSearchText: String = ""
+    /// Bumped every time `filteredItemIDs` is replaced. `ItemTableView` reloads
+    /// (and rebuilds its id→row index) on a generation change instead of doing
+    /// an O(n) array compare on every SwiftUI update.
+    @State private var listGeneration: Int = 0
 
     /// Active scope from the sidebar. We narrow before evaluating the query
     /// so per-item filter cost scales with the category, not the whole store.
@@ -50,6 +56,7 @@ struct ItemListView: View {
                     // data space well before 470k items.
                     ItemTableView(
                         ids: filteredItemIDs,
+                        generation: listGeneration,
                         selection: $itemSelection,
                         store: store
                     )
@@ -59,7 +66,17 @@ struct ItemListView: View {
         }
         .navigationTitle(title)
         .navigationSubtitle(subtitle)
-        .task(id: ListInputs(searchText: rawSearchText,
+        .task(id: rawSearchText) {
+            // Debounce: only commit search text to the (expensive) recompute
+            // after the user pauses typing. Each keystroke changes
+            // rawSearchText, which cancels and restarts this task, so the
+            // sleep completes — and the walk fires — only once typing settles.
+            if rawSearchText == debouncedSearchText { return }
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            debouncedSearchText = rawSearchText
+        }
+        .task(id: ListInputs(searchText: debouncedSearchText,
                              selection: selection,
                              itemCount: store.itemCount)) {
             await recompute()
@@ -123,9 +140,10 @@ struct ItemListView: View {
         if case .systemInfo = selection {
             filteredItemIDs = []
             displayedFilters = []
+            listGeneration &+= 1
             return
         }
-        let query = SearchQuery.parse(rawSearchText)
+        let query = SearchQuery.parse(debouncedSearchText)
         let scopeFilter = scope
         let allowedFTS: Set<UUID>? = query.resolveFTSItemIDs(against: store)
 
@@ -149,7 +167,7 @@ struct ItemListView: View {
         if Task.isCancelled { return }
         filteredItemIDs = result
         displayedFilters = query.filters
-        isRecomputing = false
+        listGeneration &+= 1
     }
 }
 

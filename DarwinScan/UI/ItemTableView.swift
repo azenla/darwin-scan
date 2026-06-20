@@ -16,6 +16,10 @@ import DarwinScanCore
 /// repeatedly is effectively free.
 struct ItemTableView: NSViewRepresentable {
     let ids: [UUID]
+    /// Monotonic token from the owner; changes exactly when `ids` is replaced.
+    /// Lets `updateNSView` decide whether to reload in O(1) instead of an O(n)
+    /// array compare on every SwiftUI update (e.g. each selection change).
+    let generation: Int
     @Binding var selection: UUID?
     let store: ScanStore
 
@@ -39,7 +43,7 @@ struct ItemTableView: NSViewRepresentable {
 
         let coord = context.coordinator
         coord.tableView = table
-        coord.ids = ids
+        coord.setIDs(ids, generation: generation)
         table.dataSource = coord
         table.delegate = coord
 
@@ -56,20 +60,16 @@ struct ItemTableView: NSViewRepresentable {
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         guard let table = nsView.documentView as? NSTableView else { return }
         let coord = context.coordinator
-        let oldIDs = coord.ids
-        // Replace the binding's parent reference + the data array on the
-        // coordinator. We compare counts first (cheap) and only fall back
-        // to a full equality check when the count matches but content may
-        // have rotated.
         coord.parent = self
         coord.store = store
-        if oldIDs.count != ids.count || oldIDs != ids {
-            coord.ids = ids
+        // Reload only when the id list actually changed — detected by the
+        // owner's generation token rather than an O(n) array compare that
+        // would run on every selection change.
+        if coord.generation != generation {
+            coord.setIDs(ids, generation: generation)
             table.reloadData()
         }
-        let desiredRow: Int? = selection.flatMap { sel in
-            coord.ids.firstIndex(of: sel)
-        }
+        let desiredRow: Int? = selection.flatMap { coord.idIndex[$0] }
         if let row = desiredRow {
             if table.selectedRow != row {
                 table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
@@ -85,12 +85,27 @@ struct ItemTableView: NSViewRepresentable {
         fileprivate var parent: ItemTableView
         fileprivate var store: ScanStore
         fileprivate var ids: [UUID] = []
+        /// id → row, kept in sync with `ids` so selection sync is O(1).
+        fileprivate var idIndex: [UUID: Int] = [:]
+        /// Last applied generation; `-1` forces the first `setIDs` to apply.
+        fileprivate var generation: Int = -1
         fileprivate weak var tableView: NSTableView?
 
         init(parent: ItemTableView) {
             self.parent = parent
             self.store = parent.store
-            self.ids = parent.ids
+            super.init()
+            setIDs(parent.ids, generation: parent.generation)
+        }
+
+        /// Replace the row data and rebuild the id→row index in one pass.
+        func setIDs(_ newIDs: [UUID], generation: Int) {
+            ids = newIDs
+            self.generation = generation
+            var index: [UUID: Int] = [:]
+            index.reserveCapacity(newIDs.count)
+            for (i, id) in newIDs.enumerated() { index[id] = i }
+            idIndex = index
         }
 
         func numberOfRows(in tableView: NSTableView) -> Int { ids.count }
