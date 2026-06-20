@@ -140,6 +140,18 @@ public nonisolated final class ScanStore {
         headerCache.clear()
     }
 
+    /// Bumped whenever the active snapshot's analyzed data changes — the
+    /// analyzer calls `noteAnalysisProgress()` periodically while it runs. The
+    /// list view folds this into its recompute key so field searches (`arch:`,
+    /// `symbol:`, …) and the sidebar category counts populate live as analysis
+    /// proceeds, rather than only at completion.
+    public private(set) var analysisRevision: Int = 0
+
+    public func noteAnalysisProgress() {
+        refreshActiveSnapshotStats()
+        analysisRevision &+= 1
+    }
+
     @discardableResult
     public func beginImport(
         source: SnapshotSourceKind,

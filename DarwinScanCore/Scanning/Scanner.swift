@@ -33,6 +33,9 @@ public final class ScanController {
     }
 
     private var workerTask: Task<Void, Never>?
+    /// Throttle for the periodic in-analysis store refresh (sidebar counts +
+    /// live search). Reset at the start of each analysis run.
+    private var lastAnalysisRefresh = Date()
     /// Provider currently driving the active import. Held so we can tear
     /// down (unmount IPSW, remove extraction dir) when the import finishes
     /// or is cancelled.
@@ -134,6 +137,7 @@ public final class ScanController {
         isRunning = true
         phase = .analyzing
         progress = ScanProgress(phase: .analyzing, startedAt: Date())
+        lastAnalysisRefresh = Date()
         try? database.markSnapshotAnalysis(
             snapshotID: targetSnapshot,
             state: .running,
@@ -152,7 +156,18 @@ public final class ScanController {
                 options: options,
                 store: store,
                 progressSink: { [weak self] snapshot in
-                    self?.progress = snapshot
+                    guard let self else { return }
+                    self.progress = snapshot
+                    // Periodically refresh the in-memory snapshot view so the
+                    // sidebar category counts climb and field searches
+                    // (arch:, symbol:, …) populate live during analysis —
+                    // throttled so the full-snapshot re-filter it triggers
+                    // isn't paid on every progress tick.
+                    let now = Date()
+                    if now.timeIntervalSince(self.lastAnalysisRefresh) > 2.5 {
+                        self.lastAnalysisRefresh = now
+                        store.noteAnalysisProgress()
+                    }
                 }
             )
             let completed = Date()
@@ -337,7 +352,7 @@ public actor ImportWorker {
         let flushInterval: TimeInterval = 0.25
         let progressInterval: TimeInterval = 0.15
         let batchSize = 256
-        var inFlight: [String] = []
+        var inFlight: [URL] = []
         inFlight.reserveCapacity(maxConcurrent)
 
         await withTaskGroup(of: (URL, ImportResult?).self) { group in
@@ -345,18 +360,19 @@ public actor ImportWorker {
             for _ in 0..<maxConcurrent {
                 guard let url = await iterator.next() else { break }
                 progress.filesVisited += 1
-                inFlight.append(url.path)
+                inFlight.append(url)
                 group.addTask {
                     if Task.isCancelled { return (url, nil) }
                     return (url, pipeline.importOne(url: url))
                 }
             }
-            progress.inFlightPaths = inFlight
+            progress.inFlightPaths = inFlight.map { pipeline.source.displayPath(for: $0) }
+                progress.activeWorkers = inFlight.count
             await progressSink(progress)
 
             while let (completedURL, result) = await group.next() {
                 if Task.isCancelled { group.cancelAll(); continue }
-                if let idx = inFlight.firstIndex(of: completedURL.path) {
+                if let idx = inFlight.firstIndex(of: completedURL) {
                     inFlight.remove(at: idx)
                 }
                 if let result {
@@ -368,7 +384,7 @@ public actor ImportWorker {
                 }
                 if let url = await iterator.next() {
                     progress.filesVisited += 1
-                    inFlight.append(url.path)
+                    inFlight.append(url)
                     group.addTask {
                         if Task.isCancelled { return (url, nil) }
                         return (url, pipeline.importOne(url: url))
@@ -383,7 +399,8 @@ public actor ImportWorker {
                 }
                 if now.timeIntervalSince(lastProgressEmit) >= progressInterval {
                     lastProgressEmit = now
-                    progress.inFlightPaths = inFlight
+                    progress.inFlightPaths = inFlight.map { pipeline.source.displayPath(for: $0) }
+                progress.activeWorkers = inFlight.count
                     await progressSink(progress)
                 }
             }

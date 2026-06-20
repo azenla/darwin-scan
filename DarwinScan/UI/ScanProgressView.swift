@@ -35,7 +35,7 @@ struct ScanProgressBar: View {
                     .font(.callout)
                     .lineLimit(1)
                 if progress.workerCount > 0 {
-                    Text("\(progress.inFlightPaths.count) of \(progress.workerCount) workers active")
+                    Text("\(progress.activeWorkers) of \(progress.workerCount) workers active")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -60,9 +60,23 @@ struct ScanProgressBar: View {
 
     private var statsView: some View {
         HStack(spacing: 14) {
-            statColumn(label: "items", value: progress.itemsFound)
-            statColumn(label: "visited", value: progress.filesVisited)
-            statColumn(label: "inspected", value: progress.filesInspected)
+            switch progress.phase {
+            case .analyzing, .inspecting:
+                // "analyzed of total" — how far through the snapshot we are.
+                statColumn(label: "analyzed", value: progress.filesInspected)
+                if progress.itemsFound > 0 {
+                    statColumn(label: "total", value: progress.itemsFound)
+                }
+            case .importing, .enumerating:
+                // "imported" = items captured; "scanned" = files the walker
+                // has reached. ("visited"/"inspected" were jargon — and
+                // "inspected" was meaningless during import, which doesn't
+                // run inspectors.)
+                statColumn(label: "imported", value: progress.itemsFound)
+                statColumn(label: "scanned", value: progress.filesVisited)
+            default:
+                statColumn(label: "items", value: progress.itemsFound)
+            }
         }
         .font(.caption)
         .monospacedDigit()

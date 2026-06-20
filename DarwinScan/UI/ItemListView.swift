@@ -60,6 +60,7 @@ struct ItemListView: View {
                         selection: $itemSelection,
                         store: store
                     )
+                    .overlay { emptyState }
                 }
                 .searchable(text: $rawSearchText, prompt: searchPrompt)
             }
@@ -78,7 +79,8 @@ struct ItemListView: View {
         }
         .task(id: ListInputs(searchText: debouncedSearchText,
                              selection: selection,
-                             itemCount: store.itemCount)) {
+                             itemCount: store.itemCount,
+                             analysisRevision: store.analysisRevision)) {
             await recompute()
         }
         .toolbar {
@@ -120,6 +122,32 @@ struct ItemListView: View {
             return n == 1 ? "1 item" : "\(n) items"
         }
         return n == 1 ? "1 match" : "\(n) matches"
+    }
+
+    /// Shown over the list when a search returns nothing. If items are still
+    /// pending analysis, explain that analyzed-only fields (arch:, symbol:,
+    /// tag:, …) can't match until analysis runs — the most common reason a
+    /// search on a freshly-imported snapshot comes back empty.
+    @ViewBuilder
+    private var emptyState: some View {
+        if filteredItemIDs.isEmpty && !rawSearchText.isEmpty {
+            let pending = store.categoryCounts[.unanalyzed] ?? 0
+            VStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.largeTitle)
+                    .foregroundStyle(.tertiary)
+                Text("No matches")
+                    .font(.headline)
+                if pending > 0 {
+                    Text("\(pending.formatted()) item\(pending == 1 ? "" : "s") aren't analyzed yet. Fields like arch:, symbol:, and tag: only match after analysis — run Analyze to search them.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 360)
+                }
+            }
+            .padding()
+        }
     }
 
     /// Stream headers out of SQLite (already ORDER BY name COLLATE NOCASE
@@ -179,6 +207,9 @@ private struct ListInputs: Equatable, Hashable {
     let searchText: String
     let selection: SidebarSelection
     let itemCount: Int
+    /// Bumps as analysis refines items, so the filtered list re-evaluates and
+    /// field searches populate live during a run.
+    let analysisRevision: Int
 }
 
 /// Horizontal strip showing the parsed filter tokens — a quick visual

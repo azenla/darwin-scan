@@ -10,7 +10,15 @@ public nonisolated protocol SourceProvider: Sendable {
     var roots: [URL] { get }
     var excludedPrefixes: [String] { get }
     func canonicalPath(for url: URL) -> String
+    /// Human-facing path for progress UI. Defaults to `canonicalPath`; the
+    /// IPSW source prefixes the mounted volume name so the user can tell
+    /// which disk image a file came from ("Macintosh HD 1 → /System/…").
+    func displayPath(for url: URL) -> String
     func cleanup()
+}
+
+public extension SourceProvider {
+    nonisolated func displayPath(for url: URL) -> String { canonicalPath(for: url) }
 }
 
 // MARK: - Current system
@@ -222,6 +230,23 @@ public nonisolated final class IPSWSource: SourceProvider, @unchecked Sendable {
             }
         }
         return urlPath
+    }
+
+    /// "<mounted volume> → <canonical path>", e.g.
+    /// "Macintosh HD 1 → /System/Library/…". The raw mounted path
+    /// (`/Volumes/Macintosh HD 1/System/…`) hides which image a file is from
+    /// and buries the meaningful suffix; this surfaces both.
+    public func displayPath(for url: URL) -> String {
+        let urlPath = url.path
+        for root in roots {
+            let mountpoint = (root.path as NSString).deletingLastPathComponent
+            guard !mountpoint.isEmpty,
+                  urlPath == root.path || urlPath.hasPrefix(mountpoint + "/") else { continue }
+            let volume = (mountpoint as NSString).lastPathComponent
+            let canonical = canonicalPath(for: url)
+            return volume.isEmpty ? canonical : "\(volume) → \(canonical)"
+        }
+        return canonicalPath(for: url)
     }
 
     // MARK: - Scan-root discovery
