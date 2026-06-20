@@ -188,11 +188,22 @@ User-state paths (`/Users`, `/Applications`, `/Library`, `/Volumes`,
   single-threaded-at-a-time (writer behind the lock; each reader leased to
   one caller), so its prepared-statement cache + JSON coders need no extra
   synchronization.
-- **Analysis is parallel.** `AnalysisWorker.run` drives a bounded
-  `TaskGroup` (`maxConcurrent ≈ cores − 1`): per-item read + inspect runs
-  across cores on reader connections; writes serialize on the writer.
-  Progress aggregation stays on the actor. `analyzeOne` is a `nonisolated
-  static` so it runs off the actor/MainActor.
+- **Analysis is parallel (producer/consumer).** `AnalysisWorker.run` runs a
+  bounded `TaskGroup` (`maxConcurrent ≈ cores − 1`) of `readAndAnalyze`
+  tasks — read + inspect (Mach-O parse, symbol/string extraction) across
+  cores on reader connections — and the actor consumes finished
+  `AnalysisOutput`s and commits them in batches via
+  `Database.applyAnalysisBatch` (64/txn). Batching matters: the writer is
+  serial, so when per-item inspection is cheap (the bulk case) committing
+  one item per transaction makes the writer the bottleneck and the run looks
+  single-threaded. `readAndAnalyze` is a `nonisolated static` so it runs off
+  the actor. `ScanProgress.activeWorkers` reports the true in-flight count.
+- **The dyld_shared_cache image loop is parallel too.** `analyzeFile`
+  extracts a cache's ~3000 images via `DispatchQueue.concurrentPerform` into
+  a lock-guarded `DyldImageCollector` (it's the single most expensive
+  analysis step). Safe because `SharedStringTable` is thread-safe and each
+  image is independent. Brief GCD/cooperative-pool oversubscription while
+  that one item runs is acceptable.
 - Shared mutable state the parallel analyzer touches is locked:
   `BlobStore.refs` (`os_unfair_lock`) and
   `DyldCachedImageInspector.SharedStringTable.mapped` (`NSLock`). Both were
@@ -265,13 +276,6 @@ to re-run analysis.
 
 ## Known follow-ups
 
-- **Parallelize the dyld inner image loop.** The per-item analysis loop is
-  parallel, but a single dyld_shared_cache item still extracts its ~3000
-  images serially inside one task (it's one long-running task among many).
-  `SharedStringTable` is now thread-safe and the per-symbol path no longer
-  touches its shared dict, so the inner loop can be parallelized — mind
-  oversubscription against the outer `TaskGroup` (don't nest unbounded
-  parallelism).
 - **AEA decryption with FCS keys.** `IPSWSource` tries `aea decrypt`
   with no key (works for unencrypted payloads). Modern Apple Silicon
   IPSWs ship AEA payloads whose keys live on Apple's signing servers.
