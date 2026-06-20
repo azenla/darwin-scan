@@ -36,7 +36,11 @@ public nonisolated enum StringsExtractor {
         process.executableURL = stringsURL
         process.arguments = ["-n", "\(minLength)", "-arch", "all", url.path]
         process.standardOutput = writeHandle
-        process.standardError = Pipe()
+        // Discard stderr to /dev/null rather than an unread Pipe(): a Pipe
+        // whose read end is never drained deadlocks once `strings` writes more
+        // than the ~64 KB pipe buffer (chatty on malformed fat binaries),
+        // because we then block forever in `waitUntilExit()`.
+        process.standardError = FileHandle.nullDevice
         do {
             try process.run()
         } catch {
