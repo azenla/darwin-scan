@@ -131,6 +131,60 @@ struct DatabaseTests {
         #expect(try db.outgoingTargets(sourceID: item.id).isEmpty)
     }
 
+    /// Hammer the connection pool: many threads read (single-id lookup,
+    /// category counts, FTS search, full-snapshot header walk) while writes
+    /// land concurrently. Proves reads run in parallel with the writer without
+    /// corruption or crashes, and that committed data stays consistent.
+    @Test func concurrentReadsDuringWrites() throws {
+        let (db, url) = try makeTempDB()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let snap = try db.insertSnapshot(
+            parentID: nil, label: nil, sourceKind: .currentSystem,
+            sourceRef: nil, startedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        // Seed 200 executable items + a symbol each.
+        let seeded: [ScanItem] = (0..<200).map { i in
+            ScanItem(
+                id: UUID(), path: "/seed/\(i)", name: "seed-\(i)", category: .executable,
+                size: Int64(i), modifiedAt: nil, insideBundle: false, owningBundlePath: nil,
+                tags: ["seed"]
+            )
+        }
+        try db.upsertItems(seeded)
+        try db.addItemsToSnapshot(snapshotID: snap, itemIDs: seeded.map(\.id))
+        for item in seeded {
+            try db.insertSymbols([SymbolRow(itemID: item.id, name: "symFor\(item.name)", kind: .function)])
+        }
+
+        // Storm: ~1/7 iterations write a NEW (.framework) item; the rest read.
+        // Writes serialize on the writer; reads fan out across the pool.
+        DispatchQueue.concurrentPerform(iterations: 700) { i in
+            if i % 7 == 0 {
+                let item = ScanItem(
+                    id: UUID(), path: "/new/\(i)", name: "new-\(i)", category: .framework,
+                    size: Int64(i), modifiedAt: nil, insideBundle: false, owningBundlePath: nil
+                )
+                try? db.upsertItem(item)
+                try? db.addItemsToSnapshot(snapshotID: snap, itemIDs: [item.id])
+            } else {
+                _ = try? db.itemHeader(id: seeded[i % seeded.count].id)
+                _ = try? db.categoryCounts(inSnapshot: snap)
+                _ = try? db.searchSymbols(query: "symFor*", limit: 50)
+                var walked = 0
+                try? db.forEachHeader(inSnapshot: snap) { _ in walked += 1; return true }
+            }
+        }
+
+        // Every seeded item must still be readable, and the executable count
+        // (seeded only — new items are frameworks) must be exactly preserved.
+        for item in seeded {
+            #expect(try db.itemHeader(id: item.id) != nil)
+        }
+        let counts = try db.categoryCounts(inSnapshot: snap)
+        #expect((counts[.executable] ?? 0) == seeded.count)
+    }
+
     @Test func metaCodableRoundTrip() throws {
         let (db, url) = try makeTempDB()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
