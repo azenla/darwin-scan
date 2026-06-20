@@ -275,18 +275,29 @@ public nonisolated struct ImportPipeline: Sendable {
         // Hash + (optionally) capture the bytes. We always hash when
         // captureFiles is on because the deterministic id needs sha256.
         let sha: String?
-        if options.hashFiles || options.captureFiles {
+        var refs: [String] = []
+        var fileBlobRef: String? = nil
+        let shouldCapture = options.captureFiles && size > 0 && size <= options.maxCaptureFileSize
+        if shouldCapture {
+            // Single pass: hash the bytes *while* writing them to the blob
+            // store, instead of one full read to hash and a second full read
+            // to copy.
+            if let captured = blobWriter.captureHashing(from: url, refPrefix: "file-") {
+                sha = captured.sha
+                fileBlobRef = captured.ref
+                refs.append(captured.ref)
+            } else {
+                // Capture failed (e.g. a transient write error). Fall back to
+                // a hash-only pass so the item can still get deterministic
+                // identity if the file is at least readable.
+                sha = Hash.sha256(of: url)
+            }
+        } else if options.hashFiles || options.captureFiles {
+            // Not capturing (disabled, empty file, or over the cap) but the
+            // identity still needs a hash.
             sha = Hash.sha256(of: url)
         } else {
             sha = nil
-        }
-        var refs: [String] = []
-        var fileBlobRef: String? = nil
-        if options.captureFiles, size > 0, size <= options.maxCaptureFileSize, let sha {
-            let ref = "file-\(sha)"
-            blobWriter.copy(from: url, ref: ref)
-            fileBlobRef = ref
-            refs.append(ref)
         }
 
         let item = ScanItem(

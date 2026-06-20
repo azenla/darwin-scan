@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import CryptoKit
 
 /// Disk-backed content-addressed payload store. Three reasons this exists as
 /// its own type (rather than a `[String: Data]` on `ScanStore`):
@@ -161,6 +162,77 @@ public nonisolated struct BlobWriter: Sendable {
             try? fm.removeItem(at: dst)
         }
         try? fm.copyItem(at: source, to: dst)
+    }
+
+    /// Read `source` exactly once, computing its SHA-256 while streaming the
+    /// bytes into the content-addressed blob layout. Returns `(sha, ref)` on
+    /// success — the blob is written as `\(refPrefix)\(sha)` — or nil if the
+    /// source can't be read.
+    ///
+    /// This replaces the old two-pass import flow (`Hash.sha256(of:)` to get
+    /// the digest, then `copy(from:ref:)` to capture the bytes), which read
+    /// every imported file from disk *twice*. For a /System walk — hundreds of
+    /// thousands of files including multi-hundred-MB Mach-Os — that halves the
+    /// dominant import cost.
+    ///
+    /// Content-addressed dedup is preserved: once the digest (and thus the
+    /// destination) is known, an already-present blob means identical bytes,
+    /// so the temp is discarded rather than rewritten. Safe under the import
+    /// worker's concurrent task group — the temp name is unique per call and a
+    /// lost move race (two files, same content) is treated as a dedup hit.
+    public func captureHashing(
+        from source: URL,
+        refPrefix: String = "file-",
+        chunkSize: Int = 1 << 20
+    ) -> (sha: String, ref: String)? {
+        let fm = FileManager.default
+        guard let inHandle = try? FileHandle(forReadingFrom: source) else { return nil }
+        defer { try? inHandle.close() }
+
+        let tempURL = rootDirectory.appendingPathComponent(".capture-\(UUID().uuidString).tmp")
+        try? fm.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        fm.createFile(atPath: tempURL.path, contents: nil)
+        guard let outHandle = try? FileHandle(forWritingTo: tempURL) else {
+            try? fm.removeItem(at: tempURL)
+            return nil
+        }
+
+        var hasher = SHA256()
+        var ok = true
+        while true {
+            let chunk: Data
+            do {
+                guard let c = try inHandle.read(upToCount: chunkSize), !c.isEmpty else { break }
+                chunk = c
+            } catch { ok = false; break }
+            hasher.update(data: chunk)
+            do { try outHandle.write(contentsOf: chunk) } catch { ok = false; break }
+        }
+        try? outHandle.close()
+
+        guard ok else {
+            try? fm.removeItem(at: tempURL)
+            return nil
+        }
+
+        let sha = hasher.finalize().compactMap { String(format: "%02x", $0) }.joined()
+        let ref = "\(refPrefix)\(sha)"
+        let dst = ensureShardURL(forRef: ref)
+
+        if fm.fileExists(atPath: dst.path) {
+            try? fm.removeItem(at: tempURL)
+            return (sha, ref)
+        }
+        do {
+            try fm.moveItem(at: tempURL, to: dst)
+        } catch {
+            // Most likely another worker just wrote the same content (the ref
+            // is the hash, so the bytes are identical). Treat a present dst as
+            // success; otherwise the capture genuinely failed.
+            try? fm.removeItem(at: tempURL)
+            guard fm.fileExists(atPath: dst.path) else { return nil }
+        }
+        return (sha, ref)
     }
 
     /// Sharded destination URL for a ref, with the prefix directory created
