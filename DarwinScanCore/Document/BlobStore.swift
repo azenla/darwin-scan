@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import CryptoKit
+import os.lock
 
 /// Disk-backed content-addressed payload store. Three reasons this exists as
 /// its own type (rather than a `[String: Data]` on `ScanStore`):
@@ -36,6 +37,12 @@ public nonisolated final class BlobStore: @unchecked Sendable {
     /// Every ref we know about. The bytes live at `blobURL(forRef:)`.
     public private(set) var refs: Set<String> = []
 
+    /// Guards mutations of `refs`. The analysis worker now registers blob refs
+    /// (extracted icons/previews) from many concurrent tasks, so the `Set`
+    /// insert must be serialized — a concurrently-mutated Swift Set is
+    /// undefined behavior, not just a lost write.
+    private var refsLock = os_unfair_lock_s()
+
     /// Root of the sharded blob layout — typically `<bundle>/blobs/` for an
     /// open document, or any temp directory in tests.
     public let rootDirectory: URL
@@ -63,12 +70,14 @@ public nonisolated final class BlobStore: @unchecked Sendable {
         BlobWriter(rootDirectory: rootDirectory)
     }
 
-    /// Register a ref the worker just wrote to disk. Idempotent.
+    /// Register a ref the worker just wrote to disk. Idempotent. Thread-safe.
     public func register(ref: String) {
+        os_unfair_lock_lock(&refsLock); defer { os_unfair_lock_unlock(&refsLock) }
         refs.insert(ref)
     }
 
     public func registerMany(_ refs: [String]) {
+        os_unfair_lock_lock(&refsLock); defer { os_unfair_lock_unlock(&refsLock) }
         for ref in refs { self.refs.insert(ref) }
     }
 
@@ -93,6 +102,9 @@ public nonisolated final class BlobStore: @unchecked Sendable {
     public func scanForExistingBlobs() {
         let fm = FileManager.default
         guard let prefixes = try? fm.contentsOfDirectory(at: rootDirectory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return }
+        // Collect off-lock (directory I/O is slow), then insert in one locked
+        // pass via registerMany.
+        var found: [String] = []
         for prefixURL in prefixes {
             let isDir = (try? prefixURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             guard isDir else { continue }
@@ -100,9 +112,10 @@ public nonisolated final class BlobStore: @unchecked Sendable {
             for fileURL in files {
                 let name = fileURL.lastPathComponent
                 guard name.hasSuffix(".bin") else { continue }
-                refs.insert(String(name.dropLast(4)))
+                found.append(String(name.dropLast(4)))
             }
         }
+        registerMany(found)
     }
 
     /// First two characters of the hash part of a ref. Refs are either

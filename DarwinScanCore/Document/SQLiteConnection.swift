@@ -11,7 +11,7 @@ import SQLite3
 /// is leased to exactly one caller at a time). The per-connection JSON coders
 /// are safe for the same reason — they're only ever touched by the one thread
 /// currently holding the connection, so concurrent readers never share a coder.
-final class SQLiteConnection: @unchecked Sendable {
+nonisolated final class SQLiteConnection: @unchecked Sendable {
     let handle: OpaquePointer
     let readOnly: Bool
     private var cache: [String: OpaquePointer] = [:]

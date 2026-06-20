@@ -66,6 +66,11 @@ public nonisolated enum DyldCachedImageInspector {
         // `mappedIfSafe` keeps pages lazy: we only resident-fault the
         // bytes we actually read.
         private var mapped: [URL: Data] = [:]
+        // Guards `mapped`. Resolved once per image (not per symbol), so the
+        // lock is taken a few thousand times across a whole cache — negligible
+        // — while making the `@unchecked Sendable` promise real for any
+        // concurrent per-image extraction.
+        private let mapLock = NSLock()
 
         public init(layout: DyldCacheLayout) {
             self.layout = layout
@@ -114,6 +119,7 @@ public nonisolated enum DyldCachedImageInspector {
         }
 
         private func ensureMapped(url: URL) -> Data? {
+            mapLock.lock(); defer { mapLock.unlock() }
             if let cached = mapped[url] { return cached }
             // mmap rather than read — a /System dyld_shared_cache linkedit
             // subcache is 200-600 MB and we only touch the string

@@ -613,44 +613,91 @@ public actor AnalysisWorker {
         progress.itemsFound = total
         await progressSink(progress)
 
-        // Single bounded query pulls just the IDs (16 B/item). Each item
-        // payload is fetched on demand and goes out of scope right after
-        // processing — never more than one ScanItem in memory at a time.
+        // Bounded query pulls just the IDs (16 B/item).
         let ids = (try? database.orderedItemIDs(inSnapshot: snapshotID)) ?? []
 
         var processed = 0
         var lastEmit = Date()
         let emitInterval: TimeInterval = 0.15
 
-        for id in ids {
-            if Task.isCancelled { break }
-            guard let item = (try? database.item(id: id)) else { continue }
-            let output = pipeline.analyze(item: item)
-            // One transaction per item (clear + upsert + stamp + symbols +
-            // additional items) instead of four-plus separate COMMITs.
-            try? database.applyAnalysis(
-                item: output.item,
-                symbols: output.symbols,
-                additionalItems: output.additionalItems,
-                additionalSymbols: output.additionalSymbols,
-                snapshotID: snapshotID,
-                analyzedAt: Date(),
-                analyzerVersion: Database.currentAnalyzerVersion
-            )
-            processed += 1
-            progress.filesInspected = processed
-            progress.perCategoryCounts[output.item.category, default: 0] += 1
-            let n = Date()
-            if n.timeIntervalSince(lastEmit) >= emitInterval {
-                lastEmit = n
-                progress.inFlightPaths = [item.path]
-                await progressSink(progress)
+        // Analyze items concurrently. The CPU/IO-heavy part — reading the
+        // item, parsing Mach-O, extracting symbols/strings — runs across
+        // `maxConcurrent` tasks on pooled reader connections; the writes
+        // (`applyAnalysis`) serialize internally on the single writer. Progress
+        // aggregation stays here on the actor, so no shared mutable state
+        // crosses task boundaries. Memory stays bounded: at most
+        // `maxConcurrent` items (plus their outputs) are ever in flight.
+        await withTaskGroup(of: AnalyzedSummary?.self) { group in
+            var iterator = ids.makeIterator()
+            var primed = 0
+            while primed < maxConcurrent, let id = iterator.next() {
+                let itemID = id
+                group.addTask {
+                    Self.analyzeOne(itemID, pipeline: pipeline, database: database, snapshotID: snapshotID)
+                }
+                primed += 1
+            }
+
+            while let summary = await group.next() {
+                if let summary {
+                    processed += 1
+                    progress.filesInspected = processed
+                    progress.perCategoryCounts[summary.category, default: 0] += 1
+                    let n = Date()
+                    if n.timeIntervalSince(lastEmit) >= emitInterval {
+                        lastEmit = n
+                        progress.inFlightPaths = [summary.path]
+                        await progressSink(progress)
+                    }
+                }
+                // Keep the window full until the input is drained or cancelled.
+                if !Task.isCancelled, let id = iterator.next() {
+                    let itemID = id
+                    group.addTask {
+                        Self.analyzeOne(itemID, pipeline: pipeline, database: database, snapshotID: snapshotID)
+                    }
+                }
             }
         }
+
         progress.phase = .done
         progress.inFlightPaths = []
         await progressSink(progress)
     }
+
+    /// Read, analyze, and persist one item. Pure with respect to the worker's
+    /// own state (it returns a small summary for progress), so it is safe to
+    /// run on many tasks at once: reads use the database's reader pool, the
+    /// write serializes on the single writer, and the inspectors hold no
+    /// shared mutable state. `nonisolated` so it runs off the actor/MainActor.
+    private nonisolated static func analyzeOne(
+        _ id: UUID,
+        pipeline: AnalysisPipeline,
+        database: Database,
+        snapshotID: Int64
+    ) -> AnalyzedSummary? {
+        if Task.isCancelled { return nil }
+        guard let item = try? database.item(id: id) else { return nil }
+        let output = pipeline.analyze(item: item)
+        // One transaction per item (clear + upsert + stamp + symbols +
+        // additional items) instead of four-plus separate COMMITs.
+        try? database.applyAnalysis(
+            item: output.item,
+            symbols: output.symbols,
+            additionalItems: output.additionalItems,
+            additionalSymbols: output.additionalSymbols,
+            snapshotID: snapshotID,
+            analyzedAt: Date(),
+            analyzerVersion: Database.currentAnalyzerVersion
+        )
+        return AnalyzedSummary(category: output.item.category, path: item.path)
+    }
+}
+
+/// Minimal per-item result carried back to the worker for progress.
+private nonisolated struct AnalyzedSummary: Sendable {
+    let category: ItemCategory
+    let path: String
 }
 
 // MARK: - Reference data
