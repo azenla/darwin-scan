@@ -109,6 +109,14 @@ public nonisolated struct FileWalker: Sendable {
         var stack: [URL] = [root]
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey, .isAliasFileKey]
 
+        // Canonical paths of symlink targets we've already queued for descent.
+        // Without this, a symlink cycle (`a -> b`, `b -> a`) or a directory
+        // symlink pointing at an ancestor loops forever, and benign symlink
+        // fan-out (e.g. framework `Versions/Current`) re-traverses the same
+        // subtree repeatedly. We only track *followed* targets, so the common
+        // no-symlink walk pays nothing.
+        var visitedLinkTargets: Set<String> = []
+
         while let current = stack.popLast() {
             let path = current.path
             if isExcluded(path) { continue }
@@ -127,8 +135,12 @@ public nonisolated struct FileWalker: Sendable {
                     || path == "/System/Cryptexes/ExclaveOS"
                 if isCryptexLink || options.followSymlinks {
                     let resolved = current.resolvingSymlinksInPath()
-                    stack.append(resolved)
                     yield(current)
+                    // Descend only if we haven't already queued this real
+                    // target via another symlink (cycle / fan-out guard).
+                    if visitedLinkTargets.insert(resolved.standardizedFileURL.path).inserted {
+                        stack.append(resolved)
+                    }
                     continue
                 }
                 // Plain old symlink — yield it as evidence but don't descend.
