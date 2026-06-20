@@ -510,8 +510,13 @@ public nonisolated struct AnalysisPipeline: Sendable {
     private func indexStringsBlob(database: Database, itemID: UUID, itemPath: String, ref: String) {
         let url = blobStore.blobURL(forRef: ref)
         guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
-              !data.isEmpty,
-              let text = String(data: data, encoding: .utf8) else { return }
+              !data.isEmpty else { return }
+        // Decode lossily: a strings dump routinely contains bytes that aren't
+        // valid UTF-8 (Latin-1 fragments, embedded binary). `String(data:
+        // encoding: .utf8)` returns nil on the *first* bad byte, which
+        // silently dropped the entire strings index for an item. Replacing
+        // invalid sequences with U+FFFD keeps every searchable run.
+        let text = String(decoding: data, as: UTF8.self)
         try? database.indexStrings(itemID: itemID, itemPath: itemPath, content: text)
     }
 
@@ -544,7 +549,13 @@ public nonisolated struct AnalysisPipeline: Sendable {
             || (path.hasPrefix("/usr/bin/") && WellKnownAppleBinaries.contains((path as NSString).lastPathComponent))
     }
     private func readShebang(_ url: URL) -> ScriptInfo? {
-        guard let head = try? FileHandle(forReadingFrom: url).read(upToCount: 256), head.count >= 2 else { return nil }
+        // Bind the handle so `defer` can close it — the previous one-liner
+        // (`FileHandle(...).read(...)`) leaked a descriptor for every file
+        // that wasn't a richer type, exhausting RLIMIT_NOFILE partway through
+        // a /System analysis pass (after which every open silently fails).
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 256), head.count >= 2 else { return nil }
         guard head[0] == 0x23, head[1] == 0x21 else { return nil }
         guard let nl = head.firstIndex(of: 0x0A) else { return nil }
         let interp = String(data: head[2..<nl], encoding: .utf8)?.trimmingCharacters(in: .whitespaces)
@@ -615,24 +626,17 @@ public actor AnalysisWorker {
             if Task.isCancelled { break }
             guard let item = (try? database.item(id: id)) else { continue }
             let output = pipeline.analyze(item: item)
-            try? database.clearAnalysisOutputForItem(item.id)
-            try? database.upsertItem(output.item)
-            try? database.setItemAnalysisState(
-                itemID: item.id,
-                state: .done,
+            // One transaction per item (clear + upsert + stamp + symbols +
+            // additional items) instead of four-plus separate COMMITs.
+            try? database.applyAnalysis(
+                item: output.item,
+                symbols: output.symbols,
+                additionalItems: output.additionalItems,
+                additionalSymbols: output.additionalSymbols,
+                snapshotID: snapshotID,
                 analyzedAt: Date(),
                 analyzerVersion: Database.currentAnalyzerVersion
             )
-            if !output.symbols.isEmpty {
-                try? database.insertSymbols(output.symbols)
-            }
-            for extra in output.additionalItems {
-                try? database.upsertItem(extra)
-                try? database.addItemsToSnapshot(snapshotID: snapshotID, itemIDs: [extra.id])
-            }
-            if !output.additionalSymbols.isEmpty {
-                try? database.insertSymbols(output.additionalSymbols)
-            }
             processed += 1
             progress.filesInspected = processed
             progress.perCategoryCounts[output.item.category, default: 0] += 1

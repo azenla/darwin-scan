@@ -75,12 +75,29 @@ public nonisolated enum DyldCachedImageInspector {
         /// subcache file backing the image whose `__LINKEDIT` segment
         /// lives at VM address `linkeditVMAddress`. `stroff` is the
         /// `LC_SYMTAB.stroff` field (a file offset within that subcache).
-        public func lookup(linkeditVMAddress: UInt64, stroff: UInt64, nameOffset: Int) -> String? {
+        /// Resolve (and memory-map, once) the subcache file that backs the
+        /// `__LINKEDIT` at `vm`. Callers reading many symbols from one image
+        /// should resolve this **once** and read with `readString(in:…)`,
+        /// rather than calling `lookup` per symbol — `locate` is an O(subcaches
+        /// × mappings) scan and the per-symbol form repeats it tens of
+        /// thousands of times per image.
+        public func mappedData(forLinkeditVMAddress vm: UInt64) -> Data? {
+            guard let loc = layout.locate(vmAddress: vm) else { return nil }
+            return ensureMapped(url: loc.url)
+        }
+
+        /// Read a null-terminated C string at `stroff + nameOffset` from an
+        /// already-resolved string-table `data`.
+        public static func readString(in data: Data, stroff: UInt64, nameOffset: Int) -> String? {
             guard nameOffset > 0 else { return nil }
-            guard let loc = layout.locate(vmAddress: linkeditVMAddress) else { return nil }
-            guard let data = ensureMapped(url: loc.url) else { return nil }
-            let absoluteOffset = Int(stroff) + nameOffset
-            guard absoluteOffset > 0, absoluteOffset < data.count else { return nil }
+            // `stroff` is taken verbatim from the image's LC_SYMTAB and is
+            // therefore attacker-controlled in a malformed cache. Compute the
+            // absolute offset with overflow-checked UInt64 math — `Int(stroff)`
+            // would trap for stroff > Int.max, and `Int + Int` traps on
+            // overflow *before* any range guard could reject it.
+            let (sum, overflowed) = stroff.addingReportingOverflow(UInt64(nameOffset))
+            guard !overflowed, sum < UInt64(data.count) else { return nil }
+            let absoluteOffset = Int(sum)
             let base = data.startIndex.advanced(by: absoluteOffset)
             var end = base
             let dataEnd = data.endIndex
@@ -89,6 +106,11 @@ public nonisolated enum DyldCachedImageInspector {
             }
             if base == end { return nil }
             return String(data: data[base..<end], encoding: .utf8)
+        }
+
+        public func lookup(linkeditVMAddress: UInt64, stroff: UInt64, nameOffset: Int) -> String? {
+            guard let data = mappedData(forLinkeditVMAddress: linkeditVMAddress) else { return nil }
+            return Self.readString(in: data, stroff: stroff, nameOffset: nameOffset)
         }
 
         private func ensureMapped(url: URL) -> Data? {
@@ -278,6 +300,12 @@ public nonisolated enum DyldCachedImageInspector {
         // and use symoff/stroff verbatim as offsets within it.
         guard let linkeditLoc = layout.locate(vmAddress: linkeditVMAddress) else { return [] }
 
+        // Resolve + map the string table once for the whole image. The old
+        // per-symbol `sharedStrtab.lookup` re-ran `locate` (an O(subcaches ×
+        // mappings) scan) and a dictionary lookup for every one of the image's
+        // tens of thousands of symbols.
+        guard let strtabData = sharedStrtab.mappedData(forLinkeditVMAddress: linkeditVMAddress) else { return [] }
+
         let nsymsCapped = min(fields.nsyms, limits.maxSymbols)
         let nlistBytesNeeded = nsymsCapped * 16
 
@@ -301,8 +329,8 @@ public nonisolated enum DyldCachedImageInspector {
             let n_desc = nlists.readUInt16LE(at: base + 6)
             if (n_type & N_STAB) != 0 { continue }
             if (n_type & N_EXT) == 0 { continue }
-            guard let name = sharedStrtab.lookup(
-                linkeditVMAddress: linkeditVMAddress,
+            guard let name = SharedStringTable.readString(
+                in: strtabData,
                 stroff: fields.stroff,
                 nameOffset: Int(n_strx)
             ), !name.isEmpty else { continue }

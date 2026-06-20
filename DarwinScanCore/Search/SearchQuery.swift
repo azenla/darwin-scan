@@ -365,12 +365,12 @@ public nonisolated struct SearchQuery: Equatable, Sendable {
             let hits: [UUID]
             switch f {
             case .symbol(let v):
-                let escaped = escapeFTSQuery(v) + "*"
-                let rows = (try? database.searchSymbols(query: escaped, limit: 5000)) ?? []
+                guard let q = ftsPrefixMatch(for: v) else { continue }
+                let rows = (try? database.searchSymbols(query: q, limit: 5000)) ?? []
                 hits = rows.map(\.itemID)
             case .strings(let v):
-                let escaped = escapeFTSQuery(v) + "*"
-                let rows = (try? database.searchStrings(query: escaped, limit: 5000)) ?? []
+                guard let q = ftsPrefixMatch(for: v) else { continue }
+                let rows = (try? database.searchStrings(query: q, limit: 5000)) ?? []
                 hits = rows.map(\.itemID)
             default:
                 continue
@@ -385,14 +385,24 @@ public nonisolated struct SearchQuery: Equatable, Sendable {
         return accumulated
     }
 
-    /// Wrap a user-supplied value in FTS5 quoted-phrase syntax so reserved
-    /// characters (`AND`, `OR`, `NOT`, `:`, `^`, `"`, parens) are treated
-    /// as literal text rather than operators. Anything containing double
-    /// quotes has them stripped — FTS5 has no escape syntax for them
-    /// inside a phrase.
-    private func escapeFTSQuery(_ value: String) -> String {
+    /// Build an FTS5 prefix-match MATCH expression for a user-supplied value,
+    /// or `nil` when the value has no tokenizable content (empty, whitespace,
+    /// or punctuation-only).
+    ///
+    /// Wrapping the value in a double-quoted phrase makes reserved characters
+    /// (`AND`, `OR`, `NOT`, `:`, `^`, parens) literal; FTS5 has no escape for
+    /// an embedded double quote, so those are stripped. A trailing `*` turns
+    /// the last token into a prefix match (`"NSURL"*` matches `NSURLSession` —
+    /// verified against FTS5).
+    ///
+    /// Returning `nil` for no-token input is the important part: an empty or
+    /// punctuation-only MATCH matches zero rows, and the caller *intersects*
+    /// FTS results into the allowed-id set — so a stray `symbol:` would
+    /// otherwise blank the entire list. The caller skips the filter instead.
+    private func ftsPrefixMatch(for value: String) -> String? {
         let cleaned = value.replacingOccurrences(of: "\"", with: "")
-        return "\"\(cleaned)\""
+        guard cleaned.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
+        return "\"\(cleaned)\"*"
     }
 }
 

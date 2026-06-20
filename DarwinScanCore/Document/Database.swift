@@ -121,6 +121,10 @@ public nonisolated final class Database: @unchecked Sendable {
         try execRaw("PRAGMA foreign_keys=OFF;")
         try execRaw("PRAGMA temp_store=MEMORY;")
         try execRaw("PRAGMA cache_size=-32000;")
+        // Memory-map up to 256 MB. The workload is overwhelmingly reads from a
+        // BLOB-heavy store (payload JSON, symbols, FTS indexes); mmap serves
+        // those pages without a read() syscall + buffer copy per page.
+        try execRaw("PRAGMA mmap_size=268435456;")
 
         try runDDL()
         try prepareStatements()
@@ -176,6 +180,16 @@ public nonisolated final class Database: @unchecked Sendable {
         analyzerVersion: String?
     ) throws {
         os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        try stampAnalysisLocked(itemID: itemID, state: state, analyzedAt: analyzedAt, analyzerVersion: analyzerVersion)
+    }
+
+    /// Stamp an item's analysis state. Caller must hold `lock`.
+    private func stampAnalysisLocked(
+        itemID: UUID,
+        state: AnalysisState,
+        analyzedAt: Date?,
+        analyzerVersion: String?
+    ) throws {
         try bindAndStep(stmts.updateItemAnalysis, label: "updateItemAnalysis") { stmt in
             sqlite3_bind_text(stmt, 1, state.rawValue, -1, SQLITE_TRANSIENT)
             if let analyzedAt {
@@ -216,14 +230,61 @@ public nonisolated final class Database: @unchecked Sendable {
     /// a previous analysis doesn't accumulate.
     public func clearAnalysisOutputForItem(_ itemID: UUID) throws {
         os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
-        let key = itemID.uuidString.lowercased()
         try beginTransaction()
         do {
-            try bindAndStep(stmts.deleteTagsForItem, label: "delTags") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
-            try bindAndStep(stmts.deleteArchsForItem, label: "delArchs") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
-            try bindAndStep(stmts.deleteRelsForItem, label: "delRels") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
-            try bindAndStep(stmts.deleteSymbolsForItem, label: "delSymbols") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
-            try bindAndStep(stmts.deleteStringsFTSForItem, label: "delStrFTS") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+            try clearAnalysisOutputLocked(key: itemID.uuidString.lowercased())
+            try commitTransaction()
+        } catch {
+            try? rollbackTransaction()
+            throw error
+        }
+    }
+
+    /// Drop analysis-derived rows for `key` (lowercased item UUID). Caller
+    /// must hold `lock` and an open transaction.
+    private func clearAnalysisOutputLocked(key: String) throws {
+        try bindAndStep(stmts.deleteTagsForItem, label: "delTags") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+        try bindAndStep(stmts.deleteArchsForItem, label: "delArchs") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+        try bindAndStep(stmts.deleteRelsForItem, label: "delRels") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+        try bindAndStep(stmts.deleteSymbolsForItem, label: "delSymbols") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+        try bindAndStep(stmts.deleteStringsFTSForItem, label: "delStrFTS") { sqlite3_bind_text($0, 1, key, -1, SQLITE_TRANSIENT) }
+    }
+
+    /// Apply one item's full analysis output in a **single** transaction:
+    /// clear stale analysis-derived rows, upsert the refined item, stamp its
+    /// analysis state, insert its symbols, then upsert + attach any additional
+    /// items the analyzer produced (with their own symbols).
+    ///
+    /// The analysis worker previously issued four-plus independent
+    /// transactions per item (clear, upsert, stamp, insertSymbols, …). Across
+    /// a /System-scale snapshot that is millions of COMMITs and WAL frames.
+    /// Batching per item into one transaction collapses that overhead and
+    /// makes each item's analysis atomic (a mid-item failure rolls back
+    /// cleanly instead of leaving half-applied output).
+    public func applyAnalysis(
+        item: ScanItem,
+        symbols: [SymbolRow],
+        additionalItems: [ScanItem],
+        additionalSymbols: [SymbolRow],
+        snapshotID: Int64,
+        analyzedAt: Date,
+        analyzerVersion: String
+    ) throws {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        try beginTransaction()
+        do {
+            try clearAnalysisOutputLocked(key: item.id.uuidString.lowercased())
+            try upsertItemLocked(item)
+            try stampAnalysisLocked(itemID: item.id, state: .done, analyzedAt: analyzedAt, analyzerVersion: analyzerVersion)
+            for row in symbols { try insertSymbolLocked(row) }
+            for extra in additionalItems {
+                try upsertItemLocked(extra)
+                try bindAndStep(stmts.insertSnapshotItem, label: "insertSnapshotItem") { stmt in
+                    sqlite3_bind_int64(stmt, 1, snapshotID)
+                    sqlite3_bind_text(stmt, 2, extra.id.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
+                }
+            }
+            for row in additionalSymbols { try insertSymbolLocked(row) }
             try commitTransaction()
         } catch {
             try? rollbackTransaction()
@@ -285,27 +346,30 @@ public nonisolated final class Database: @unchecked Sendable {
         os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         try beginTransaction()
         do {
-            for row in rows {
-                try bindAndStep(stmts.insertSymbol, label: "insertSymbol") { stmt in
-                    sqlite3_bind_text(stmt, 1, row.itemID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
-                    sqlite3_bind_text(stmt, 2, row.name, -1, SQLITE_TRANSIENT)
-                    if let d = row.demangled {
-                        sqlite3_bind_text(stmt, 3, d, -1, SQLITE_TRANSIENT)
-                    } else {
-                        sqlite3_bind_null(stmt, 3)
-                    }
-                    sqlite3_bind_text(stmt, 4, row.kind.rawValue, -1, SQLITE_TRANSIENT)
-                    if let ord = row.libraryOrdinal {
-                        sqlite3_bind_int(stmt, 5, Int32(ord))
-                    } else {
-                        sqlite3_bind_null(stmt, 5)
-                    }
-                }
-            }
+            for row in rows { try insertSymbolLocked(row) }
             try commitTransaction()
         } catch {
             try? rollbackTransaction()
             throw error
+        }
+    }
+
+    /// Insert one symbol row. Caller must hold `lock` and an open transaction.
+    private func insertSymbolLocked(_ row: SymbolRow) throws {
+        try bindAndStep(stmts.insertSymbol, label: "insertSymbol") { stmt in
+            sqlite3_bind_text(stmt, 1, row.itemID.uuidString.lowercased(), -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 2, row.name, -1, SQLITE_TRANSIENT)
+            if let d = row.demangled {
+                sqlite3_bind_text(stmt, 3, d, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(stmt, 3)
+            }
+            sqlite3_bind_text(stmt, 4, row.kind.rawValue, -1, SQLITE_TRANSIENT)
+            if let ord = row.libraryOrdinal {
+                sqlite3_bind_int64(stmt, 5, Int64(ord))
+            } else {
+                sqlite3_bind_null(stmt, 5)
+            }
         }
     }
 
