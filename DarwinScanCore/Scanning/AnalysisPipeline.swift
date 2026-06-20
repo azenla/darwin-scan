@@ -626,24 +626,17 @@ public actor AnalysisWorker {
             if Task.isCancelled { break }
             guard let item = (try? database.item(id: id)) else { continue }
             let output = pipeline.analyze(item: item)
-            try? database.clearAnalysisOutputForItem(item.id)
-            try? database.upsertItem(output.item)
-            try? database.setItemAnalysisState(
-                itemID: item.id,
-                state: .done,
+            // One transaction per item (clear + upsert + stamp + symbols +
+            // additional items) instead of four-plus separate COMMITs.
+            try? database.applyAnalysis(
+                item: output.item,
+                symbols: output.symbols,
+                additionalItems: output.additionalItems,
+                additionalSymbols: output.additionalSymbols,
+                snapshotID: snapshotID,
                 analyzedAt: Date(),
                 analyzerVersion: Database.currentAnalyzerVersion
             )
-            if !output.symbols.isEmpty {
-                try? database.insertSymbols(output.symbols)
-            }
-            for extra in output.additionalItems {
-                try? database.upsertItem(extra)
-                try? database.addItemsToSnapshot(snapshotID: snapshotID, itemIDs: [extra.id])
-            }
-            if !output.additionalSymbols.isEmpty {
-                try? database.insertSymbols(output.additionalSymbols)
-            }
             processed += 1
             progress.filesInspected = processed
             progress.perCategoryCounts[output.item.category, default: 0] += 1
