@@ -708,41 +708,49 @@ private struct LinkedLibraryRow: View {
     let sourceItem: ScanItem
     @Bindable var store: ScanStore
     @Binding var itemSelection: UUID?
+    // Resolved off the body pass (in `.task`) so a binary linking many dylibs
+    // doesn't fire N blocking @rpath-resolution SQL lookups during layout.
+    @State private var target: ItemHeader?
     var body: some View {
-        if let target = resolve(lib, source: sourceItem, store: store) {
-            Button {
-                itemSelection = target.id
-            } label: {
+        Group {
+            if let target {
+                Button {
+                    itemSelection = target.id
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "link.circle.fill")
+                            .foregroundStyle(.tint)
+                            .imageScale(.small)
+                        Text(lib)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if let ctx = target.context {
+                            Text(ctx)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                }
+                .buttonStyle(.plain)
+            } else {
                 HStack(spacing: 6) {
-                    Image(systemName: "link.circle.fill")
-                        .foregroundStyle(.tint)
+                    Image(systemName: "link")
+                        .foregroundStyle(.tertiary)
                         .imageScale(.small)
                     Text(lib)
                         .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if let ctx = target.context {
-                        Text(ctx)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
                     Spacer()
                 }
             }
-            .buttonStyle(.plain)
-        } else {
-            HStack(spacing: 6) {
-                Image(systemName: "link")
-                    .foregroundStyle(.tertiary)
-                    .imageScale(.small)
-                Text(lib)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer()
-            }
+        }
+        .task(id: lib) {
+            target = resolve(lib, source: sourceItem, store: store)
         }
     }
 
@@ -1288,8 +1296,11 @@ private struct RelationshipRow: View {
     let rel: Relationship
     @Bindable var store: ScanStore
     @Binding var itemSelection: UUID?
+    // Resolved off the synchronous body pass (in `.task`) so opening a detail
+    // view with many relationships doesn't fire N blocking SQL lookups during
+    // layout. Until it resolves the row shows the raw path.
+    @State private var target: ItemHeader?
     var body: some View {
-        let target = store.item(atPath: rel.targetPath)
         HStack(spacing: 6) {
             if let target {
                 Button {
@@ -1323,6 +1334,9 @@ private struct RelationshipRow: View {
                 Text(note).font(.caption2).foregroundStyle(.tertiary)
             }
             Spacer()
+        }
+        .task(id: rel.targetPath) {
+            target = store.item(atPath: rel.targetPath)
         }
     }
 }
