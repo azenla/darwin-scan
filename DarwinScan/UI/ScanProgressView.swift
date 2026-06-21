@@ -208,19 +208,7 @@ struct NewSnapshotSheet: View {
                 }
             }
 
-            GroupBox("Import") {
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Capture file bytes into bundle", isOn: $options.captureFiles)
-                    Text(options.captureFiles
-                         ? "Required for IPSW analysis and for re-running analysis later. Recommended."
-                         : "Skipping capture makes a smaller bundle but analysis can only run against the live filesystem.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            Text("Analysis is a separate step — after import you can run or re-run it from the toolbar. Two-phase model means you only pay capture cost once.")
+            Text("Import captures a copy of every file's bytes into the bundle, so analysis can run — and re-run — without the original source. Analysis is a separate step you can start or re-run from the toolbar; you only pay the capture cost once.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
 

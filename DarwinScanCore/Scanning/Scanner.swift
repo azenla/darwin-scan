@@ -9,8 +9,9 @@ import Observation
 ///   are no inspector calls in this phase. Bound to the in-flight snapshot
 ///   so cancelling discards just that snapshot.
 ///
-/// - **Analyze**: re-runs the inspectors against captured blob bytes (or
-///   live file paths for current-system imports where capture is off).
+/// - **Analyze**: re-runs the inspectors against captured blob bytes (falling
+///   back to the live file path only for the rare item with no captured blob,
+///   e.g. an empty file on a current-system import).
 ///   Refines category, populates per-category payloads, extracts symbols
 ///   and strings into FTS. Re-runnable on a finished snapshot or on a
 ///   single item.
@@ -287,12 +288,12 @@ public nonisolated struct ImportPipeline: Sendable {
         }
         guard isFile else { return nil }
 
-        // Hash + (optionally) capture the bytes. We always hash when
-        // captureFiles is on because the deterministic id needs sha256.
+        // Capture is always on — the scan must contain a copy of the bytes.
+        // We always hash because the deterministic id needs sha256.
         let sha: String?
         var refs: [String] = []
         var fileBlobRef: String? = nil
-        let shouldCapture = options.captureFiles && size > 0 && size <= options.maxCaptureFileSize
+        let shouldCapture = size > 0
         if shouldCapture {
             // Single pass: hash the bytes *while* writing them to the blob
             // store, instead of one full read to hash and a second full read
@@ -307,12 +308,9 @@ public nonisolated struct ImportPipeline: Sendable {
                 // identity if the file is at least readable.
                 sha = Hash.sha256(of: url)
             }
-        } else if options.hashFiles || options.captureFiles {
-            // Not capturing (disabled, empty file, or over the cap) but the
-            // identity still needs a hash.
-            sha = Hash.sha256(of: url)
         } else {
-            sha = nil
+            // Empty file — no blob ref, but the identity still needs a hash.
+            sha = Hash.sha256(of: url)
         }
 
         let item = ScanItem(

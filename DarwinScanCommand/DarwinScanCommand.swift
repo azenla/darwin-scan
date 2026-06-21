@@ -67,12 +67,6 @@ struct Import: AsyncParsableCommand {
     @Option(name: [.long, .customShort("x")], parsing: .upToNextOption, help: "Path prefixes to exclude.")
     var exclude: [String] = []
 
-    @Flag(name: .long, inversion: .prefixedNo, help: "Capture file bytes into the bundle (default on; required for IPSW analysis).")
-    var captureFiles: Bool = true
-
-    @Option(name: .long, help: "Maximum file size (bytes) that --capture-files will pull in.")
-    var maxCaptureFileSize: Int64 = 256 * 1024 * 1024
-
     @Flag(name: .long, help: "Run analysis automatically after import completes.")
     var thenAnalyze: Bool = false
 
@@ -89,8 +83,6 @@ struct Import: AsyncParsableCommand {
         var options = ScanOptions()
         if !roots.isEmpty   { options.roots = roots }
         if !exclude.isEmpty { options.excludedPrefixes = exclude }
-        options.captureFiles = captureFiles
-        options.maxCaptureFileSize = maxCaptureFileSize
 
         let source: any SourceProvider
         if let ipsw = self.ipsw {

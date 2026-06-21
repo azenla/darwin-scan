@@ -2,9 +2,9 @@ import Foundation
 import SQLite3
 
 /// Reconstructs the original system tree from a `.darwinscan` bundle's
-/// captured file blobs. The bundle must have been produced with
-/// `--capture-files`; items without a `fileBlobRef` are skipped (we know the
-/// path but not the bytes).
+/// captured file blobs. Capture is always on at import, so every non-empty
+/// regular file has a blob; items without a `fileBlobRef` (zero-byte files)
+/// are skipped (we know the path but there are no bytes to write).
 ///
 /// ## Output layout
 ///

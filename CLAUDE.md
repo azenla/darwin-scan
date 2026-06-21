@@ -19,7 +19,8 @@ Scanning is split into two independent phases:
    No inspectors run here.
 2. **Analyze** (re-runnable). Iterates a snapshot's items, runs the
    inspectors against captured blob bytes (preferred) or the live
-   filesystem (fallback for current-system imports without capture).
+   filesystem (fallback for items with no captured blob, e.g. zero-byte
+   files on a current-system import).
    Refines category, populates per-category payloads, symbols, strings,
    relationships. Idempotent — running again wipes stale output and
    re-applies. Records `analyzed_at` + `analyzer_version` per item and

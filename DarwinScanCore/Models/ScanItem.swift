@@ -87,9 +87,10 @@ public nonisolated struct ScanItem: Codable, Identifiable, Hashable, Sendable {
     public var owningBundlePath: String?
 
     /// Optional content-addressed reference to the original file bytes, copied
-    /// verbatim into the blob store. Populated when `ScanOptions.captureFiles`
-    /// is on. Lets a future `darwin-scan extract` reconstruct the source tree
-    /// from a `.darwinscan` bundle.
+    /// verbatim into the blob store. Populated for every non-empty regular file
+    /// (zero-byte files get none — there are no bytes to capture). Lets
+    /// `darwin-scan extract` reconstruct the source tree from a `.darwinscan`
+    /// bundle.
     public var fileBlobRef: String?
 
     // Discriminated payload — exactly one is populated to match `category`.
