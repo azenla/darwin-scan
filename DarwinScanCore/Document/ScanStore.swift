@@ -419,6 +419,58 @@ public nonisolated final class ScanStore {
         forEachHeader(category: nil, body)
     }
 
+    // MARK: - File browser
+
+    /// Immediate children (subdirectories + files) of a directory path in the
+    /// active snapshot. Backed by `Database.childrenOfDirectory` (a loose-index
+    /// skip scan), so expanding even a wide root stays cheap. Pass "" for the
+    /// filesystem root.
+    public func directoryChildren(of directory: String) -> [DirectoryEntry] {
+        guard let database, let snapshotID = activeSnapshotID else { return [] }
+        return (try? database.childrenOfDirectory(directory, inSnapshot: snapshotID)) ?? []
+    }
+
+    /// Errors surfaced by `exportItem(_:to:)`.
+    public enum ExportError: Error, CustomStringConvertible {
+        case noCapturedBytes(String)
+        case blobMissing(String)
+
+        public var description: String {
+            switch self {
+            case .noCapturedBytes(let path):
+                return "\(path) has no captured bytes (zero-byte file)."
+            case .blobMissing(let ref):
+                return "The captured blob \(ref) is missing from the bundle."
+            }
+        }
+    }
+
+    /// Copy a single captured file's bytes out of the content-addressed blob
+    /// store to `destination` on disk, preserving the recorded mtime and (for
+    /// executables) the +x bit. Mirrors what `Extract` does per file. Throws if
+    /// the item has no captured blob. Synchronous and `nonisolated` — call it
+    /// off the main actor for large files.
+    public func exportItem(_ header: ItemHeader, to destination: URL) throws {
+        guard let ref = header.fileBlobRef else { throw ExportError.noCapturedBytes(header.path) }
+        let source = blobStore.blobURL(forRef: ref)
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: source.path) else { throw ExportError.blobMissing(ref) }
+        if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+        try fm.copyItem(at: source, to: destination)
+        if let mtime = header.modifiedAt {
+            try? fm.setAttributes([.modificationDate: mtime], ofItemAtPath: destination.path)
+        }
+        if header.category == .executable {
+            let attrs = (try? fm.attributesOfItem(atPath: destination.path)) ?? [:]
+            if let perm = attrs[.posixPermissions] as? NSNumber {
+                try? fm.setAttributes(
+                    [.posixPermissions: NSNumber(value: perm.uint16Value | 0o111)],
+                    ofItemAtPath: destination.path
+                )
+            }
+        }
+    }
+
     // MARK: - Counts façade
 
     public func counts() -> [ItemCategory: Int] { categoryCounts }

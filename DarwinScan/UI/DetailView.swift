@@ -200,6 +200,16 @@ private struct HeaderCard: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .help("Run analysis on just this item — useful when developing new inspectors.")
+                if item.fileBlobRef != nil {
+                    Button {
+                        exportItem()
+                    } label: {
+                        Label("Export…", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Export this file's captured bytes out of the bundle.")
+                }
                 Spacer()
                 AnalysisStateChip(state: item.analysisState, analyzedAt: item.analyzedAt)
             }
@@ -210,6 +220,31 @@ private struct HeaderCard: View {
                 .fill(Color(nsColor: .windowBackgroundColor))
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.separator, lineWidth: 0.5))
         )
+    }
+
+    private func exportItem() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = item.name
+        panel.canCreateDirectories = true
+        panel.title = "Export File"
+        panel.message = "Export \(item.path) from the snapshot."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let store = self.store
+        let header = ItemHeader(from: item)
+        Task {
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try store.exportItem(header, to: url)
+                }.value
+            } catch {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Export failed"
+                alert.informativeText = (error as? CustomStringConvertible)?.description
+                    ?? error.localizedDescription
+                alert.runModal()
+            }
+        }
     }
 
     @ViewBuilder private var iconView: some View {

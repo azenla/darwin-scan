@@ -877,6 +877,88 @@ public nonisolated final class Database: @unchecked Sendable {
         }
     }
 
+    /// Immediate children — subdirectories and files — of a directory path
+    /// within a snapshot, for the file browser.
+    ///
+    /// Items never store directories (the scanner captures regular files only),
+    /// so a child directory is *inferred* from the first path component shared
+    /// by its descendants. To avoid scanning a wide root's entire subtree on
+    /// every expand (a `/System` expand would otherwise touch hundreds of
+    /// thousands of rows just to list ~20 children), this is a **loose-index
+    /// (skip) scan**: each iteration seeks the smallest descendant path with
+    /// `LIMIT 1` off `items_path_idx`, classifies its first component, then
+    /// jumps the cursor past that component's whole subtree. Cost is one index
+    /// seek per child, not per descendant.
+    ///
+    /// `directory` is an absolute path; pass "" (or "/") for the filesystem
+    /// root, which yields the top-level roots (`/System`, `/usr`, …).
+    public func childrenOfDirectory(_ directory: String, inSnapshot snapshotID: Int64) throws -> [DirectoryEntry] {
+        // Normalise to a base prefix ending in "/". Root ("" or "/") → "/".
+        let normalized: String = {
+            if directory.isEmpty || directory == "/" { return "" }
+            return directory.hasSuffix("/") ? String(directory.dropLast()) : directory
+        }()
+        let base = normalized.isEmpty ? "/" : normalized + "/"
+        // Upper bound for the subtree: swap the trailing "/" (0x2F) for "0"
+        // (0x30), the next code point. Every path under `base` is < `upper`,
+        // and `upper` sits just past the subtree, so [base, upper) is exactly
+        // base's descendants. (Root: base "/" → upper "0", which bounds all
+        // absolute paths since "/" < "0".)
+        let upper = String(base.dropLast()) + "0"
+
+        return try withReader { conn in
+            // INDEXED BY pins the path-index plan: range + ORDER BY satisfied by
+            // the index, membership resolved by the snapshot_items PK probe. The
+            // alternative plan (drive from snapshot_id) would rescan the whole
+            // snapshot per seek and defeat the skip scan entirely.
+            let sql = """
+                SELECT \(Self.headerColumns)
+                FROM items i INDEXED BY items_path_idx
+                JOIN snapshot_items si ON si.item_id = i.id
+                WHERE si.snapshot_id = ? AND i.path >= ? AND i.path < ?
+                ORDER BY i.path
+                LIMIT 1;
+                """
+            var dirs: [DirectoryEntry] = []
+            var files: [DirectoryEntry] = []
+            var seenDirs = Set<String>()
+            var cursor = base
+
+            while true {
+                let stmt = try conn.prepared(sql)
+                sqlite3_bind_int64(stmt, 1, snapshotID)
+                sqlite3_bind_text(stmt, 2, cursor, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(stmt, 3, upper, -1, SQLITE_TRANSIENT)
+                guard sqlite3_step(stmt) == SQLITE_ROW,
+                      let header = Self.hydrateHeader(stmt: stmt) else { break }
+                let path = header.path
+                guard path.hasPrefix(base) else { break }
+                let rest = path.dropFirst(base.count)
+                if let slash = rest.firstIndex(of: "/") {
+                    // A descendant deeper than this level → its first component
+                    // is a child directory. Record it and skip its whole
+                    // subtree (everything under "<dirPath>/" sorts before
+                    // "<dirPath>0").
+                    let name = String(rest[..<slash])
+                    let dirPath = base + name
+                    if seenDirs.insert(name).inserted {
+                        dirs.append(.directory(name: name, path: dirPath))
+                    }
+                    cursor = dirPath + "0"
+                } else {
+                    // A file directly in this directory. Advance just past it
+                    // (append a low byte so the next seek is strictly greater).
+                    files.append(.file(header))
+                    cursor = path + "\u{01}"
+                }
+            }
+
+            dirs.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            files.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            return dirs + files
+        }
+    }
+
     /// Headers that reference a given path via an outgoing relationship — the
     /// "Referenced By" panel. Bounded by `limit`, plus an unbounded count.
     public func headersReferencing(path: String, inSnapshot snapshotID: Int64, limit: Int) throws -> (total: Int, headers: [ItemHeader]) {
@@ -1555,6 +1637,47 @@ public nonisolated enum AnalysisState: String, Codable, Sendable, Hashable, Case
     case running   // snapshot only: analyzer currently working through this snapshot
     case done      // all members analyzed at current analyzer version
     case failed    // analysis attempted but errored
+}
+
+/// One entry in a directory listing produced by
+/// `Database.childrenOfDirectory(_:inSnapshot:)` — either an inferred
+/// subdirectory (no item backs it; the scanner stores files only) or a file
+/// (carrying its full `ItemHeader`).
+public nonisolated enum DirectoryEntry: Sendable, Hashable, Identifiable {
+    case directory(name: String, path: String)
+    case file(ItemHeader)
+
+    public var id: String {
+        switch self {
+        case .directory(_, let path): return "d:\(path)"
+        case .file(let header):       return "f:\(header.id.uuidString)"
+        }
+    }
+
+    public var name: String {
+        switch self {
+        case .directory(let name, _): return name
+        case .file(let header):       return header.name
+        }
+    }
+
+    public var path: String {
+        switch self {
+        case .directory(_, let path): return path
+        case .file(let header):       return header.path
+        }
+    }
+
+    public var isDirectory: Bool {
+        if case .directory = self { return true }
+        return false
+    }
+
+    /// The file's header, or nil for a directory.
+    public var header: ItemHeader? {
+        if case .file(let header) = self { return header }
+        return nil
+    }
 }
 
 public nonisolated struct SnapshotRecord: Sendable, Hashable, Identifiable {

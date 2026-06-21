@@ -185,6 +185,83 @@ struct DatabaseTests {
         #expect((counts[.executable] ?? 0) == seeded.count)
     }
 
+    /// The file-browser skip scan: inferred subdirectories, sibling files that
+    /// sort *before* a same-named directory's subtree (the boundary edge case),
+    /// trailing-slash normalisation, and snapshot scoping.
+    @Test func fileBrowserChildrenSkipScan() throws {
+        let (db, url) = try makeTempDB()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let snap = try db.insertSnapshot(
+            parentID: nil, label: nil, sourceKind: .currentSystem,
+            sourceRef: nil, startedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let other = try db.insertSnapshot(
+            parentID: nil, label: nil, sourceKind: .currentSystem,
+            sourceRef: nil, startedAt: Date(timeIntervalSince1970: 1_700_000_001)
+        )
+
+        func mk(_ path: String, size: Int64 = 0) -> ScanItem {
+            ScanItem(
+                id: UUID(), path: path, name: (path as NSString).lastPathComponent,
+                category: .other, size: size, modifiedAt: nil,
+                insideBundle: false, owningBundlePath: nil
+            )
+        }
+        let items = [
+            mk("/usr/bin/cat"),
+            mk("/usr/bin/ls", size: 42),
+            mk("/usr/lib.foo"),                 // sibling FILE that sorts before /usr/lib/…
+            mk("/usr/lib/foo/bar.dylib"),
+            mk("/usr/lib/libSystem.dylib", size: 1024),
+            mk("/usr/local/bin/brew"),
+            mk("/bin/sh"),
+            mk("/System/Library/Frameworks/Foo.framework/Foo"),
+        ]
+        try db.upsertItems(items)
+        try db.addItemsToSnapshot(snapshotID: snap, itemIDs: items.map(\.id))
+
+        // Lives only in the *other* snapshot — must never surface for `snap`.
+        let opt = mk("/opt/weird/thing")
+        try db.upsertItem(opt)
+        try db.addItemsToSnapshot(snapshotID: other, itemIDs: [opt.id])
+
+        func names(_ dir: String) throws -> [String] {
+            try db.childrenOfDirectory(dir, inSnapshot: snap).map(\.name)
+        }
+        func dirNames(_ dir: String) throws -> [String] {
+            try db.childrenOfDirectory(dir, inSnapshot: snap).filter(\.isDirectory).map(\.name)
+        }
+        func fileNames(_ dir: String) throws -> [String] {
+            try db.childrenOfDirectory(dir, inSnapshot: snap).filter { !$0.isDirectory }.map(\.name)
+        }
+
+        // Root: only top-level directories, case-insensitively sorted, scoped
+        // to this snapshot (no /opt from the other snapshot).
+        #expect(try names("") == ["bin", "System", "usr"])
+        #expect(try names("/") == ["bin", "System", "usr"])
+
+        // /usr: directories first (bin, lib, local), then the sibling file.
+        #expect(try dirNames("/usr") == ["bin", "lib", "local"])
+        #expect(try fileNames("/usr") == ["lib.foo"])
+
+        // /usr/lib: subdir `foo` is inferred from its descendant; the sibling
+        // file /usr/lib.foo must NOT leak in despite sorting adjacent.
+        #expect(try dirNames("/usr/lib") == ["foo"])
+        #expect(try fileNames("/usr/lib") == ["libSystem.dylib"])
+
+        // Leaf directory of plain files; trailing slash normalised.
+        #expect(try names("/usr/bin") == ["cat", "ls"])
+        #expect(try names("/usr/bin/") == ["cat", "ls"])
+
+        // File entries carry their header (size travels through).
+        let libSystem = try db.childrenOfDirectory("/usr/lib", inSnapshot: snap)
+            .first { $0.name == "libSystem.dylib" }
+        #expect(libSystem?.header?.size == 1024)
+
+        // A file path has no children.
+        #expect(try names("/usr/bin/ls").isEmpty)
+    }
+
     @Test func metaCodableRoundTrip() throws {
         let (db, url) = try makeTempDB()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }

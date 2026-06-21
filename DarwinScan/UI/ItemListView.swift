@@ -32,6 +32,7 @@ struct ItemListView: View {
         switch selection {
         case .systemInfo:        return nil
         case .allItems:          return nil
+        case .fileBrowser:       return nil
         case .category(let c):   return c
         case .snapshot:          return nil
         }
@@ -44,6 +45,8 @@ struct ItemListView: View {
                 ScrollView { SystemInfoView(store: store) }
             case .snapshot(let id):
                 ScrollView { SnapshotDetailView(store: store, snapshotID: id) }
+            case .fileBrowser:
+                FileBrowserView(store: store, itemSelection: $itemSelection)
             default:
                 VStack(spacing: 0) {
                     if !displayedFilters.isEmpty {
@@ -111,12 +114,14 @@ struct ItemListView: View {
         switch selection {
         case .systemInfo:        return "System Info"
         case .allItems:          return "All Items"
+        case .fileBrowser:       return "File Browser"
         case .category(let c):   return c.displayName
         case .snapshot(let id):  return "Snapshot #\(id)"
         }
     }
 
     private var subtitle: String {
+        if case .fileBrowser = selection { return "" }
         let n = filteredItemIDs.count
         if rawSearchText.isEmpty {
             return n == 1 ? "1 item" : "\(n) items"
@@ -165,11 +170,17 @@ struct ItemListView: View {
     /// detached task — ~140 MB for a /System scan, before the heap
     /// counted the in-memory items dict itself.
     private func recompute() async {
-        if case .systemInfo = selection {
+        // The system-info, snapshot-detail and file-browser selections render
+        // their own views in place of the item list — skip the filter walk
+        // entirely rather than streaming the whole snapshot for nothing.
+        switch selection {
+        case .systemInfo, .snapshot, .fileBrowser:
             filteredItemIDs = []
             displayedFilters = []
             listGeneration &+= 1
             return
+        default:
+            break
         }
         let query = SearchQuery.parse(debouncedSearchText)
         let scopeFilter = scope

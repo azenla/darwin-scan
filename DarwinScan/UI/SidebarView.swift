@@ -40,6 +40,9 @@ struct SidebarView: View {
                             .monospacedDigit()
                     }
                 }
+                NavigationLink(value: SidebarSelection.fileBrowser) {
+                    Label("File Browser", systemImage: "folder")
+                }
             }
 
             Section("Categories") {
@@ -181,6 +184,7 @@ private struct SnapshotRow: View {
 enum SidebarSelection: Hashable {
     case systemInfo
     case allItems
+    case fileBrowser
     case category(ItemCategory)
     case snapshot(Int64)
 }
